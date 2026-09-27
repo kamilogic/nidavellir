@@ -11,6 +11,17 @@
     onResumePower,
   } = $props();
 
+  const FORGE_PHASES = [
+    { id: "prepare", label: "Prepare" },
+    { id: "test", label: "Test candidates" },
+    { id: "compare", label: "Compare" },
+    { id: "restore", label: "Restore" },
+  ];
+  const finishFormatter = new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
   let now = $state(Date.now());
   let observedElapsed = $state(null);
   let observedRemaining = $state(null);
@@ -20,14 +31,18 @@
   let observedTask = $state(null);
   let taskElapsedBase = $state(0);
   let taskObservedAt = $state(Date.now());
+  let observedRunId = $state(null);
+  let latchedLastOutcome = $state(null);
 
   const hasRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
   const isInterrupted = $derived(powerSweep?.phase === "interrupted");
   const isPaused = $derived(powerSweep?.phase === "paused");
   const isStopping = $derived(powerSweep?.phase === "stopping");
-  const isFinished = $derived(["finished", "provisional"].includes(powerSweep?.phase));
+  const isFinished = $derived(powerSweep?.phase === "finished");
+  const isProvisional = $derived(powerSweep?.phase === "provisional");
   const reportedElapsedMs = $derived(validDuration(powerSweep?.elapsed_ms));
   const reportedRemainingMs = $derived(validDuration(powerSweep?.estimated_remaining_ms));
+  const estimatedTotalUpperMs = $derived(validDuration(powerSweep?.estimated_total_upper_ms));
   const currentTaskReportedMs = $derived(validDuration(powerSweep?.current_task_elapsed_ms) ?? 0);
   const elapsedMs = $derived(
     elapsedBase == null
@@ -39,56 +54,114 @@
       ? null
       : Math.max(0, remainingBase - (powerRunning ? Math.max(0, now - timingObservedAt) : 0)),
   );
+  const upperRemainingMs = $derived(
+    estimatedTotalUpperMs == null || elapsedMs == null
+      ? null
+      : Math.max(0, estimatedTotalUpperMs - elapsedMs),
+  );
+  const conservativeRemainingMs = $derived(
+    upperRemainingMs == null
+      ? null
+      : remainingMs == null
+        ? upperRemainingMs
+        : Math.max(remainingMs, upperRemainingMs),
+  );
   const taskElapsedMs = $derived(
-    powerRunning
-      ? taskElapsedBase + Math.max(0, now - taskObservedAt)
-      : taskElapsedBase,
+    powerRunning ? taskElapsedBase + Math.max(0, now - taskObservedAt) : taskElapsedBase,
   );
   const taskEstimatedTotalMs = $derived(validDuration(powerSweep?.current_task_estimated_total_ms));
   const taskRemainingMs = $derived(
     taskEstimatedTotalMs == null ? null : Math.max(0, taskEstimatedTotalMs - taskElapsedMs),
   );
-  const estimatedTotalMs = $derived.by(() => {
-    if (elapsedMs == null) return null;
-    return remainingMs == null ? elapsedMs : elapsedMs + remainingMs;
-  });
-  const phaseInfo = $derived(stageInfo(powerSweep?.phase, powerRunning));
+  const phaseInfo = $derived(stageInfo(powerSweep?.phase, powerRunning, powerSweep?.profiles_qualified));
   const currentTaskLabel = $derived(taskLabel(powerSweep?.current_task) ?? phaseInfo.label);
   const nextTaskLabel = $derived(
-    taskLabel(powerSweep?.next_task) ?? nextStageLabel(powerSweep?.phase),
+    taskLabel(powerSweep?.next_task) ?? terminalNextTask(powerSweep?.phase, powerSweep?.resume_available),
   );
   const nextTaskDurationMs = $derived(validDuration(powerSweep?.next_task_estimated_duration_ms));
-  const completedSteps = $derived(Number(powerSweep?.completed_steps ?? 0));
-  const totalSteps = $derived(Number(powerSweep?.total_steps_estimate ?? 0));
+  const completedSteps = $derived(Math.max(0, Number(powerSweep?.completed_steps ?? 0)));
+  const totalSteps = $derived(Math.max(0, Number(powerSweep?.total_steps_estimate ?? 0)));
+  const currentPhaseIndex = $derived(forgePhaseIndex(powerSweep?.current_task, powerSweep?.phase));
   const progressPercent = $derived.by(() => {
     if (isFinished) return 100;
     if (totalSteps > 0) return clampPercent((completedSteps / totalSteps) * 100);
     if (powerRunning && elapsedMs != null && remainingMs != null && elapsedMs + remainingMs > 0) {
       return clampPercent((elapsedMs / (elapsedMs + remainingMs)) * 100);
     }
+    if (hasRun && currentPhaseIndex != null) {
+      return clampPercent((currentPhaseIndex / FORGE_PHASES.length) * 100);
+    }
     return powerRunning ? 3 : 0;
   });
-  const estimatedFinish = $derived.by(() => {
-    if (isFinished) return "Complete";
-    if (!powerRunning) return "—";
-    if (remainingMs == null) return "Calculating";
-    return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(
-      new Date(now + remainingMs),
-    );
-  });
-  const canResume = $derived(Boolean(!powerRunning && isPaused && powerSweep?.resume_available));
+  const remainingEstimate = $derived(
+    powerRunning ? (remainingMs == null ? "Calculating" : duration(remainingMs)) : "—",
+  );
+  const remainingCeiling = $derived(
+    powerRunning
+      ? (conservativeRemainingMs == null ? "Calculating" : duration(conservativeRemainingMs))
+      : "—",
+  );
+  const estimatedFinishWindow = $derived(
+    finishWindow(now, remainingMs, conservativeRemainingMs, powerRunning, isFinished),
+  );
+  const currentPairLabel = $derived(pairLabel(powerSweep, powerRunning));
+  const currentPairHeading = $derived(powerRunning ? "Current pair" : "Last measured pair");
+  const stepLabel = $derived(stepProgress(completedSteps, totalSteps));
+  const lastDecision = $derived(
+    outcomeInfo(latchedLastOutcome, isFinished, powerSweep?.profiles_qualified),
+  );
+  const discoverySearch = $derived(powerSweep?.discovery_search ?? null);
+  const searchBands = $derived(discoverySearch?.bands ?? []);
+  const qualifiedBands = $derived(searchBands.filter((band) => band.last_qualified_clock_mhz > 0 && band.last_qualified_voltage_mv > 0).length);
+  const rebootRequired = $derived(Boolean(safeLoop?.gpu_reboot_required));
+  const canResume = $derived(
+    Boolean(!rebootRequired && !powerRunning && isPaused && powerSweep?.resume_available),
+  );
   const safetyLabel = $derived.by(() => {
     if (!safeLoop) return "Protection pending";
+    if (rebootRequired) return "Restart Windows";
     if (safeLoop.safe_mode || safeLoop.state === "unstable") return "Needs attention";
     if (safeLoop.boot_flag_armed || safeLoop.recovery_pending_ack) return "Recovery ready";
     return "Protected";
   });
   const title = $derived(
-    isInterrupted ? "Forge interrupted" : isPaused ? "Forge paused" : isFinished ? "Forge complete" : powerRunning ? "Forging your GPU" : "Forge progress",
+    rebootRequired
+      ? "Restart Windows to continue"
+      : isInterrupted
+        ? "Forge interrupted"
+        : isPaused
+          ? "Forge paused"
+          : isProvisional
+            ? "Forge preview ready"
+            : isFinished
+              ? "Forge complete"
+              : powerRunning
+                ? "Forging your GPU"
+                : "Forge progress",
   );
   const runState = $derived(
-    isStopping ? "Stopping safely" : powerRunning ? "Running" : isInterrupted ? "Interrupted" : isPaused ? "Paused" : isFinished ? "Complete" : "Idle",
+    rebootRequired
+      ? "Restart required"
+      : isStopping
+        ? "Stopping safely"
+        : powerRunning
+          ? "Running"
+          : isInterrupted
+            ? "Interrupted"
+            : isPaused
+              ? "Paused"
+              : isProvisional
+                ? "Qualification pending"
+                : isFinished
+                  ? "Complete"
+                  : "Idle",
   );
+  const liveAnnouncement = $derived.by(() => {
+    const parts = [runState];
+    if (powerSweep?.current_task) parts.push(currentTaskLabel);
+    if (latchedLastOutcome) parts.push(lastDecision.label);
+    return parts.join(". ");
+  });
 
   function validDuration(value) {
     if (value == null || value === "") return null;
@@ -112,28 +185,261 @@
     return `${seconds}s`;
   }
 
+  function finishWindow(timestamp, estimate, ceiling, running, finished) {
+    if (finished) return "Complete";
+    if (!running) return "—";
+    const estimateMs = validDuration(estimate);
+    const ceilingMs = validDuration(ceiling);
+    if (estimateMs == null && ceilingMs == null) return "Calculating";
+    if (estimateMs == null) return `By ${finishFormatter.format(new Date(timestamp + ceilingMs))}`;
+    if (ceilingMs == null) return `Around ${finishFormatter.format(new Date(timestamp + estimateMs))}`;
+    const earliest = Math.min(estimateMs, ceilingMs);
+    const latest = Math.max(estimateMs, ceilingMs);
+    const start = finishFormatter.format(new Date(timestamp + earliest));
+    const end = finishFormatter.format(new Date(timestamp + latest));
+    return start === end ? `Around ${start}` : `${start}–${end}`;
+  }
+
   function taskLabel(task) {
     if (!task) return null;
     const labels = {
       prepare_stock: "Preparing a clean stock state",
       stock_preheat: "Normalizing temperature and stock clock",
       capture_goldens: "Capturing stock render references",
-      frontier_descent: "Mapping the stable core frontier",
+      frontier_descent: "Screening the current candidate",
+      candidate_screening: "Screening the current candidate",
+      candidate_selection: "Choosing the next candidate within the search budget",
+      candidate_qualification: "Qualifying the current candidate",
       power_calibration: "Measuring real Apply power",
       profile_synthesis: "Forging the three profile goals",
       apply_calibration: "Measuring exact Apply pairs",
       synthesize_profiles: "Forging the three profile goals",
-      apply_qualification: "Stress-testing the final Apply pairs",
-      publish_profiles: "Finishing the forged profiles",
+      apply_qualification: "Qualifying the current candidate",
+      publish_profiles: "Publishing qualified profiles",
       final_stock_reset: "Restoring and verifying stock state",
       final_reset: "Restoring and verifying stock state",
     };
     return labels[task] ?? String(task).replaceAll("_", " ");
   }
 
-  function stageInfo(phase, running) {
+  function forgePhaseIndex(task, phase) {
+    const taskPhases = {
+      prepare_stock: 0,
+      stock_preheat: 0,
+      capture_goldens: 0,
+      frontier_descent: 1,
+      candidate_screening: 1,
+      candidate_selection: 1,
+      candidate_qualification: 1,
+      power_calibration: 1,
+      profile_synthesis: 2,
+      apply_calibration: 1,
+      synthesize_profiles: 2,
+      apply_qualification: 1,
+      publish_profiles: 2,
+      final_stock_reset: 3,
+      final_reset: 3,
+    };
+    if (task && taskPhases[task] != null) return taskPhases[task];
+    const phaseIndexes = {
+      preheat: 0,
+      power: 1,
+      descend: 1,
+      calibrate: 1,
+      synthesize: 2,
+      provisional: 1,
+      "apply-qualify": 1,
+      validate: 1,
+      stopping: 3,
+      finished: 3,
+    };
+    return phaseIndexes[phase] ?? null;
+  }
+
+  function phaseStatus(index) {
+    if (isFinished) return "complete";
+    if (currentPhaseIndex == null) return "pending";
+    if (index < currentPhaseIndex) return "complete";
+    if (index === currentPhaseIndex) return "active";
+    return "pending";
+  }
+
+  function pairLabel(progress, running) {
+    const clock = Number(progress?.current_clock_mhz);
+    const voltage = Number(progress?.current_voltage_mv);
+    const hasClock = Number.isFinite(clock) && clock > 0;
+    const hasVoltage = Number.isFinite(voltage) && voltage > 0;
+    if (hasClock && hasVoltage) return `${clock} MHz @ ${voltage} mV`;
+    if (hasClock) return `${clock} MHz · voltage pending`;
+    if (hasVoltage) return `${voltage} mV · clock pending`;
+    return running ? "Selecting a measured pair" : "—";
+  }
+
+  function stepProgress(completed, estimatedTotal) {
+    if (estimatedTotal > 0) return `${Math.min(completed, estimatedTotal)} done · ~${estimatedTotal} planned`;
+    if (completed > 0) return `${completed} completed`;
+    return "Awaiting the first measured step";
+  }
+
+  function bandLabel(id) {
+    return { performance: "Performance", balanced: "Balance", efficiency: "Efficiency" }[id] ?? id;
+  }
+
+  function bandStatus(status) {
+    return { waiting_for_top: "Waiting for qualified top", pending: "Pending", in_flight: "Testing", closed: "Closed" }[status] ?? "Pending";
+  }
+
+  function searchStopReason(reason) {
+    const labels = {
+      attempt_budget_exhausted: "Candidate attempt budget reached.",
+      time_budget_exhausted: "There is not enough run time left for another complete qualification.",
+      driver_failure_recovery_required: "A driver failure requires recovery before tuning can continue.",
+      operational_failure: "An operation could not be completed. Review the run details.",
+      integrity_error_budget_exhausted: "Integrity errors reached this run's limit.",
+      power_integrity_boundary: "The next clock needs more voltage than the tested power envelope permits.",
+      qualified_top_unavailable: "No sustainable top was qualified. Review the measurement refusals before a new run.",
+      evidence_incomplete_no_boundary_inferred: "Evidence was insufficient. No hardware boundary was inferred; review the exact refusal in the run log.",
+      physical_clock_domain_exhausted: "Reached the end of the admissible clock domain.",
+      control_reapplication_failed: "Clock or voltage containment failed again after the one allowed reapplication. No point was approved from that test.",
+      all_regions_closed: "All search regions have been closed.",
+      physical_domain_exhausted: "No further admissible point is available in this region.",
+      power_preparation_exhausted: "Power-limited preparation reached its allowed limit.",
+      integrity_error_region_closed: "An integrity error ended exploration of this region.",
+      inconclusive_region_closed: "The available evidence could not support further exploration.",
+      invalid_search_plan: "The candidate search plan is incomplete or invalid. A new compatible run is required.",
+      incompatible_search_version: "This saved search uses a different discovery version. Start a new run.",
+    };
+    return labels[reason] ?? String(reason).replaceAll("_", " ");
+  }
+
+  function outcomeInfo(outcome, finished, qualified) {
+    if (finished && !qualified) {
+      return {
+        label: "No profile published",
+        detail: "The run ended without enough qualified evidence to publish a profile.",
+        tone: "caution",
+      };
+    }
+    if (finished && qualified && !outcome) {
+      return {
+        label: "Profiles qualified",
+        detail: "The final Apply pairs passed the required qualification gates.",
+        tone: "success",
+      };
+    }
+    if (!outcome) {
+      return {
+        label: "No decision yet",
+        detail: "The first measured result will appear here.",
+        tone: "neutral",
+      };
+    }
+
+    const raw = String(outcome);
+    const key = raw.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+    if (["tdrrisk", "censored", "skipped"].some((token) => key.includes(token))) {
+      return {
+        label: "Skipped for safety",
+        detail: "Nidavellir refused this point before treating it as positive evidence.",
+        tone: "caution",
+      };
+    }
+    if (["tdrorcrash", "devicelost", "crash"].some((token) => key.includes(token))) {
+      return {
+        label: "Interrupted · recovery",
+        detail: "The device or driver stopped responding; the run failed closed.",
+        tone: "danger",
+      };
+    }
+    if (["armfailed", "applyfailed", "verifyfailed", "resetfailed", "operationalfailure", "aborted"].some((token) => key.includes(token))) {
+      return {
+        label: "Interrupted · safety check",
+        detail: "A protected write, verification or reset step could not be confirmed.",
+        tone: "danger",
+      };
+    }
+    if (key === "cancelled") {
+      return {
+        label: "Candidate stopped",
+        detail: "This attempt did not qualify the pair. Its spent search budget is retained.",
+        tone: "neutral",
+      };
+    }
+    if (["silenterror", "unstable", "rejected", "failed"].some((token) => key.includes(token))) {
+      return {
+        label: "Rejected · unstable",
+        detail: "The measured point did not meet the stability requirement.",
+        tone: "danger",
+      };
+    }
+    if (key.includes("powerbound")) {
+      return {
+        label: "Inconclusive · power limit",
+        detail: "The power envelope prevented a clean stability decision for this point.",
+        tone: "caution",
+      };
+    }
+    if (["clockdrop", "residency"].some((token) => key.includes(token))) {
+      return {
+        label: "Inconclusive · low residency",
+        detail: "The load did not hold the target strongly enough to accept or condemn the point.",
+        tone: "caution",
+      };
+    }
+    if (key.includes("inconclusive")) {
+      return {
+        label: "Inconclusive",
+        detail: "Evidence was insufficient to qualify or condemn this point. Review the recorded reason.",
+        tone: "caution",
+      };
+    }
+    if (key === "searchbudgetexhausted") {
+      return {
+        label: "Search budget reached",
+        detail: "Exploration ended within the run budget. Untested points are not classified as unstable.",
+        tone: "caution",
+      };
+    }
+    if (key === "bandclosedintegrityerror") {
+      return {
+        label: "Region closed after an error",
+        detail: "The measured candidate failed integrity checks. Further exploration of this region has stopped.",
+        tone: "caution",
+      };
+    }
+    if (key === "candidatequalified") {
+      return {
+        label: "Candidate qualified",
+        detail: "The recorded pair passed the complete qualification matrix and stock restoration checks.",
+        tone: "success",
+      };
+    }
+    if (key === "eligibleforqualification") {
+      return {
+        label: "Eligible for qualification",
+        detail: "Screening passed. The complete matrix is still required before this pair can become a profile or allow refinement.",
+        tone: "neutral",
+      };
+    }
+    if (["qualified", "validated", "stable", "passed", "pass"].some((token) => key.includes(token))) {
+      return {
+        label: "Stage passed",
+        detail: "This stage passed. A profile requires the complete qualification matrix and verified stock restoration.",
+        tone: "neutral",
+      };
+    }
+    return {
+      label: "Evidence recorded",
+      detail: raw.replaceAll(/([a-z])([A-Z])/g, "$1 $2"),
+      tone: "neutral",
+    };
+  }
+
+  function stageInfo(phase, running, qualified) {
     if (!running && phase === "finished") {
-      return { label: "Profiles forged", detail: "The run finished and the GPU returned to a verified state." };
+      return qualified
+        ? { label: "Profiles forged", detail: "Profiles were selected from fully qualified candidates. The GPU returned to its verified final state." }
+        : { label: "Search ended", detail: "The run ended without enough qualified evidence to publish a profile." };
     }
     if (!running && phase === "provisional") {
       return { label: "Preview complete", detail: "The map is ready, but final qualification is still required." };
@@ -148,10 +454,10 @@
     const stages = {
       preheat: ["Preparing the forge", "Normalizing the GPU before the first measurement."],
       power: ["Finding sustainable performance", "Locating the highest clock the hardware can hold cleanly."],
-      descend: ["Testing the stability frontier", "Searching the real voltage boundary of each useful clock."],
+      descend: ["Screening a candidate", "Screening can reject a point early. Each eligible pair needs complete qualification before further refinement."],
       calibrate: ["Measuring profile power", "Recording real power at the exact Apply points."],
       synthesize: ["Forging the profiles", "Selecting performance, balance and efficiency from measured evidence."],
-      "apply-qualify": ["Tempering the final profiles", "Texture Hop v13-r3 and Endurance are challenging each final Apply point."],
+      "apply-qualify": ["Qualifying a candidate", "DX11, Vulkan, DX12 and Endurance must all pass at this exact pair before it can become a profile or allow refinement."],
       stopping: ["Stopping safely", "Saving learning and returning the GPU to stock."],
     };
     const [label, detail] = stages[phase] ?? ["Refining the forge", "The next estimate arrives with the current hardware task."];
@@ -161,21 +467,28 @@
   function nextStageLabel(phase) {
     const labels = {
       preheat: "Find sustainable performance",
-      power: "Map the stability frontier",
-      descend: "Test the next hardware candidate",
+      power: "Screen a candidate",
+      descend: "Qualify an eligible candidate",
       calibrate: "Forge the three profile goals",
-      synthesize: "Temper the final Apply pairs",
-      "apply-qualify": "Publish the forged profiles",
+      synthesize: "Publish qualified profiles",
+      "apply-qualify": "Compare evidence and remaining search budget",
       stopping: "Confirm the safe stock state",
     };
     return labels[phase] ?? "Prepare the next forge stage";
   }
 
+  function terminalNextTask(phase, resumeAvailable) {
+    if (phase === "finished") return "No further task";
+    if (phase === "provisional") return "Run final qualification";
+    if (phase === "interrupted") return "Review recovery before continuing";
+    if (phase === "paused") {
+      return resumeAvailable ? "Resume the saved Forge run" : "Resolve resume compatibility";
+    }
+    return nextStageLabel(phase);
+  }
+
   $effect(() => {
-    if (
-      reportedElapsedMs !== observedElapsed ||
-      reportedRemainingMs !== observedRemaining
-    ) {
+    if (reportedElapsedMs !== observedElapsed || reportedRemainingMs !== observedRemaining) {
       observedElapsed = reportedElapsedMs;
       observedRemaining = reportedRemainingMs;
       elapsedBase = reportedElapsedMs;
@@ -194,12 +507,29 @@
   });
 
   $effect(() => {
+    const runId = powerSweep?.run_id ?? null;
+    const reportedOutcome = powerSweep?.last_outcome;
+    if (runId !== observedRunId) {
+      observedRunId = runId;
+      latchedLastOutcome = reportedOutcome == null || String(reportedOutcome).trim() === ""
+        ? null
+        : reportedOutcome;
+      return;
+    }
+    if (reportedOutcome != null && String(reportedOutcome).trim() !== "") {
+      latchedLastOutcome = reportedOutcome;
+    }
+  });
+
+  $effect(() => {
     const interval = setInterval(() => (now = Date.now()), 1000);
     return () => clearInterval(interval);
   });
 </script>
 
 <section class="forge-progress" aria-labelledby="forge-progress-title">
+  <p class="sr-only" aria-live="polite" aria-atomic="true">{liveAnnouncement}</p>
+
   <header class="progress-header">
     <div class="progress-heading">
       <span class="eyebrow">Forge progress</span>
@@ -207,9 +537,9 @@
       <p>{phaseInfo.detail}</p>
     </div>
     <div class="progress-actions">
-      <span class="safety-pill"><ShieldCheck size={14} strokeWidth={1.9} />{safetyLabel}</span>
-      <span class:live={powerRunning} class:warning={isInterrupted} class="run-pill">{runState}</span>
-      {#if powerRunning}
+      <span class:warning={rebootRequired} class="safety-pill"><ShieldCheck size={14} strokeWidth={1.9} />{safetyLabel}</span>
+      <span class:live={powerRunning && !rebootRequired} class:warning={isInterrupted || rebootRequired} class="run-pill">{runState}</span>
+      {#if powerRunning && !rebootRequired}
         <button class="progress-button stop" type="button" onclick={onStopPower} disabled={isStopping}>
           <Square size={14} strokeWidth={1.9} />{isStopping ? "Stopping…" : "Stop safely"}
         </button>
@@ -217,13 +547,33 @@
         <button class="progress-button resume" type="button" onclick={onResumePower}>
           <Play size={14} strokeWidth={1.9} />Resume Forge
         </button>
-      {:else if isInterrupted}
+      {:else if isInterrupted && !rebootRequired}
         <button class="progress-button resume" type="button" onclick={() => onRecoverContinue?.(forgeMode)}>
           <Play size={14} strokeWidth={1.9} />Review & continue
         </button>
       {/if}
     </div>
   </header>
+
+  {#if rebootRequired}
+    <p class="resume-note reboot-note" role="alert">
+      The GPU driver stopped responding and the test was interrupted. Restart Windows once; the incident and recovery state are saved.
+    </p>
+  {/if}
+
+  <ol class="phase-rail" aria-label="Forge stages">
+    {#each FORGE_PHASES as forgePhase, index}
+      <li
+        class:complete={phaseStatus(index) === "complete"}
+        class:active={phaseStatus(index) === "active"}
+        aria-current={phaseStatus(index) === "active" ? "step" : undefined}
+      >
+        <span class="phase-marker" aria-hidden="true">{phaseStatus(index) === "complete" ? "✓" : index + 1}</span>
+        <span>{forgePhase.label}</span>
+        <span class="sr-only">{phaseStatus(index)}</span>
+      </li>
+    {/each}
+  </ol>
 
   <div class="progress-overview">
     <div class="progress-copy">
@@ -238,49 +588,97 @@
       aria-valuemin="0"
       aria-valuemax="100"
       aria-valuenow={Math.round(progressPercent)}
+      aria-valuetext={`${Math.round(progressPercent)} percent estimated`}
     >
       <span style={`width: ${progressPercent}%`}></span>
     </div>
   </div>
 
-  {#if powerRunning}
-    <div class="task-flow" aria-live="polite">
+  {#if hasRun}
+    <div class="run-context" aria-label="Current Forge context">
+      <article>
+        <span>{currentPairHeading}</span>
+        <strong>{currentPairLabel}</strong>
+      </article>
+      <article>
+        <span>Measured progress</span>
+        <strong>{stepLabel}</strong>
+      </article>
+    </div>
+
+    {#if discoverySearch}
+      <section class="search-budget" aria-label="Candidate search coverage">
+        <div class="search-summary">
+          <strong>{discoverySearch.attempts_used} / {discoverySearch.attempts_limit} candidate attempts</strong>
+          <span>{qualifiedBands} / {searchBands.length} regions with a qualified candidate</span>
+          <span>Run budget: {duration(discoverySearch.time_budget_ms)} · used {duration(discoverySearch.elapsed_ms)}</span>
+        </div>
+        <p>First qualify the highest sustainable clock across heavy loads. Then explore efficiency within 10% below the qualified top. Every candidate needs complete qualification; Resume preserves the budget.</p>
+        <p>The requested clock is nominal. Tests allow up to +15 MHz, with the same voltage and power limits. A brief peak does not qualify a higher-clock profile.</p>
+        {#if discoverySearch.stop_reason}<p class="search-stop">Search ended: {searchStopReason(discoverySearch.stop_reason)}</p>{/if}
+        <ul class="search-bands">
+          {#each searchBands as band}
+            <li class:closed={band.status === "closed"}>
+              <strong>{bandLabel(band.id)} <span>· {bandStatus(band.status)}</span></strong>
+              {#if band.last_qualified_clock_mhz > 0 && band.last_qualified_voltage_mv > 0}
+                <p>Qualified: {band.last_qualified_clock_mhz} MHz @ {band.last_qualified_voltage_mv} mV</p>
+              {:else}
+                <p>No qualified candidate yet.</p>
+              {/if}
+              {#if band.stop_reason}<p>{searchStopReason(band.stop_reason)}</p>{/if}
+            </li>
+          {/each}
+        </ul>
+        {#if searchBands.some((band) => band.status === "closed")}
+          <p>Closing a region stops further exploration; it does not classify untested points as unstable.</p>
+        {/if}
+      </section>
+    {/if}
+
+    <div class="task-flow">
       <article class="task-card current">
         <span class="task-icon"><Timer size={20} strokeWidth={1.75} /></span>
         <div>
-          <small>Now · running for {duration(taskElapsedMs)}</small>
+          <small>Now{powerRunning ? ` · ${duration(taskElapsedMs)}` : ""}</small>
           <strong>{currentTaskLabel}</strong>
-          <p>{taskRemainingMs == null ? "The live estimate is still settling." : `About ${duration(taskRemainingMs)} until the next stage.`}</p>
+          <p>{powerRunning && taskRemainingMs != null ? `Current task estimate: ${duration(taskRemainingMs)} remaining.` : phaseInfo.detail}</p>
         </div>
       </article>
-      <span class="task-arrow"><ArrowRight size={21} strokeWidth={1.6} /></span>
-      <article class="task-card next">
-        <span class="task-icon next-icon">NEXT</span>
+      <article class={`task-card last ${lastDecision.tone}`}>
+        <span class="task-icon text-icon">LAST</span>
         <div>
-          <small>{taskRemainingMs == null ? "Starts after the current stage" : `Starts in about ${duration(taskRemainingMs)}`}</small>
+          <small>Last decision</small>
+          <strong>{lastDecision.label}</strong>
+          <p>{lastDecision.detail}</p>
+        </div>
+      </article>
+      <article class="task-card next">
+        <span class="task-icon text-icon">NEXT</span>
+        <div>
+          <small>{isFinished ? "Run complete" : powerRunning && taskRemainingMs != null ? `Starts in about ${duration(taskRemainingMs)}` : "Next planned task"}</small>
           <strong>{nextTaskLabel}</strong>
-          <p>{nextTaskDurationMs == null ? "Duration updates from live hardware evidence." : `Expected duration: ${duration(nextTaskDurationMs)}.`}</p>
+          <p>{isFinished ? "The GPU has returned to its verified final state." : nextTaskDurationMs == null ? "Duration updates from measured hardware evidence." : `Expected duration: ${duration(nextTaskDurationMs)}.`}</p>
         </div>
       </article>
     </div>
   {/if}
 
-  <div class="run-timing" aria-live="polite">
+  <div class="run-timing">
     <article>
       <Clock3 size={17} strokeWidth={1.7} />
       <span>Elapsed<strong>{hasRun && elapsedMs != null ? duration(elapsedMs) : "—"}</strong></span>
     </article>
     <article>
       <Timer size={17} strokeWidth={1.7} />
-      <span>Remaining<strong>{powerRunning && remainingMs != null ? duration(remainingMs) : "—"}</strong></span>
+      <span>Remaining estimate<strong>{remainingEstimate}</strong></span>
     </article>
     <article>
       <Activity size={17} strokeWidth={1.7} />
-      <span>Estimated total<strong>{hasRun && estimatedTotalMs != null ? duration(estimatedTotalMs) : "—"}</strong></span>
+      <span>Conservative ceiling<strong>{remainingCeiling}</strong></span>
     </article>
     <article>
       <ArrowRight size={17} strokeWidth={1.7} />
-      <span>Estimated finish<strong>{estimatedFinish}</strong></span>
+      <span>Finish window<strong>{estimatedFinishWindow}</strong></span>
     </article>
   </div>
 
@@ -296,7 +694,7 @@
     --panel-radius: 11px;
     --inner-radius: 9px;
     display: grid;
-    gap: 14px;
+    gap: 12px;
     padding: 18px;
     border: 0;
     border-radius: var(--panel-radius);
@@ -304,6 +702,16 @@
     box-shadow: inset 0 0 0 1px var(--progress-outline, rgba(126, 136, 143, 0.34));
     color: #e3e3df;
     font-family: inherit;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   .progress-header,
@@ -314,20 +722,14 @@
     align-items: center;
   }
 
-  .progress-header {
-    justify-content: space-between;
-    gap: 18px;
-  }
-
-  .progress-heading {
-    min-width: 0;
-  }
+  .progress-header { justify-content: space-between; gap: 18px; }
+  .progress-heading { min-width: 0; }
 
   .eyebrow {
     display: block;
     margin-bottom: 5px;
-    color: #737d82;
-    font-size: 0.68rem;
+    color: #889196;
+    font-size: 0.75rem;
     font-weight: 700;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -347,17 +749,13 @@
   .progress-heading p {
     max-width: 700px;
     margin: 5px 0 0;
-    color: #92999d;
+    color: #a2a9ac;
     font-size: 0.75rem;
     line-height: 1.5;
     text-wrap: pretty;
   }
 
-  .progress-actions {
-    justify-content: flex-end;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
+  .progress-actions { justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 
   .safety-pill,
   .run-pill {
@@ -370,9 +768,9 @@
     background: rgba(126, 184, 78, 0.1);
     box-shadow: inset 0 0 0 1px rgba(126, 184, 78, 0.34);
     color: #bce49a;
-    font-size: 0.65rem;
+    font-size: 0.75rem;
     font-weight: 780;
-    letter-spacing: 0.07em;
+    letter-spacing: 0.055em;
     text-transform: uppercase;
     white-space: nowrap;
   }
@@ -380,7 +778,7 @@
   .run-pill {
     background: rgba(255, 255, 255, 0.035);
     box-shadow: inset 0 0 0 1px var(--forge-line);
-    color: var(--nord-dim);
+    color: #a5adb1;
   }
 
   .run-pill.live {
@@ -389,7 +787,8 @@
     color: var(--forge-gold);
   }
 
-  .run-pill.warning {
+  .run-pill.warning,
+  .safety-pill.warning {
     background: rgba(191, 97, 106, 0.12);
     box-shadow: inset 0 0 0 1px rgba(191, 97, 106, 0.4);
     color: #f3b9bd;
@@ -425,38 +824,86 @@
     box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.48);
   }
 
-  .progress-button:active:not(:disabled) {
-    transform: scale(0.96);
+  .progress-button:focus-visible { outline: 2px solid var(--forge-gold); outline-offset: 2px; }
+  .progress-button:active:not(:disabled) { transform: scale(0.96); }
+  .progress-button:disabled { cursor: wait; opacity: 0.58; }
+
+  .phase-rail {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0;
+    margin: 0;
+    padding: 0;
+    list-style: none;
   }
 
-  .progress-button:disabled {
-    cursor: wait;
-    opacity: 0.58;
+  .phase-rail li {
+    position: relative;
+    display: grid;
+    min-width: 0;
+    justify-items: center;
+    gap: 6px;
+    color: #7f898e;
+    font-size: 0.75rem;
+    font-weight: 680;
+    text-align: center;
+  }
+
+  .phase-rail li:not(:last-child)::after {
+    position: absolute;
+    z-index: 0;
+    top: 14px;
+    left: calc(50% + 17px);
+    width: calc(100% - 34px);
+    height: 1px;
+    background: rgba(255, 255, 255, 0.1);
+    content: "";
+  }
+
+  .phase-rail li.complete,
+  .phase-rail li.active { color: #d8dbd8; }
+  .phase-rail li.complete:not(:last-child)::after { background: rgba(126, 184, 78, 0.42); }
+
+  .phase-marker {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    width: 29px;
+    height: 29px;
+    place-items: center;
+    border-radius: 50%;
+    background: #111619;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.13);
+    color: #818b90;
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .complete .phase-marker {
+    background: rgba(126, 184, 78, 0.12);
+    box-shadow: inset 0 0 0 1px rgba(126, 184, 78, 0.4);
+    color: #bce49a;
+  }
+
+  .active .phase-marker {
+    background: rgba(214, 168, 93, 0.13);
+    box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.55), 0 0 14px rgba(214, 168, 93, 0.13);
+    color: var(--forge-gold);
   }
 
   .progress-overview {
-    padding: 14px;
+    padding: 12px 14px;
     border-radius: var(--inner-radius);
     background: rgba(0, 0, 0, 0.2);
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.055);
   }
 
-  .progress-copy {
-    justify-content: space-between;
-    gap: 12px;
-    color: #92999d;
-    font-size: 0.75rem;
-  }
-
-  .progress-copy strong {
-    color: var(--forge-gold);
-    font-size: 0.86rem;
-    font-variant-numeric: tabular-nums;
-  }
+  .progress-copy { justify-content: space-between; gap: 12px; color: #a2a9ac; font-size: 0.75rem; }
+  .progress-copy strong { color: var(--forge-gold); font-size: 0.875rem; font-variant-numeric: tabular-nums; }
 
   .progress-track {
-    height: 10px;
-    margin-top: 10px;
+    height: 9px;
+    margin-top: 9px;
     overflow: hidden;
     border-radius: 999px;
     background: rgba(0, 0, 0, 0.52);
@@ -478,52 +925,73 @@
     position: absolute;
     inset: 0;
     content: "";
-    background: linear-gradient(
-      100deg,
-      transparent 20%,
-      rgba(255, 245, 215, 0.08) 38%,
-      rgba(255, 250, 229, 0.5) 50%,
-      rgba(255, 245, 215, 0.08) 62%,
-      transparent 80%
-    );
+    background: linear-gradient(100deg, transparent 20%, rgba(255, 245, 215, 0.08) 38%, rgba(255, 250, 229, 0.5) 50%, rgba(255, 245, 215, 0.08) 62%, transparent 80%);
     transform: translateX(-140%);
     animation: forge-progress-sheen 1.9s linear infinite;
     will-change: transform;
   }
 
-  @keyframes forge-progress-sheen {
-    to { transform: translateX(140%); }
+  @keyframes forge-progress-sheen { to { transform: translateX(140%); } }
+
+  .run-context { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+
+  .run-context article {
+    min-width: 0;
+    padding: 10px 12px;
+    border-radius: var(--inner-radius);
+    background: rgba(255, 255, 255, 0.025);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.055);
   }
 
-  .task-flow {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr);
-    align-items: center;
-    gap: 10px;
+  .run-context span { display: block; color: #8e979b; font-size: 0.75rem; }
+
+  .run-context strong {
+    display: block;
+    margin-top: 3px;
+    overflow: hidden;
+    color: #d7d9d7;
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
+
+  .search-budget { padding: 12px; border-radius: var(--inner-radius); background: rgba(0, 0, 0, 0.2); }
+  .search-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.8rem; }
+  .search-summary strong { color: var(--forge-gold); }
+  .search-summary span { color: #a2a9ac; }
+  .search-budget p { margin: 6px 0 0; color: #a2a9ac; font-size: 0.75rem; line-height: 1.5; }
+  .search-budget .search-stop { color: var(--forge-gold); }
+  .search-bands { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }
+  .search-bands li { min-width: 0; padding: 10px; border-radius: var(--inner-radius); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1); }
+  .search-bands strong { font-size: 0.8rem; font-weight: 670; }
+  .search-bands strong span { color: #a2a9ac; font-weight: 500; }
+  .search-bands li.closed { box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.3); }
+
+  .task-flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 
   .task-card {
     display: grid;
     min-width: 0;
-    min-height: 108px;
-    grid-template-columns: 44px minmax(0, 1fr);
+    min-height: 112px;
+    grid-template-columns: 40px minmax(0, 1fr);
     align-items: center;
-    gap: 12px;
-    padding: 14px;
+    gap: 11px;
+    padding: 12px;
     border-radius: var(--inner-radius);
     background: rgba(0, 0, 0, 0.2);
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.055);
   }
 
-  .task-card.current {
-    background: rgba(214, 168, 93, 0.07);
-    box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.22);
-  }
+  .task-card.current { background: rgba(214, 168, 93, 0.07); box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.24); }
+  .task-card.last.success { box-shadow: inset 0 0 0 1px rgba(126, 184, 78, 0.3); }
+  .task-card.last.caution { box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.3); }
+  .task-card.last.danger { box-shadow: inset 0 0 0 1px rgba(191, 97, 106, 0.36); }
 
   .task-icon {
     display: grid;
-    width: 44px;
-    height: 44px;
+    width: 40px;
+    height: 40px;
     place-items: center;
     border-radius: 9px;
     background: rgba(214, 168, 93, 0.11);
@@ -531,68 +999,49 @@
     color: var(--forge-gold);
   }
 
-  .next-icon {
-    color: var(--nord-dim);
-    font-size: 0.58rem;
-    font-weight: 800;
-    letter-spacing: 0.08em;
-  }
-
-  .task-card div {
-    min-width: 0;
-  }
-
-  .task-card small {
-    color: var(--nord-dim);
-    font-size: 0.67rem;
-    font-variant-numeric: tabular-nums;
-  }
+  .text-icon { color: #9aa3a7; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.06em; }
+  .task-card div { min-width: 0; }
+  .task-card small { color: #929b9f; font-size: 0.75rem; font-variant-numeric: tabular-nums; }
 
   .task-card strong {
     display: block;
     margin-top: 4px;
     color: #d7d9d7;
-    font-size: 0.88rem;
+    font-size: 0.875rem;
     font-weight: 670;
     text-wrap: balance;
   }
 
+  .task-card.last.success strong { color: #bce49a; }
+  .task-card.last.caution strong { color: var(--forge-gold); }
+  .task-card.last.danger strong { color: #f3b9bd; }
+
   .task-card p {
     margin: 5px 0 0;
-    color: #92999d;
-    font-size: 0.72rem;
+    color: #a0a7aa;
+    font-size: 0.75rem;
     line-height: 1.4;
     text-wrap: pretty;
   }
 
-  .task-arrow {
-    display: grid;
-    place-items: center;
-    color: rgba(214, 168, 93, 0.65);
-  }
-
-  .run-timing {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 8px;
-  }
+  .run-timing { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 
   .run-timing article {
     min-width: 0;
     gap: 9px;
-    padding: 11px 12px;
+    padding: 10px 12px;
     border-radius: 9px;
     background: rgba(255, 255, 255, 0.025);
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
-    color: var(--nord-dim);
+    color: #929b9f;
   }
 
   .run-timing span {
     min-width: 0;
-    color: var(--nord-dim);
-    font-size: 0.62rem;
+    color: #929b9f;
+    font-size: 0.75rem;
     font-weight: 760;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.045em;
     text-transform: uppercase;
   }
 
@@ -619,44 +1068,24 @@
     line-height: 1.45;
   }
 
-  @media (max-width: 940px) {
-    .progress-header {
-      align-items: flex-start;
-      flex-direction: column;
-    }
-    .progress-actions {
-      justify-content: flex-start;
-    }
-    .run-timing {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
+  @media (max-width: 1040px) {
+    .progress-header { align-items: flex-start; flex-direction: column; }
+    .progress-actions { justify-content: flex-start; }
+    .task-flow { grid-template-columns: 1fr; }
+    .task-card { min-height: 92px; }
+    .run-timing { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
 
   @media (max-width: 680px) {
-    .forge-progress {
-      padding: 14px;
-    }
-    .task-flow {
-      grid-template-columns: 1fr;
-    }
-    .task-arrow {
-      transform: rotate(90deg);
-    }
-    .run-timing {
-      grid-template-columns: 1fr;
-    }
-    .progress-button {
-      min-height: 44px;
-    }
+    .forge-progress { padding: 14px; }
+    .run-context,
+    .run-timing { grid-template-columns: 1fr; }
+    .progress-button { min-height: 44px; }
   }
 
   @media (prefers-reduced-motion: reduce) {
     .progress-track > span,
-    .progress-button {
-      transition: none;
-    }
-    .progress-track.forging > span::after {
-      animation: none;
-    }
+    .progress-button { transition: none; }
+    .progress-track.forging > span::after { animation: none; }
   }
 </style>

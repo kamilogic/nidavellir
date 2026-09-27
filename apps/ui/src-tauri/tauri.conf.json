@@ -40,10 +40,6 @@
       "icons/icon.ico"
     ],
     "externalBin": ["binaries/nidavellir-service"],
-    "resources": [
-      "resources/third_party/pawnio/",
-      "resources/pawnio-modules/"
-    ],
     "windows": {
       "webviewInstallMode": {
         "type": "embedBootstrapper",

@@ -11,18 +11,26 @@ use windows::Win32::Graphics::Direct3D::{
     ID3DBlob, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 
 const NVIDIA_VENDOR_ID: u32 = 0x10de;
-const TARGET_WIDTH: u32 = 768;
-const TARGET_HEIGHT: u32 = 768;
+const TARGET_WIDTH: u32 = 1536;
+const TARGET_HEIGHT: u32 = 1536;
+const SOURCE_DIM: u32 = 1024;
+const COMPUTE_ELEMENTS: u32 = 65_536;
 const GOLDEN_MIN_CHECKS: u32 = 3;
-const CHECK_INTERVAL_FRAMES: u64 = 24;
-const GPU_COMPLETION_TIMEOUT: Duration = Duration::from_millis(750);
+const CHECK_INTERVAL_FRAMES: u64 = 16;
+const GPU_COMPLETION_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 const SHADER_SOURCE: &[u8] = br#"
 struct VsOut { float4 position : SV_Position; float2 uv : TEXCOORD0; };
+
+Texture2D<float4> source_texture : register(t0);
+SamplerState source_sampler : register(s0);
+RWStructuredBuffer<uint> compute_output : register(u0);
 
 VsOut vs_main(uint id : SV_VertexID) {
     float2 p = float2((id << 1) & 2, id & 2);
@@ -33,13 +41,23 @@ VsOut vs_main(uint id : SV_VertexID) {
 }
 
 float4 ps_main(VsOut input) : SV_Target {
-    float3 v = float3(input.uv, input.uv.x * input.uv.y) + 0.03125;
+    float3 v = source_texture.Sample(source_sampler, input.uv * 7.0).rgb + 0.03125;
     [unroll] for (uint i = 0; i < 48; ++i) {
         v = frac(v.yzx * float3(1.6180339, 1.4142135, 1.7320508)
             + v.zxy * 0.375 + float3(0.013, 0.017, 0.019));
         v = mad(v, 0.875, v.zxy * 0.125);
     }
-    return float4(v, 1.0);
+    return float4(v, 0.42);
+}
+
+[numthreads(256, 1, 1)]
+void cs_main(uint3 id : SV_DispatchThreadID) {
+    uint v = id.x ^ 0x9e3779b9u;
+    [unroll] for (uint i = 0; i < 64; ++i) {
+        v = v * 1664525u + 1013904223u;
+        v ^= v >> 13;
+    }
+    compute_output[id.x] = v;
 }
 "#;
 
@@ -49,8 +67,17 @@ pub struct Dx11Qualifier {
     render_target: ID3D11Texture2D,
     staging: ID3D11Texture2D,
     render_target_view: ID3D11RenderTargetView,
+    depth_view: ID3D11DepthStencilView,
+    depth_state: ID3D11DepthStencilState,
+    blend_state: ID3D11BlendState,
+    source_view: ID3D11ShaderResourceView,
+    sampler: ID3D11SamplerState,
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
+    compute_shader: ID3D11ComputeShader,
+    compute_buffer: ID3D11Buffer,
+    compute_staging: ID3D11Buffer,
+    compute_uav: ID3D11UnorderedAccessView,
     completion_query: ID3D11Query,
     adapter: Dx11AdapterIdentity,
 }
@@ -79,6 +106,7 @@ impl Dx11Qualifier {
 
             let vertex_blob = compile_shader(b"vs_main\0", b"vs_5_0\0")?;
             let pixel_blob = compile_shader(b"ps_main\0", b"ps_5_0\0")?;
+            let compute_blob = compile_shader(b"cs_main\0", b"cs_5_0\0")?;
             let vertex_bytes = std::slice::from_raw_parts(
                 vertex_blob.GetBufferPointer().cast::<u8>(),
                 vertex_blob.GetBufferSize(),
@@ -86,6 +114,10 @@ impl Dx11Qualifier {
             let pixel_bytes = std::slice::from_raw_parts(
                 pixel_blob.GetBufferPointer().cast::<u8>(),
                 pixel_blob.GetBufferSize(),
+            );
+            let compute_bytes = std::slice::from_raw_parts(
+                compute_blob.GetBufferPointer().cast::<u8>(),
+                compute_blob.GetBufferSize(),
             );
             let mut vertex_shader = None;
             device
@@ -95,6 +127,10 @@ impl Dx11Qualifier {
             device
                 .CreatePixelShader(pixel_bytes, None, Some(&mut pixel_shader))
                 .map_err(|e| format!("CreatePixelShader failed: {e}"))?;
+            let mut compute_shader = None;
+            device
+                .CreateComputeShader(compute_bytes, None, Some(&mut compute_shader))
+                .map_err(|e| format!("CreateComputeShader failed: {e}"))?;
 
             let target_desc = D3D11_TEXTURE2D_DESC {
                 Width: TARGET_WIDTH,
@@ -122,6 +158,103 @@ impl Dx11Qualifier {
                 .CreateRenderTargetView(&render_target, None, Some(&mut render_target_view))
                 .map_err(|e| format!("CreateRenderTargetView failed: {e}"))?;
 
+            let depth_desc = D3D11_TEXTURE2D_DESC {
+                Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                BindFlags: D3D11_BIND_DEPTH_STENCIL.0 as u32,
+                ..target_desc
+            };
+            let mut depth_texture = None;
+            device
+                .CreateTexture2D(&depth_desc, None, Some(&mut depth_texture))
+                .map_err(|e| format!("CreateTexture2D(depth) failed: {e}"))?;
+            let depth_texture =
+                depth_texture.ok_or_else(|| "D3D11 depth texture was not returned".to_string())?;
+            let mut depth_view = None;
+            device
+                .CreateDepthStencilView(&depth_texture, None, Some(&mut depth_view))
+                .map_err(|e| format!("CreateDepthStencilView failed: {e}"))?;
+            let depth_desc = D3D11_DEPTH_STENCIL_DESC {
+                DepthEnable: BOOL(1),
+                DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
+                DepthFunc: D3D11_COMPARISON_ALWAYS,
+                ..Default::default()
+            };
+            let mut depth_state = None;
+            device
+                .CreateDepthStencilState(&depth_desc, Some(&mut depth_state))
+                .map_err(|e| format!("CreateDepthStencilState failed: {e}"))?;
+
+            let mut blend_desc = D3D11_BLEND_DESC::default();
+            blend_desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: BOOL(1),
+                SrcBlend: D3D11_BLEND_SRC_ALPHA,
+                DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D11_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D11_BLEND_ONE,
+                DestBlendAlpha: D3D11_BLEND_ZERO,
+                BlendOpAlpha: D3D11_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            };
+            let mut blend_state = None;
+            device
+                .CreateBlendState(&blend_desc, Some(&mut blend_state))
+                .map_err(|e| format!("CreateBlendState failed: {e}"))?;
+
+            let mut source_data = vec![0u8; (SOURCE_DIM * SOURCE_DIM * 4) as usize];
+            for (index, pixel) in source_data.chunks_exact_mut(4).enumerate() {
+                let hash = (index as u32).wrapping_mul(2_654_435_761);
+                pixel[0] = (hash >> 24) as u8;
+                pixel[1] = (hash >> 16) as u8;
+                pixel[2] = (hash >> 8) as u8;
+                pixel[3] = 255;
+            }
+            let source_desc = D3D11_TEXTURE2D_DESC {
+                Width: SOURCE_DIM,
+                Height: SOURCE_DIM,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_IMMUTABLE,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let source_initial = D3D11_SUBRESOURCE_DATA {
+                pSysMem: source_data.as_ptr().cast::<c_void>(),
+                SysMemPitch: SOURCE_DIM * 4,
+                SysMemSlicePitch: 0,
+            };
+            let mut source_texture = None;
+            device
+                .CreateTexture2D(
+                    &source_desc,
+                    Some(&source_initial),
+                    Some(&mut source_texture),
+                )
+                .map_err(|e| format!("CreateTexture2D(source) failed: {e}"))?;
+            let source_texture = source_texture
+                .ok_or_else(|| "D3D11 source texture was not returned".to_string())?;
+            let mut source_view = None;
+            device
+                .CreateShaderResourceView(&source_texture, None, Some(&mut source_view))
+                .map_err(|e| format!("CreateShaderResourceView failed: {e}"))?;
+            let sampler_desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_WRAP,
+                AddressV: D3D11_TEXTURE_ADDRESS_WRAP,
+                AddressW: D3D11_TEXTURE_ADDRESS_WRAP,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            let mut sampler = None;
+            device
+                .CreateSamplerState(&sampler_desc, Some(&mut sampler))
+                .map_err(|e| format!("CreateSamplerState failed: {e}"))?;
+
             let staging_desc = D3D11_TEXTURE2D_DESC {
                 Usage: D3D11_USAGE_STAGING,
                 BindFlags: 0,
@@ -132,6 +265,36 @@ impl Dx11Qualifier {
             device
                 .CreateTexture2D(&staging_desc, None, Some(&mut staging))
                 .map_err(|e| format!("CreateTexture2D(staging) failed: {e}"))?;
+
+            let compute_desc = D3D11_BUFFER_DESC {
+                ByteWidth: COMPUTE_ELEMENTS * 4,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_UNORDERED_ACCESS.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
+                StructureByteStride: 4,
+            };
+            let mut compute_buffer = None;
+            device
+                .CreateBuffer(&compute_desc, None, Some(&mut compute_buffer))
+                .map_err(|e| format!("CreateBuffer(compute) failed: {e}"))?;
+            let compute_buffer = compute_buffer
+                .ok_or_else(|| "D3D11 compute buffer was not returned".to_string())?;
+            let mut compute_uav = None;
+            device
+                .CreateUnorderedAccessView(&compute_buffer, None, Some(&mut compute_uav))
+                .map_err(|e| format!("CreateUnorderedAccessView failed: {e}"))?;
+            let compute_staging_desc = D3D11_BUFFER_DESC {
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+                ..compute_desc
+            };
+            let mut compute_staging = None;
+            device
+                .CreateBuffer(&compute_staging_desc, None, Some(&mut compute_staging))
+                .map_err(|e| format!("CreateBuffer(compute staging) failed: {e}"))?;
 
             let query_desc = D3D11_QUERY_DESC {
                 Query: D3D11_QUERY_EVENT,
@@ -150,10 +313,26 @@ impl Dx11Qualifier {
                     .ok_or_else(|| "D3D11 staging texture was not returned".to_string())?,
                 render_target_view: render_target_view
                     .ok_or_else(|| "D3D11 render-target view was not returned".to_string())?,
+                depth_view: depth_view
+                    .ok_or_else(|| "D3D11 depth view was not returned".to_string())?,
+                depth_state: depth_state
+                    .ok_or_else(|| "D3D11 depth state was not returned".to_string())?,
+                blend_state: blend_state
+                    .ok_or_else(|| "D3D11 blend state was not returned".to_string())?,
+                source_view: source_view
+                    .ok_or_else(|| "D3D11 source view was not returned".to_string())?,
+                sampler: sampler.ok_or_else(|| "D3D11 sampler was not returned".to_string())?,
                 vertex_shader: vertex_shader
                     .ok_or_else(|| "D3D11 vertex shader was not returned".to_string())?,
                 pixel_shader: pixel_shader
                     .ok_or_else(|| "D3D11 pixel shader was not returned".to_string())?,
+                compute_shader: compute_shader
+                    .ok_or_else(|| "D3D11 compute shader was not returned".to_string())?,
+                compute_buffer,
+                compute_staging: compute_staging
+                    .ok_or_else(|| "D3D11 compute staging buffer was not returned".to_string())?,
+                compute_uav: compute_uav
+                    .ok_or_else(|| "D3D11 compute UAV was not returned".to_string())?,
                 completion_query: completion_query
                     .ok_or_else(|| "D3D11 completion query was not returned".to_string())?,
                 adapter: adapter_identity,
@@ -173,21 +352,24 @@ impl Dx11Qualifier {
             || checks.len() < GOLDEN_MIN_CHECKS as usize
         {
             self.draw_frame();
-            self.wait_for_gpu_completion()?;
             frames = frames.saturating_add(1);
             if frames.is_multiple_of(CHECK_INTERVAL_FRAMES) {
-                checks.push(self.readback_checksum()?);
+                checks.push(self.readback_checksums()?);
             }
         }
-        let Some(&checksum) = checks.first() else {
+        let Some(&(checksum, compute_checksum)) = checks.first() else {
             return Err("DX11 golden captured no checksum".into());
         };
-        if checks.iter().any(|candidate| *candidate != checksum) {
+        if checks
+            .iter()
+            .any(|candidate| *candidate != (checksum, compute_checksum))
+        {
             return Err("DX11 stock golden was not deterministic".into());
         }
         let elapsed_us = started.elapsed().as_micros().max(1) as u64;
         Ok(Dx11Golden {
             checksum,
+            compute_checksum,
             adapter_luid: self.adapter.adapter_luid,
             frame_reference_us: (elapsed_us / frames.max(1)).clamp(1, u64::from(u32::MAX)) as u32,
         })
@@ -199,10 +381,23 @@ impl Dx11Qualifier {
         golden: Dx11Golden,
         cancel: Option<&AtomicBool>,
     ) -> Dx11QualificationResult {
+        self.run_with_golden_observed(duration_ms, golden, cancel, &mut |_| {})
+    }
+
+    /// Reports submitted GPU work until its completion fence. CPU-only checksum work and idle
+    /// are excluded. The callback is diagnostic/coverage only and must not alter GPU settings.
+    pub fn run_with_golden_observed(
+        &self,
+        duration_ms: u64,
+        golden: Dx11Golden,
+        cancel: Option<&AtomicBool>,
+        activity: &mut dyn FnMut(bool),
+    ) -> Dx11QualificationResult {
         let started = Instant::now();
         if golden.adapter_luid != self.adapter.adapter_luid {
             return result(
                 StabilityResult::Stable,
+                0,
                 0,
                 0,
                 started,
@@ -210,60 +405,88 @@ impl Dx11Qualifier {
                 Some("stock/candidate adapter LUID mismatch".into()),
             );
         }
-        let mut frames = 0u64;
+        let cancelled = || cancel.is_some_and(|token| token.load(Ordering::SeqCst));
+        if cancelled() || duration_ms == 0 {
+            return result(
+                StabilityResult::Stable,
+                0,
+                0,
+                0,
+                started,
+                false,
+                Some("dx11_no_work_requested".into()),
+            );
+        }
+        self.submit_batch();
+        activity(true);
+        let mut frames = CHECK_INTERVAL_FRAMES;
         let mut checks = 0u32;
-        while started.elapsed() < Duration::from_millis(duration_ms) {
-            if cancel.is_some_and(|token| token.load(Ordering::SeqCst)) {
-                break;
-            }
-            self.draw_frame();
-            if let Err(error) = self.wait_for_gpu_completion() {
-                let timed_out = error.contains("completion timeout");
-                return result(
-                    if timed_out {
-                        StabilityResult::Unstable
-                    } else {
-                        StabilityResult::Crash
-                    },
-                    frames,
-                    checks,
-                    started,
-                    timed_out,
-                    None,
-                );
-            }
-            frames = frames.saturating_add(1);
-            if frames.is_multiple_of(CHECK_INTERVAL_FRAMES) {
-                match self.readback_checksum() {
-                    Ok(checksum) if checksum == golden.checksum => {
-                        checks = checks.saturating_add(1)
-                    }
-                    Ok(_) => {
-                        return result(
-                            StabilityResult::SilentError,
-                            frames,
-                            checks,
-                            started,
-                            false,
-                            None,
-                        )
-                    }
-                    Err(error) => {
-                        let timed_out = error.contains("completion timeout");
-                        return result(
-                            if timed_out {
-                                StabilityResult::Unstable
-                            } else {
-                                StabilityResult::Crash
-                            },
-                            frames,
-                            checks,
-                            started,
-                            timed_out,
-                            None,
-                        );
-                    }
+        let mut compute_checks = 0u32;
+        loop {
+            let mut queued_next = false;
+            // Copy and fence the current batch before queuing the next one. CPU checksums read
+            // the separate staging resources while the GPU renders into the original resources.
+            // At most one batch is ahead; normal/cancelled exits drain and check every batch.
+            let readback = self.readback_checksums_with(|| {
+                activity(false);
+                if !cancelled() && started.elapsed() < Duration::from_millis(duration_ms) {
+                    self.submit_batch();
+                    activity(true);
+                    frames = frames.saturating_add(CHECK_INTERVAL_FRAMES);
+                    queued_next = true;
                 }
+            });
+            let failed = !matches!(&readback, Ok((render, compute))
+                if *render == golden.checksum && *compute == golden.compute_checksum);
+            // A failed check may have one batch in flight. Fence it before returning to the
+            // caller's stock reset; a device failure while draining takes precedence.
+            let readback = if failed && queued_next {
+                match self.wait_for_gpu_completion() {
+                    Ok(()) => readback,
+                    Err(error) => Err(error),
+                }
+            } else {
+                readback
+            };
+            if failed { activity(false); }
+            match readback {
+                Ok((checksum, compute_checksum))
+                    if checksum == golden.checksum
+                        && compute_checksum == golden.compute_checksum =>
+                {
+                    checks = checks.saturating_add(1);
+                    compute_checks = compute_checks.saturating_add(1);
+                }
+                Ok(_) => {
+                    return result(
+                        StabilityResult::SilentError,
+                        frames,
+                        checks,
+                        compute_checks,
+                        started,
+                        false,
+                        None,
+                    )
+                }
+                Err(error) => {
+                    let timed_out = error.contains("completion timeout");
+                    return result(
+                        if timed_out {
+                            StabilityResult::Unstable
+                        } else {
+                            StabilityResult::Crash
+                        },
+                        frames,
+                        checks,
+                        compute_checks,
+                        started,
+                        timed_out,
+                        None,
+                    );
+                }
+            }
+            if !queued_next {
+                break;
             }
         }
         let verdict = if checks == 0 {
@@ -271,13 +494,30 @@ impl Dx11Qualifier {
         } else {
             StabilityResult::Stable
         };
-        result(verdict, frames, checks, started, false, None)
+        result(
+            verdict,
+            frames,
+            checks,
+            compute_checks,
+            started,
+            false,
+            None,
+        )
     }
 
     fn draw_frame(&self) {
         unsafe {
+            self.context.OMSetRenderTargets(
+                Some(&[Some(self.render_target_view.clone())]),
+                &self.depth_view,
+            );
             self.context
-                .OMSetRenderTargets(Some(&[Some(self.render_target_view.clone())]), None);
+                .ClearRenderTargetView(&self.render_target_view, &[0.0, 0.0, 0.0, 1.0]);
+            self.context
+                .ClearDepthStencilView(&self.depth_view, D3D11_CLEAR_DEPTH.0, 1.0, 0);
+            self.context.OMSetDepthStencilState(&self.depth_state, 0);
+            self.context
+                .OMSetBlendState(&self.blend_state, None, u32::MAX);
             self.context.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -290,15 +530,43 @@ impl Dx11Qualifier {
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             self.context.VSSetShader(&self.vertex_shader, None);
             self.context.PSSetShader(&self.pixel_shader, None);
+            self.context
+                .PSSetShaderResources(0, Some(&[Some(self.source_view.clone())]));
+            self.context
+                .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             self.context.DrawInstanced(3, 4, 0, 0);
+
+            self.context.CSSetShader(&self.compute_shader, None);
+            let uavs = [Some(self.compute_uav.clone())];
+            self.context
+                .CSSetUnorderedAccessViews(0, 1, Some(uavs.as_ptr()), None);
+            self.context.Dispatch(COMPUTE_ELEMENTS.div_ceil(256), 1, 1);
         }
     }
 
-    fn readback_checksum(&self) -> Result<u32, String> {
+    fn submit_batch(&self) {
+        for _ in 0..CHECK_INTERVAL_FRAMES {
+            self.draw_frame();
+        }
+        // Dispatch queued work before the CPU starts hashing the previous readback.
+        unsafe { self.context.Flush() };
+    }
+
+    fn readback_checksums(&self) -> Result<(u32, u32), String> {
+        self.readback_checksums_with(|| {})
+    }
+
+    fn readback_checksums_with(&self, before_hash: impl FnOnce()) -> Result<(u32, u32), String> {
         unsafe {
+            let no_uavs: [Option<ID3D11UnorderedAccessView>; 1] = [None];
+            self.context
+                .CSSetUnorderedAccessViews(0, 1, Some(no_uavs.as_ptr()), None);
             self.context
                 .CopyResource(&self.staging, &self.render_target);
+            self.context
+                .CopyResource(&self.compute_staging, &self.compute_buffer);
             self.wait_for_gpu_completion()?;
+            before_hash();
 
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
@@ -315,7 +583,27 @@ impl Dx11Qualifier {
                 }
             }
             self.context.Unmap(&self.staging, 0);
-            Ok(hash)
+
+            let mut compute_mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(
+                    &self.compute_staging,
+                    0,
+                    D3D11_MAP_READ,
+                    0,
+                    Some(&mut compute_mapped),
+                )
+                .map_err(|e| format!("DX11 compute staging Map failed: {e}"))?;
+            let compute_bytes = std::slice::from_raw_parts(
+                compute_mapped.pData.cast::<u8>(),
+                (COMPUTE_ELEMENTS * 4) as usize,
+            );
+            let mut compute_hash = 0x811c9dc5u32;
+            for byte in compute_bytes {
+                compute_hash = compute_hash.wrapping_mul(0x01000193) ^ u32::from(*byte);
+            }
+            self.context.Unmap(&self.compute_staging, 0);
+            Ok((hash, compute_hash))
         }
     }
 
@@ -352,6 +640,7 @@ fn result(
     verdict: StabilityResult,
     frames: u64,
     checks: u32,
+    compute_checks: u32,
     started: Instant,
     timed_out: bool,
     inconclusive_reason: Option<String>,
@@ -361,6 +650,7 @@ fn result(
         result: verdict,
         frames,
         checks,
+        compute_checks,
         fps: frames as f64 / elapsed.as_secs_f64().max(f64::EPSILON),
         elapsed_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
         timed_out,
@@ -453,9 +743,60 @@ mod tests {
             .expect("deterministic stock golden");
         drop(stock);
         let candidate = Dx11Qualifier::new().expect("fresh native DX11 candidate context");
-        let run = candidate.run_with_golden(1_000, golden, None);
+        let mut activity = Vec::new();
+        let run = candidate.run_with_golden_observed(1_000, golden, None, &mut |active| activity.push(active));
+        assert_eq!(activity.first(), Some(&true));
+        assert_eq!(activity.last(), Some(&false));
+        assert!(activity.windows(2).all(|pair| pair[0] != pair[1]));
+        assert_eq!(activity.len() as u64, run.frames / CHECK_INTERVAL_FRAMES * 2);
         assert_eq!(run.result, StabilityResult::Stable);
         assert!(run.checks > 0);
+        assert!(run.compute_checks > 0);
         assert!(!run.timed_out);
+        assert_eq!(run.frames, u64::from(run.checks) * CHECK_INTERVAL_FRAMES);
+        assert_eq!(run.checks, run.compute_checks);
+
+        for bad in [
+            Dx11Golden {
+                checksum: golden.checksum ^ 1,
+                ..golden
+            },
+            Dx11Golden {
+                compute_checksum: golden.compute_checksum ^ 1,
+                ..golden
+            },
+        ] {
+            let mut activity = Vec::new();
+            let failed = candidate.run_with_golden_observed(1_000, bad, None, &mut |active| activity.push(active));
+            assert_eq!(activity.last(), Some(&false), "failure must drain and close activity before stock reset");
+            assert_eq!(failed.result, StabilityResult::SilentError);
+            assert_eq!(failed.checks, 0);
+            assert!(failed.frames <= 2 * CHECK_INTERVAL_FRAMES);
+            // The preceding error drained its queued batch; the context remains usable.
+            let recovered = candidate.run_with_golden(100, golden, None);
+            assert_eq!(recovered.result, StabilityResult::Stable);
+            assert_eq!(
+                recovered.frames,
+                u64::from(recovered.checks) * CHECK_INTERVAL_FRAMES
+            );
+        }
+        let stop = AtomicBool::new(true);
+        let cancelled = candidate.run_with_golden(1_000, golden, Some(&stop));
+        assert_eq!(cancelled.frames, 0);
+        assert!(cancelled.inconclusive_reason.is_some());
+        stop.store(false, Ordering::SeqCst);
+        let cancelled = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                stop.store(true, Ordering::SeqCst);
+            });
+            candidate.run_with_golden(10_000, golden, Some(&stop))
+        });
+        assert!(cancelled.elapsed_ms < 5_000);
+        assert_eq!(cancelled.result, StabilityResult::Stable);
+        assert_eq!(
+            cancelled.frames,
+            u64::from(cancelled.checks) * CHECK_INTERVAL_FRAMES
+        );
     }
 }

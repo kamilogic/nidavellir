@@ -1,7 +1,6 @@
 <script>
   import { Check, ChevronDown, CircleCheck, Play, RotateCcw, ShieldCheck, TriangleAlert } from "@lucide/svelte";
   import StatusBadge from "./StatusBadge.svelte";
-  import gpuHero from "../../assets/gpu-hero.png";
 
   let {
     error = null,
@@ -69,15 +68,17 @@
     if (forgeState === "Forged" || forgeState === "Refined") return "check";
     return null;
   });
+  const rebootRequired = $derived(Boolean(safeLoop?.gpu_reboot_required));
   const safetyState = $derived.by(() => {
     if (!safeLoop) return "Protected";
+    if (rebootRequired) return "Restart Windows";
     if (safeLoop.safe_mode || safeLoop.state === "unstable") return "Needs Attention";
     if (safeLoop.boot_flag_armed || ["probing", "applying", "dwell"].includes(safeLoop.state)) return "Recovery Ready";
     if ((safeLoop.recent_crashes?.length ?? 0) > 0 && safeLoop.consecutive_crashes === 0) return "Recovered Successfully";
     return "Protected";
   });
   const safetyVariant = $derived.by(() => {
-    if (safetyState === "Needs Attention") return "attention";
+    if (safetyState === "Needs Attention" || safetyState === "Restart Windows") return "attention";
     if (safetyState === "Recovery Ready") return "recovery";
     if (safetyState === "Recovered Successfully") return "recovered";
     return "protected";
@@ -120,13 +121,14 @@
 
   // Recommended-action state machine (merged in from the former RecommendedAction.svelte card).
   const profilesQualified = $derived(!powerSweep?.is_undervolt || Boolean(powerSweep?.profiles_qualified));
-  const needsAttention = $derived(Boolean(safeLoop?.safe_mode || safeLoop?.state === "unstable"));
+  const needsAttention = $derived(Boolean(rebootRequired || safeLoop?.safe_mode || safeLoop?.state === "unstable"));
   const currentPhase = $derived(powerSweep?.phase && powerSweep.phase !== "idle" ? powerSweep.phase : null);
   const isInterrupted = $derived(powerSweep?.phase === "interrupted");
-  const canResetState = $derived(Boolean(onReset) && (needsAttention || hasAppliedTuning || hasProfiles || hasForgeRun));
-  const canFullResetState = $derived(Boolean(onFullReset) && (needsAttention || hasAppliedTuning || hasProfiles || hasForgeRun));
-  const canRecoverContinue = $derived(Boolean(onRecoverContinue) && (needsAttention || isInterrupted) && !powerRunning);
+  const canResetState = $derived(Boolean(onReset) && !rebootRequired && (needsAttention || hasAppliedTuning || hasProfiles || hasForgeRun));
+  const canFullResetState = $derived(Boolean(onFullReset) && !rebootRequired && (needsAttention || hasAppliedTuning || hasProfiles || hasForgeRun));
+  const canRecoverContinue = $derived(Boolean(onRecoverContinue) && !rebootRequired && (needsAttention || isInterrupted) && !powerRunning);
   const actionTitle = $derived.by(() => {
+    if (rebootRequired) return "Restart Windows to continue";
     if (isInterrupted) return "Forge interrupted";
     if (needsAttention) return "Needs Attention";
     if (!hasProfiles && !applied?.core) return "Raw GPU Detected";
@@ -136,14 +138,17 @@
     return "Ready to forge";
   });
   const actionBody = $derived.by(() => {
+    if (rebootRequired) {
+      return "Nidavellir stopped after the GPU driver recovered. Restart Windows once; the failed point and all useful Forge learning are already saved.";
+    }
     if (isInterrupted && needsAttention) {
-      return "The previous Forge was interrupted and recovery is latched. Recover & continue resets to stock, clears recovery, preserves learned observations, then starts the selected Forge mode.";
+      return "The previous Forge was interrupted. After stock recovery and acknowledgement, Nidavellir resumes that same run in its original mode when the saved build, GPU and driver still match.";
     }
     if (isInterrupted) {
-      return "The previous Forge run did not finish cleanly. Continue with the selected mode to reuse saved learning, or use Full reset only if you want to discard it.";
+      return "The previous Forge run did not finish cleanly. Resume continues that same compatible run and mode; it never starts a replacement run silently.";
     }
     if (needsAttention) {
-      return "Nidavellir detected a safety condition. Recover & continue clears the recovery latch while keeping Forge learning available for the next run.";
+      return "Nidavellir detected a safety condition. Review & resume keeps the original run, its mode and all negative safety evidence.";
     }
     if (!hasProfiles && !applied?.core) {
       return "Nidavellir has detected your NVIDIA GPU. The current Forge GPU action runs the implemented core VF forge and profile generation path.";
@@ -156,7 +161,7 @@
     }
     return "Your applied profile will be re-applied automatically on boot with Safe Loop protection. You can refine core VF profiles at any time.";
   });
-  const primaryLabel = $derived(isInterrupted ? "Continue Forge" : hasProfiles ? "Refine Profiles" : "Forge GPU");
+  const primaryLabel = $derived(isInterrupted ? "Resume same Forge" : hasProfiles ? "Refine Profiles" : "Forge GPU");
   const actionDotClass = $derived.by(() => {
     if (isInterrupted || needsAttention) return "danger";
     if (hasProfiles && applied?.core) return "green";
@@ -168,9 +173,9 @@
       id: "standard",
       label: "Standard",
       summaryLabel: "Std",
-      meta: "compact proof",
-      title: "Compact Texture Hop qualification",
-      description: "Runs Texture Hop v13-r3 and the compact Endurance proof to completion. Duration follows the hardware frontier; there is no artificial one-hour cutoff.",
+      meta: "bounded proof",
+      title: "Multi-API qualification",
+      description: "Each unique final pair runs 7 minutes of resident DX11, 2 minutes each of Vulkan and DX12, then 5 minutes of Endurance. Discovery duration follows the hardware frontier.",
     },
     {
       id: "long",
@@ -178,15 +183,15 @@
       summaryLabel: "Long",
       meta: "exhaustive proof",
       title: "Exhaustive qualification",
-      description: "Keeps the full five-minute Texture Hop and twenty-minute thermal Endurance proof for every final Apply point.",
+      description: "Each unique final pair runs 7 minutes of resident DX11, 5 minutes each of Vulkan and DX12, then 20 minutes of thermal Endurance.",
     },
     {
       id: "clean",
       label: "Clean run",
       summaryLabel: "Clean",
-      meta: "experimental",
-      title: "Organic search — no historical memory",
-      description: "Uses the Standard compact proof, but starts organically: pre-run learning is archived and only failures from this run steer it. Sentinel and Safe Loop remain active.",
+      meta: "fresh positives",
+      title: "Remeasure profiles — keep safety memory",
+      description: "Uses the Standard multi-API proof and rebuilds positive measurements. Rigid, Quarantine and TDR safety boundaries always remain active.",
     },
   ];
   const selectedMode = $derived(forgeModes.find((mode) => mode.id === forgeMode) ?? forgeModes[0]);
@@ -198,13 +203,13 @@
   }
 
   function startSelectedMode() {
-    if (needsAttention || powerRunning) return;
+    if (rebootRequired || needsAttention || powerRunning) return;
     onStartPower?.(forgeMode);
   }
 
   function recoverSelectedMode() {
-    if (!canRecoverContinue) return;
-    onRecoverContinue?.(forgeMode);
+    if (rebootRequired || !canRecoverContinue) return;
+    onRecoverContinue?.();
   }
 
   function handlePickerKeydown(event) {
@@ -249,9 +254,6 @@
 
 <section class={`gpu-hero ${forgeStateClass}`}>
   <div class="id-strip">
-    {#if theme === "command"}
-      <img class="command-gpu-art" src={gpuHero} alt="" aria-hidden="true" />
-    {/if}
     <div class="id-left">
       <span class="gpu-swatch" aria-hidden="true"></span>
       <div class="id-copy">
@@ -286,51 +288,21 @@
         <p>{actionBody}</p>
       </div>
 
-      {#if powerRunning}
+      {#if rebootRequired}
+        <div class="banner-actions">
+          <StatusBadge label="Restart Windows" variant="attention" symbol="attention" />
+        </div>
+      {:else if powerRunning}
         <div class="banner-actions">
           <span class="running-hint">Forging is in progress — see the panel below to stop.</span>
         </div>
-      {:else if needsAttention}
+      {:else if needsAttention || isInterrupted}
         <div class="banner-actions">
           {#if canRecoverContinue}
-            <div class="action-group" use:dismissPicker>
-              <button class="btn action-primary" onclick={recoverSelectedMode}>
-                <Play size={15} strokeWidth={1.9} />
-                <span>Recover & continue</span>
-              </button>
-              <details class="mode-picker" bind:this={modePicker}>
-                <summary
-                  class="mode-summary"
-                  aria-label={`Select forge mode for recovery. Current mode: ${selectedMode.label}`}
-                  title={`${selectedMode.title}. ${selectedMode.description}`}
-                  onkeydown={handlePickerKeydown}
-                >
-                  <span>{selectedMode.summaryLabel}</span>
-                  <ChevronDown size={14} strokeWidth={2} />
-                </summary>
-                <div class="mode-menu" role="menu" tabindex="-1" onkeydown={handlePickerKeydown}>
-                  {#each forgeModes as mode}
-                    <button
-                      type="button"
-                      class="mode-item"
-                      class:selected={forgeMode === mode.id}
-                      role="menuitemradio"
-                      aria-checked={forgeMode === mode.id}
-                      onclick={() => selectMode(mode.id)}
-                    >
-                      <span class="mode-copy">
-                        <strong>{mode.label}<small>{mode.meta}</small></strong>
-                        <span>{mode.title}</span>
-                      </span>
-                      <span class="mode-check" class:visible={forgeMode === mode.id}>
-                        <Check size={14} strokeWidth={2.1} />
-                      </span>
-                    </button>
-                  {/each}
-                  <p class="mode-safety">Clears recovery first · preserves learned observations</p>
-                </div>
-              </details>
-            </div>
+            <button class="btn action-primary" onclick={recoverSelectedMode}>
+              <Play size={15} strokeWidth={1.9} />
+              <span>Review & resume same run</span>
+            </button>
           {:else}
             <StatusBadge label="Review Safety" variant="attention" symbol="attention" />
           {/if}
@@ -341,7 +313,7 @@
             </button>
           {/if}
           {#if canFullResetState}
-            <button class="btn full-reset" onclick={onFullReset}>
+            <button class="btn full-reset" onclick={() => { if (globalThis.confirm?.("Permanently erase all GPU learning, profiles, blacklist and failure history? Previously rejected points may be tested again.") === true) onFullReset?.("full"); }}>
               <RotateCcw size={14} strokeWidth={1.9} />
               <span>Full reset</span>
             </button>
@@ -394,7 +366,7 @@
             </button>
           {/if}
           {#if canFullResetState}
-            <button class="btn full-reset" onclick={onFullReset}>
+            <button class="btn full-reset" onclick={() => { if (globalThis.confirm?.("Permanently erase all GPU learning, profiles, blacklist and failure history? Previously rejected points may be tested again.") === true) onFullReset?.("full"); }}>
               <RotateCcw size={14} strokeWidth={1.9} />
               <span>Full reset</span>
             </button>

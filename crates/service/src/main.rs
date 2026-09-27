@@ -1,4 +1,5 @@
 mod detector_lab;
+mod development_validation;
 mod game_trace;
 mod gpu_apply;
 mod gpu_benchmark;
@@ -12,8 +13,10 @@ mod gpu_undervolt;
 mod gpu_verify;
 mod ipc_server;
 mod manual_point;
+mod qualified_search;
 mod safe_loop_runtime;
 mod sensor_gather;
+mod shutdown;
 mod service_impl;
 mod tdr_sentinel;
 
@@ -66,10 +69,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<OsString> = std::env::args_os().collect();
     if args.len() > 1 {
         match args[1].to_string_lossy().as_ref() {
-            "run" | "console" => return run_standalone(),
+            "run" | "console" => {
+                match args.get(2).map(|s| s.to_string_lossy()).as_deref() {
+                    None => (),
+                    Some("--development-validation") if args.len() == 3 => {
+                        development_validation::enable();
+                        tracing::warn!("Development validation mode: one explicitly authorized Standard run; no automatic retries, Resume or profile Apply");
+                    }
+                    _ => return Err("Usage: console [--development-validation]".into()),
+                }
+                return run_standalone();
+            }
             "verify-applied" => return run_verify_only(),
+            "acceptance-preflight" => return run_acceptance_preflight(),
             "build-frontier" => return run_build_frontier_cmd(&args),
             "undervolt-probe" => return run_undervolt_probe_cmd(&args),
+            "diagnose-f2-point" | "diagnose-f2-loads" => return gpu_undervolt::diagnostic::run(&args).map_err(Into::into),
             "game-trace" => return game_trace::run(&args),
             _ => {}
         }
@@ -88,6 +103,55 @@ fn run_verify_only() -> Result<(), Box<dyn std::error::Error>> {
     let status = gpu_verify::verify_applied_curve();
     // Structured result to stdout for headless QA (in addition to the apply_verify log).
     println!("{}", serde_json::to_string_pretty(&status)?);
+    Ok(())
+}
+
+/// Inventory only: never enters AppState/startup recovery, starts a watcher, ACKs or writes GPU state.
+fn run_acceptance_preflight() -> Result<(), Box<dyn std::error::Error>> {
+    let store = SafeLoopStore::new(nidavellir_core::safe_loop::default_data_dir());
+    let mut blockers = Vec::new();
+    match store.load_record_checked() {
+        Ok(record) => {
+            if record.pending_forge_incident.is_some() { blockers.push("Incident acknowledgement is pending".to_string()); }
+            if record.safe_mode || record.state == nidavellir_core::safe_loop::SafeLoopState::Unstable {
+                blockers.push("Safe Loop recovery is required".to_string());
+            }
+        }
+        Err(error) => blockers.push(format!("Safe Loop record is unreadable: {error}")),
+    }
+    match store.read_boot_flag_checked() {
+        Ok(Some(_)) => blockers.push("Boot flag is armed; checked stock recovery is required".to_string()),
+        Ok(None) => (),
+        Err(error) => blockers.push(format!("Boot flag is unreadable: {error}")),
+    }
+    if let Some(reason) = gpu_power_sweep::forge_start_block_reason(&store) { blockers.push(reason); }
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "read_only": true,
+        "build_revision": env!("NIDAVELLIR_BUILD_REVISION"),
+        "gate": if blockers.is_empty() { "requires_live_service_verification" } else { "blocked" },
+        "blockers": blockers,
+        "note": "No service, recovery or GPU workload was started. This is not hardware acceptance."
+    }))?);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn start_supervised_cli_sentinel(store: &SafeLoopStore) -> Result<(), String> {
+    let snapshot = tdr_sentinel::initialize_reboot_guard()?;
+    let baseline = snapshot.watcher_baseline();
+    if let Err(error) = tdr_sentinel::startup_reconcile(store, &snapshot) {
+        tdr_sentinel::mark_gpu_reboot_required("sentinel-cli-reconcile-error");
+        return Err(error);
+    }
+    tdr_sentinel::spawn(store.clone(), baseline).map_err(|error| {
+        tdr_sentinel::mark_gpu_reboot_required("sentinel-cli-watcher-startup-error");
+        format!("Sentinel watcher startup failed closed: {error}")
+    })?;
+    if let Some(event) = tdr_sentinel::reboot_required_event() {
+        return Err(format!(
+            "GPU driver recovery is latched at {event}; reboot Windows before a supervised hardware command"
+        ));
+    }
     Ok(())
 }
 
@@ -193,6 +257,11 @@ fn run_build_frontier_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::E
             "build-frontier: --confirm set — running startup recovery, then the SUPERVISED hardware frontier"
         );
         safe_loop_runtime::run_startup_recovery(&store);
+        start_supervised_cli_sentinel(&store).map_err(
+            |error| -> Box<dyn std::error::Error> {
+                format!("build-frontier: Sentinel startup guard refused hardware: {error}").into()
+            },
+        )?;
     } else {
         tracing::info!("build-frontier: dry-run (pass --confirm to execute the supervised hardware run)");
     }
@@ -230,6 +299,11 @@ fn run_undervolt_probe_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::
              step (may write a bounded positive VF offset; can TDR/reboot)"
         );
         safe_loop_runtime::run_startup_recovery(&store);
+        start_supervised_cli_sentinel(&store).map_err(
+            |error| -> Box<dyn std::error::Error> {
+                format!("undervolt-probe: Sentinel startup guard refused hardware: {error}").into()
+            },
+        )?;
     } else {
         tracing::info!(
             "undervolt-probe: dry-run (pass `--steps 1 --confirm` to execute one supervised single step)"
@@ -369,14 +443,50 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     // v17 boot reconciliation: a hard wedge freezes the live sentinel with the machine — detect a
     // TDR that happened while we were down BEFORE re-applying the very profile that caused it.
     #[cfg(windows)]
-    tdr_sentinel::initialize_reboot_guard();
+    let sentinel_ready = match tdr_sentinel::initialize_reboot_guard() {
+        Ok(snapshot) => {
+            let baseline = snapshot.watcher_baseline();
+            match tdr_sentinel::startup_reconcile(&safe_store, &snapshot) {
+                Ok(_) => {
+                    // Reapply is authorized only after the watcher thread acknowledges that its
+                    // checked seed/floor have been durably persisted.
+                    match tdr_sentinel::spawn(safe_store.clone(), baseline) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tdr_sentinel::mark_gpu_reboot_required(
+                                "sentinel-watcher-startup-error",
+                            );
+                            tracing::error!(
+                                "sentinel watcher startup failed closed ({error}); console service remains stock"
+                            );
+                            false
+                        }
+                    }
+                }
+                Err(error) => {
+                    tdr_sentinel::mark_gpu_reboot_required("sentinel-startup-reconcile-error");
+                    tracing::error!(
+                        "sentinel startup reconciliation failed closed ({error}); console service remains stock and the uncommitted cursor will be retried"
+                    );
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                "sentinel Event Log initialization failed closed ({error}); console service remains stock"
+            );
+            false
+        }
+    };
     #[cfg(windows)]
-    tdr_sentinel::startup_reconcile(&safe_store);
+    if sentinel_ready && tdr_sentinel::reboot_required_event().is_none() && !development_validation::enabled() {
+        gpu_apply::reapply_on_boot(&safe_store);
+    } else {
+        tracing::warn!("persisted GPU profile reapply skipped by the Sentinel/development startup guard");
+    }
+    #[cfg(not(windows))]
     gpu_apply::reapply_on_boot(&safe_store);
-    // v17 runtime TDR sentinel: watch nvlddmkm-153 while a profile is applied; on the FIRST
-    // in-game TDR break the hang cascade (stock → blacklist → auto-fallback +3 bins, same clock).
-    #[cfg(windows)]
-    tdr_sentinel::spawn(safe_store.clone());
 
     let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {
@@ -398,8 +508,12 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     }));
     #[cfg(windows)]
     console_shutdown::install(Arc::clone(&state));
-    ipc_server::run_pipe_server(state)?;
-    Ok(())
+    let result = ipc_server::run_pipe_server(Arc::clone(&state), None);
+    // A fatal listener error must also release workers and restore any applied tuning.
+    let cleanup = shutdown::complete(state, std::time::Duration::from_secs(30));
+    if let Err(error) = &cleanup { tracing::error!("console cleanup incomplete: {error}"); }
+    if let Err(error) = &result { tracing::error!("console IPC failed: {error}"); }
+    shutdown::exit_process(if result.is_err() || cleanup.is_err() { 1 } else { 0 });
 }
 
 /// Console-mode Ctrl+C / window-close handling. Without this, the main thread sits blocked in
@@ -407,24 +521,32 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
 /// driver DLL detach until all queued GPU work drains — Ctrl+C and "End task" appear dead for a
 /// long time. The handler signals every motor's cooperative stop (the same path the IPC Stop
 /// request uses: the dwell cancels within a band/frame, resets to stock and clears the boot
-/// flag), waits a bounded grace for the workers to land, then exits. If the grace expires the
-/// process exits anyway — an armed boot flag is exactly what the Safe Loop startup recovery is
-/// designed to handle.
+/// flag), waits a bounded grace for the workers to land, then exits. Timeout exits nonzero with
+/// recovery evidence preserved. Windows may preempt the grace when closing the console window.
 #[cfg(windows)]
 mod console_shutdown {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
     use windows::Win32::Foundation::BOOL;
-    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+    use windows::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
+        CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
 
     use crate::AppState;
 
     static STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
-    static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
-    /// Upper bound before giving up on the cooperative landing. A cancelled dwell typically
-    /// finishes its band, resets to stock and clears the boot flag within a few seconds.
-    const GRACE_POLLS: u32 = 120; // × 250 ms = 30 s
+    fn shutdown_grace(event: u32) -> Option<std::time::Duration> {
+        match event {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => Some(std::time::Duration::from_secs(30)),
+            // Windows normally allows only five seconds for closing a console. Leave room
+            // for process termination; an unfinished cleanup must preserve recovery evidence.
+            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+                Some(std::time::Duration::from_secs(4))
+            }
+            _ => None,
+        }
+    }
 
     pub fn install(state: Arc<Mutex<AppState>>) {
         let _ = STATE.set(state);
@@ -438,46 +560,82 @@ mod console_shutdown {
     /// Exit WITHOUT running DLL_PROCESS_DETACH/atexit: the v17 sentinel keeps background threads
     /// inside CreateProcess (wevtutil) / NVML / wgpu, and a normal `exit` deadlocks on the loader
     /// lock during DLL detach — the "shutdown complete but the window never closes" hang.
-    /// TerminateProcess cannot take that lock; the GPU is already back at stock by this point.
+    /// A nonzero exit preserves unconfirmed recovery instead of claiming the GPU reached stock.
     fn hard_exit(code: u32) -> ! {
-        unsafe { windows::Win32::System::Threading::TerminateProcess(
-            windows::Win32::System::Threading::GetCurrentProcess(), code) }.ok();
-        std::process::abort();
+        crate::shutdown::exit_process(code)
     }
 
-    unsafe extern "system" fn ctrl_handler(_event: u32) -> BOOL {
+    unsafe extern "system" fn ctrl_handler(event: u32) -> BOOL {
+        let Some(grace) = shutdown_grace(event) else { return BOOL(0); };
         // A second Ctrl+C while already landing = exit immediately.
-        if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+        if !crate::shutdown::begin() {
             hard_exit(1);
         }
-        tracing::info!(
-            "shutdown signal — stopping motors, restoring GPU to stock (Ctrl+C again to force)"
-        );
-        if let Some(state) = STATE.get() {
-            if let Ok(mut s) = state.lock() {
-                s.power_sweep.stop();
-                s.real_sweep.stop();
-                s.mem_sweep.stop();
-                s.forge_all.stop();
-                s.benchmark.stop();
-                s.detector_lab.stop();
-                let store = s.safe_store.clone();
-                if let Err(error) = s.manual_point.reset(&store) {
-                    tracing::warn!("shutdown: manual point stock reset failed: {error}");
+        // Console I/O is unreliable during CTRL_CLOSE_EVENT. In particular, a blocked log
+        // here or after cleanup would bypass the cleanup deadline and prevent native exit.
+        let result = STATE.get()
+            .ok_or_else(|| "Console state is unavailable".to_string())
+            .and_then(|state| crate::shutdown::complete(Arc::clone(state), grace));
+        hard_exit(if result.is_ok() { 0 } else { 1 });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn callback_exits_even_when_console_logging_would_block() {
+            const EVENT: &str = "NIDAVELLIR_CONSOLE_CLOSE_TEST_EVENT";
+            if let Ok(event) = std::env::var(EVENT) {
+                struct BlockedConsole;
+                impl std::io::Write for BlockedConsole {
+                    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                        loop { std::thread::park(); }
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
                 }
+                let subscriber = tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(|| BlockedConsole)
+                    .finish();
+                // Invoke the real callback in an isolated process without AppState/hardware.
+                // A log before cleanup or native exit would wedge this blocked console sink.
+                tracing::subscriber::with_default(subscriber, || unsafe {
+                    let _ = ctrl_handler(event.parse().unwrap());
+                });
+                panic!("a recognized control event must terminate the fixture process");
             }
-            for poll in 0..GRACE_POLLS {
-                let busy = state.lock().map(|s| s.power_sweep.progress().running).unwrap_or(false);
-                if !busy {
-                    break;
-                }
-                if poll % 8 == 0 {
-                    tracing::info!("shutdown: waiting for the current dwell to land safely…");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(250));
+            for event in [CTRL_C_EVENT, CTRL_CLOSE_EVENT] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "console_shutdown::tests::callback_exits_even_when_console_logging_would_block"])
+                    .env(EVENT, event.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn().unwrap();
+                let started = std::time::Instant::now();
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() { break status; }
+                    if started.elapsed() > std::time::Duration::from_secs(5) {
+                        child.kill().unwrap();
+                        child.wait().unwrap();
+                        panic!("console callback was blocked before native exit");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                };
+                // No service state: fail closed rather than claiming confirmed stock recovery.
+                assert_eq!(status.code(), Some(1));
             }
         }
-        tracing::info!("shutdown complete");
-        hard_exit(0);
+
+        #[test]
+        fn close_events_fit_windows_deadline_without_shortening_ctrl_c_cleanup() {
+            for event in [CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT] {
+                assert_eq!(shutdown_grace(event), Some(std::time::Duration::from_secs(4)));
+            }
+            for event in [CTRL_C_EVENT, CTRL_BREAK_EVENT] {
+                assert_eq!(shutdown_grace(event), Some(std::time::Duration::from_secs(30)));
+            }
+            assert_eq!(shutdown_grace(u32::MAX), None);
+        }
     }
 }

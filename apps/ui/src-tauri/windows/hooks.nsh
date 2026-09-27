@@ -1,56 +1,46 @@
-; NSIS hooks for Nidavellir - Windows Service + optional PawnIO bundled installer
-
-!macro NidavellirFindServiceExe OUT_VAR
-  FindFirst $0 ${OUT_VAR} "$INSTDIR\nidavellir-service-*.exe"
-  FindClose $0
-!macroend
-
-!macro NidavellirStopService
-  nsExec::ExecToLog "sc stop NidavellirCore"
+; Checked lifecycle for the NVIDIA/Windows beta. NSIS already runs per-machine/elevated.
+!define NIDAVELLIR_SERVICE_HELPER "${__FILEDIR__}\service-lifecycle.ps1"
+!macro NidavellirServiceAction ACTION
+  InitPluginsDir
+  ; Embed the helper in installer and uninstaller; do not trust an older installed copy.
+  File "/oname=$PLUGINSDIR\nidavellir-service-lifecycle.ps1" "${NIDAVELLIR_SERVICE_HELPER}"
+  nsExec::ExecToStack /TIMEOUT=90000 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\nidavellir-service-lifecycle.ps1" -Action ${ACTION} -InstallDir "$INSTDIR"'
   Pop $0
-  Sleep 1500
-  nsExec::ExecToLog "sc delete NidavellirCore"
-  Pop $0
+  Pop $1
+  DetailPrint "$1"
+  ${If} $0 != 0
+    SetErrorLevel 1
+    MessageBox MB_OK|MB_ICONSTOP "Core Service ${ACTION} did not complete ($0).$\r$\n$1$\r$\nInstallation cannot continue. Close the app and retry; restart Windows if the service cannot stop." /SD IDOK
+    Abort
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL
-  !insertmacro NidavellirStopService
-  !insertmacro NidavellirFindServiceExe $R0
-  StrCmp $R0 "" +3 0
-    nsExec::ExecToLog "cmd /c taskkill /F /IM $R0 /T"
-    Pop $0
+  !insertmacro NidavellirServiceAction Prepare
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  !insertmacro NidavellirFindServiceExe $R0
-  StrCmp $R0 "" service_missing 0
-    StrCpy $R1 "$INSTDIR\$R0"
-    nsExec::ExecToLog "sc create NidavellirCore binPath= \"$R1\" start= auto DisplayName= \"Nidavellir Core Service\""
-    Pop $0
-    nsExec::ExecToLog "sc description NidavellirCore \"Privileged hardware access for Nidavellir (MSR, PawnIO).\""
-    Pop $0
-    nsExec::ExecToLog "sc start NidavellirCore"
-    Pop $0
-    Goto pawnio_prompt
-  service_missing:
-    MessageBox MB_ICONEXCLAMATION "Nidavellir Core Service binary was not found in the install folder. Reinstall or contact support."
-
-  pawnio_prompt:
-  IfFileExists "$INSTDIR\resources\third_party\pawnio\PawnIO-Setup.exe" 0 skip_pawnio
-    MessageBox MB_YESNO|MB_ICONQUESTION "Install the bundled PawnIO kernel driver now?$\r$\n(Recommended for CPU MSR access. Requires a reboot if Windows prompts.)" IDYES run_pawnio IDNO skip_pawnio
-  run_pawnio:
-    ExecWait '"$INSTDIR\resources\third_party\pawnio\PawnIO-Setup.exe" /S' $0
-  skip_pawnio:
+  !insertmacro NidavellirServiceAction Install
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  !insertmacro NidavellirStopService
-  !insertmacro NidavellirFindServiceExe $R0
-  StrCmp $R0 "" +3 0
-    nsExec::ExecToLog "cmd /c taskkill /F /IM $R0 /T"
-    Pop $0
+  !insertmacro NidavellirServiceAction Uninstall
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
-  ; PawnIO uninstall is separate product - we do not remove it automatically
+  ; These exact files shipped in the legacy CPU bundle. New packages no longer
+  ; declare them as resources, so the generated uninstaller cannot remove them.
+  Delete "$INSTDIR\resources\pawnio-modules\COPYING-PawnIO.Modules"
+  Delete "$INSTDIR\resources\pawnio-modules\IntelMSR.bin"
+  Delete "$INSTDIR\resources\pawnio-modules\LpcIO.bin"
+  Delete "$INSTDIR\resources\pawnio-modules\README.md"
+  Delete "$INSTDIR\resources\third_party\pawnio\PawnIO_setup.exe"
+  Delete "$INSTDIR\resources\third_party\pawnio\README.md"
+  ; Non-recursive: unrelated files remain. Never uninstall the shared PawnIO driver.
+  RMDir "$INSTDIR\resources\pawnio-modules"
+  RMDir "$INSTDIR\resources\third_party\pawnio"
+  RMDir "$INSTDIR\resources\third_party"
+  RMDir "$INSTDIR\resources"
+  RMDir "$INSTDIR"
+  ; ProgramData safety/learning history is intentionally retained.
 !macroend

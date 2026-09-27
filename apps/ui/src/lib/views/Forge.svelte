@@ -1,6 +1,7 @@
 <script>
   import { open } from "@tauri-apps/plugin-shell";
   import { serviceCall } from "../service.js";
+  import { nvidiaGpu, recoverForge, requireServiceData } from "../forge-workflow.js";
   import AdvancedDiagnosticsHub from "../components/forge/AdvancedDiagnosticsHub.svelte";
   import ForgeProgress from "../components/forge/ForgeProgress.svelte";
   import ForgeThemeScreen from "../components/forge/ForgeThemeScreen.svelte";
@@ -11,10 +12,14 @@
   let { theme = "command", onThemeChange } = $props();
 
   let error = $state(null);
+  let serviceStatus = $state("connecting");
+  let serviceError = $state(null);
+  let hardwareError = $state(null);
   let timer = $state(null);
   let hardware = $state(null);
   let safeLoop = $state(null);
   let activeView = $state("forge");
+  let diagnosticsTab = $state("log");
   let applied = $state(null);
   let verification = $state(null);
   let exporting = $state(false);
@@ -35,6 +40,7 @@
   let detectorLabBusy = $state(false);
   let detectorLabActionError = $state("");
   let fullResetBusy = $state(false);
+  let actionBusy = $state(false);
   let fullResetFeedback = $state(null);
   // Live GPU telemetry (ReadSensors) + rolling sparkline buffers for the monitoring panel.
   let sensors = $state(null);
@@ -43,7 +49,8 @@
   let powerSweep = $state(null);
   let forgeMode = $state("standard");
   let resetCleanRunArmed = $state(false);
-  let hardwareLoaded = $state(false);
+  let hardwareLoading = false;
+  let lastHardwareAttemptAt = 0;
   let refreshInFlight = false;
   let lastSlowRefreshAt = 0;
 
@@ -52,19 +59,28 @@
   const hasKnowledge = $derived(Boolean(powerSweep?.points?.length || verification?.status));
   const hasForgeRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
 
-  async function loadHardware() {
-    if (hardwareLoaded) return;
+  function responseData(response, type, label) {
+    return requireServiceData(response, type, label);
+  }
+
+  async function loadHardware(force = false) {
+    const now = Date.now();
+    if (hardware || hardwareLoading || (!force && now - lastHardwareAttemptAt < 3000)) return;
+    hardwareLoading = true;
+    lastHardwareAttemptAt = now;
     try {
       const hw = await serviceCall("DetectHardware");
-      hardware = hw?.data?.type === "Hardware" ? hw.data : hardware;
-      hardwareLoaded = true;
-    } catch {
-      hardwareLoaded = true;
+      hardware = responseData(hw, "Hardware", "hardware detection");
+      hardwareError = null;
+    } catch (e) {
+      hardwareError = String(e);
+    } finally {
+      hardwareLoading = false;
     }
   }
 
   async function refresh(forceSlow = false) {
-    if (refreshInFlight) return;
+    if (refreshInFlight || fullResetBusy) return;
     refreshInFlight = true;
     try {
       const now = Date.now();
@@ -73,16 +89,19 @@
         serviceCall("GetPowerSweepProgress"),
         serviceCall("GetSafeLoopStatus"),
       ]);
-      powerSweep = ps?.data?.type === "PowerSweep" ? ps.data : powerSweep;
-      safeLoop = sl?.data?.type === "SafeLoop" ? sl.data : safeLoop;
+      powerSweep = responseData(ps, "PowerSweep", "Forge status");
+      safeLoop = responseData(sl, "SafeLoop", "Safe Loop status");
       if (slowDue) {
         const ap = await serviceCall("GetAppliedProfile");
-        applied = ap?.data?.type === "GpuApply" ? ap.data : applied;
+        applied = responseData(ap, "GpuApply", "applied profile");
         lastSlowRefreshAt = now;
+        void loadHardware();
       }
-      error = null;
+      serviceStatus = "online";
+      serviceError = null;
     } catch (e) {
-      error = String(e);
+      serviceStatus = "offline";
+      serviceError = String(e);
     } finally {
       refreshInFlight = false;
     }
@@ -91,6 +110,7 @@
   async function call(method, set) {
     try {
       const r = await serviceCall(method);
+      if (r?.ok === false) throw new Error(r.error || `${method} failed`);
       set(r);
       error = null;
     } catch (e) {
@@ -98,15 +118,21 @@
     }
   }
 
-  const setApplied = (r) => (applied = r?.data?.type === "GpuApply" ? r.data : applied);
+  const setApplied = (r) => (applied = responseData(r, "GpuApply", "GPU apply"));
   const resetTuning = async () => {
+    if (actionBusy || fullResetBusy || serviceStatus !== "online") return;
     const confirmed = globalThis.confirm?.(
-      "Reset GPU tuning latch? This returns the GPU to stock, clears recovery, and preserves learned Forge observations.",
+      "Return the GPU to stock? The saved run and safety history stay preserved. A pending incident still requires recovery acknowledgement.",
     ) ?? true;
     if (!confirmed) return;
     verification = null;
-    await call("ResetGpuTuning", setApplied);
-    await refresh();
+    actionBusy = true;
+    try {
+      await call("ResetGpuTuning", setApplied);
+      await refresh();
+    } finally {
+      actionBusy = false;
+    }
   };
   async function refreshForgeStateAfterReset() {
     const [ps, sl, ap] = await Promise.all([
@@ -122,16 +148,33 @@
     powerSweep = ps.data;
     safeLoop = sl.data;
     applied = ap.data;
+    serviceStatus = "online";
+    serviceError = null;
     lastSlowRefreshAt = Date.now();
-    await refreshSentinel();
+    void refreshSentinel();
   }
 
-  async function fullResetTuning() {
-    if (fullResetBusy) return false;
+  async function fullResetTuning(mode = "full") {
+    const full = mode !== "soft";
+    const resetName = full ? "Full Reset" : "Soft Reset";
+    if (fullResetBusy || actionBusy) return false;
+    if (serviceStatus !== "online" || safeLoop?.gpu_reboot_required) {
+      fullResetFeedback = {
+        tone: "error",
+        message: safeLoop?.gpu_reboot_required
+          ? "Restart Windows once before any tuning reset. The failed point and Forge learning are already saved."
+          : `Core Service must be online before ${resetName}.`,
+      };
+      return false;
+    }
     fullResetBusy = true;
-    fullResetFeedback = null;
+    fullResetFeedback = {
+      tone: "progress",
+      title: `${resetName} in progress`,
+      message: "Restoring the GPU to stock and clearing saved learning. Please wait.",
+    };
     try {
-      const response = await serviceCall("ResetGpuTuningFull");
+      const response = await serviceCall(full ? "ResetGpuTuningFull" : "ResetGpuTuningSoft");
       if (response?.ok === false) {
         throw new Error(response.error || "Unable to reset all GPU learning");
       }
@@ -141,16 +184,15 @@
 
       applied = response.data;
       verification = null;
-      const message = response.data.message || "Full reset completed";
+      const message = response.data.message || `${resetName} completed`;
       if (/^reset failed/i.test(message)) throw new Error(message);
-      const partial = /some state could not be cleared/i.test(message);
-      if (!partial) {
-        forgeMode = "clean";
-        resetCleanRunArmed = true;
+      if (full && /negative safety evidence preserved/i.test(message)) {
+        throw new Error("The running Core still uses the old reset behavior. Close it and reopen your launcher to load the Full Reset update.");
       }
-      const feedbackMessage = partial
-        ? message
-        : `${message}. The next Forge is armed as a Clean Run: durable real-world condemnations stay preserved, but they will not steer this run.`;
+      const partial = /some state could not be cleared/i.test(message);
+      resetCleanRunArmed = false;
+      if (!partial) forgeMode = "clean";
+      const feedbackMessage = partial ? message : `${message}. Checking whether another Forge can start.`;
       fullResetFeedback = {
         tone: partial ? "warning" : "success",
         message: feedbackMessage,
@@ -158,6 +200,17 @@
 
       try {
         await refreshForgeStateAfterReset();
+        if (!partial) {
+          const blocked = Boolean(powerSweep?.start_block_reason);
+          resetCleanRunArmed = !blocked;
+          fullResetFeedback = {
+            tone: blocked ? "warning" : "success",
+            title: blocked ? "Reset completed; tuning blocked" : "Reset completed",
+            message: blocked
+              ? `${message}. Automatic tuning is still blocked. Choose Review safety block for the remaining requirement.`
+              : `${message}. The next Forge is prepared as a Clean Run. ${full ? "No saved GPU learning will be reused." : "Known failures stay preserved."}`,
+          };
+        }
       } catch (refreshError) {
         fullResetFeedback = {
           tone: "warning",
@@ -168,14 +221,14 @@
     } catch (resetError) {
       fullResetFeedback = {
         tone: "error",
-        message: `Full reset failed: ${String(resetError)}`,
+        message: `${resetName} failed: ${String(resetError)}`,
       };
       return false;
     } finally {
       fullResetBusy = false;
     }
   }
-  const setPower = (r) => (powerSweep = r?.data?.type === "PowerSweep" ? r.data : powerSweep);
+  const setPower = (r) => (powerSweep = responseData(r, "PowerSweep", "Forge"));
   const POWER_START = {
     standard: "StartPowerSweep",
     long: "StartPowerSweepLong",
@@ -185,32 +238,67 @@
     forgeMode = ["standard", "long", "clean"].includes(mode) ? mode : "standard";
     if (mode !== "clean") resetCleanRunArmed = false;
   };
-  const startPower = (mode = forgeMode) => {
-    if (safeLoop?.recovery_pending_ack) return recoverAndStartPower(mode);
-    return call(POWER_START[mode] ?? POWER_START.standard, setPower);
+  const requireWindowsRestart = () => {
+    error = "The GPU driver recovered and Nidavellir stopped the test. Restart Windows once to continue; the failed point and Forge learning are already saved.";
   };
-  const recoverAndStartPower = async (mode = forgeMode) => {
+  const startPower = async (mode = forgeMode) => {
+    if (actionBusy || fullResetBusy || powerRunning) return;
+    if (serviceStatus !== "online") {
+      error = "Core Service is not ready. Start the elevated service before forging.";
+      return;
+    }
+    if (!nvidiaGpu(hardware) || !safeLoop) {
+      error = "Nidavellir is still confirming the local GPU and Safe Loop state.";
+      return;
+    }
+    if (safeLoop?.gpu_reboot_required) return requireWindowsRestart();
+    if (safeLoop?.recovery_pending_ack) return recoverAndStartPower(mode);
+    if (safeLoop.safe_mode || safeLoop.boot_flag_armed || safeLoop.state === "unstable") {
+      error = "Return to stock before starting Forge.";
+      return;
+    }
+    if (powerSweep?.start_block_reason) {
+      error = powerSweep.start_block_reason;
+      return;
+    }
+    actionBusy = true;
+    try {
+      await call(POWER_START[mode] ?? POWER_START.standard, setPower);
+      await refresh(true);
+    } finally {
+      actionBusy = false;
+    }
+  };
+  const recoverAndStartPower = async () => {
+    if (actionBusy || fullResetBusy || powerRunning) return;
+    if (serviceStatus !== "online") {
+      error = "Core Service is not ready. The interrupted run remains preserved.";
+      return;
+    }
+    if (safeLoop?.gpu_reboot_required) return requireWindowsRestart();
     const incident = safeLoop?.pending_forge_incident;
     const point = incident?.target_mhz && incident?.anchor_mv
       ? ` Candidate context: ${incident.target_mhz} MHz at ${incident.anchor_mv} mV VF bin.`
       : " No candidate will be inferred because the interrupted point was not attributable.";
     const confirmed = globalThis.confirm?.(
-      `Review the interrupted Forge and continue from saved learning? Nidavellir will reset the GPU to stock, acknowledge the incident, preserve the blacklist/observations, then start the selected mode.${point}`,
+      `Recover Forge? Nidavellir will return the GPU to stock and acknowledge the incident while preserving safety history. It will resume only if the saved run is compatible. Otherwise it stays at stock; a new run requires a separate action.${point}`,
     ) ?? true;
     if (!confirmed) return;
     verification = null;
+    actionBusy = true;
     try {
-      const reset = await serviceCall("ResetGpuTuning");
-      setApplied(reset);
-      const acknowledged = await serviceCall("AcknowledgeForgeIncident");
-      safeLoop = acknowledged?.data?.type === "SafeLoop" ? acknowledged.data : safeLoop;
-      const started = await serviceCall(POWER_START[mode] ?? POWER_START.standard);
-      setPower(started);
+      const result = await recoverForge(serviceCall);
+      applied = result.applied;
+      safeLoop = result.safeLoop;
+      powerSweep = result.powerSweep;
+      fullResetFeedback = { tone: "success", title: "Forge recovery", message: result.message };
       error = null;
       await refresh();
     } catch (e) {
       error = String(e);
       await refresh();
+    } finally {
+      actionBusy = false;
     }
   };
   const REPORT_UNSTABLE = {
@@ -246,9 +334,20 @@
     await call("StopPowerSweep", setPower);
   };
   const resumePower = async () => {
-    if (powerSweep?.running || powerSweep?.phase !== "paused" || !powerSweep?.resume_available) return;
-    await call("ResumePowerSweep", setPower);
-    await refresh(true);
+    if (actionBusy || fullResetBusy || powerSweep?.running || !powerSweep?.resume_available) return;
+    if (powerSweep.start_block_reason) { error = powerSweep.start_block_reason; return; }
+    if (serviceStatus !== "online") {
+      error = "Core Service is not ready. The paused run remains preserved.";
+      return;
+    }
+    if (safeLoop?.gpu_reboot_required) return requireWindowsRestart();
+    actionBusy = true;
+    try {
+      await call("ResumePowerSweep", setPower);
+      await refresh(true);
+    } finally {
+      actionBusy = false;
+    }
   };
   const POWER_APPLY = {
     godforge: "ApplyPowerGodforge",
@@ -256,11 +355,24 @@
     deep_calm: "ApplyPowerDeepCalm",
   };
   const applyPower = async (which) => {
+    if (actionBusy || fullResetBusy || powerRunning) return;
+    if (serviceStatus !== "online" || !safeLoop || safeLoop.gpu_reboot_required || safeLoop.safe_mode || safeLoop.state === "unstable") {
+      error = safeLoop?.gpu_reboot_required
+        ? "Restart Windows once before applying a profile."
+        : "Safe Loop and Core Service must be ready before applying a profile.";
+      return;
+    }
     verification = null;
-    await call(POWER_APPLY[which], setApplied);
+    actionBusy = true;
+    try {
+      await call(POWER_APPLY[which], setApplied);
+    } finally {
+      actionBusy = false;
+    }
   };
 
   async function exportLog() {
+    if (exporting) return;
     exporting = true;
     exportMsg = "";
     exportFailed = false;
@@ -456,7 +568,10 @@
 
   function changeView(view) {
     activeView = view === "advanced" || view === "settings" ? view : "forge";
-    requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, behavior: "auto" });
+      document.querySelector("[data-forge-heading]")?.focus({ preventScroll: true });
+    });
   }
 
   function pushSpark(arr, value) {
@@ -552,7 +667,17 @@
     {forgeMode}
     {powerRunning}
     {fullResetBusy}
+    {actionBusy}
     {fullResetFeedback}
+    {error}
+    {serviceStatus}
+    {serviceError}
+    {hardwareError}
+    {exporting}
+    {exportMsg}
+    {exportFailed}
+    onExportLog={exportLog}
+    onViewSafetyHistory={() => { diagnosticsTab = "sentinel"; changeView("advanced"); }}
     {onThemeChange}
     onForgeModeChange={selectForgeMode}
     onStartPower={startPower}
@@ -562,11 +687,14 @@
     onApplyPower={applyPower}
     onReportProfileUnstable={reportProfileUnstable}
     onFullReset={fullResetTuning}
+    onReset={resetTuning}
+    onDismissError={() => (error = null)}
     onDismissFullResetFeedback={() => (fullResetFeedback = null)}
     {activeView}
     onViewChange={changeView}
   >
     <AdvancedDiagnosticsHub
+      bind:activeTab={diagnosticsTab}
       {theme}
       embedded
       {powerSweep}

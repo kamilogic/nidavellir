@@ -44,6 +44,9 @@ impl ForgeAllHandle {
     pub fn progress(&self) -> ForgeAllProgress {
         self.progress.lock().map(|p| p.clone()).unwrap_or_else(|_| idle())
     }
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
@@ -93,19 +96,15 @@ impl P {
     }
 }
 
-/// Recover the GPU context after a TDR. The driver needs a few seconds to
-/// reset; recreating the device immediately fails ("lost during init"), so we
-/// wait and retry a few times.
 #[cfg(windows)]
-fn recover_ctx() -> Option<nidavellir_gpu_stress::GpuCtx> {
-    use nidavellir_gpu_stress::GpuCtx;
-    for _ in 0..6 {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        if let Ok(c) = GpuCtx::new() {
-            return Some(c);
-        }
+fn reset_forge_all_to_stock(store: &SafeLoopStore) {
+    if let Err(error) = crate::tdr_sentinel::legacy_stock_reset_guard(store) {
+        info!("forge-all: stock reset skipped: {error}");
+        return;
     }
-    None
+    if let Err(error) = nidavellir_gpu_nvapi::reset_all() {
+        info!("forge-all: stock reset failed: {error}");
+    }
 }
 
 /// Run a combined core+mem load while sampling the peak core clock.
@@ -151,14 +150,14 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
     }
     let p = P { progress: progress.clone() };
     let finish = |phase: &str| {
-        let _ = gpu::reset_all();
+        reset_forge_all_to_stock(&store);
         if let Ok(mut g) = progress.lock() {
             g.running = false;
             g.phase = phase.into();
         }
     };
 
-    let mut ctx = match GpuCtx::new() {
+    let ctx = match GpuCtx::new() {
         Ok(c) => c,
         Err(e) => {
             p.log(format!("Falha ao iniciar GPU: {e}"));
@@ -166,7 +165,12 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
             return;
         }
     };
-    let _ = gpu::reset_all();
+    if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+        p.log(format!("Execução recusada antes do primeiro write: {error}"));
+        finish("aborted");
+        return;
+    }
+    reset_forge_all_to_stock(&store);
 
     // 1. VRAM gate ----------------------------------------------------------
     p.set("vram");
@@ -176,6 +180,9 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
         Err(_) => StabilityResult::Crash,
     };
     if !vram.is_stable() {
+        if matches!(vram, StabilityResult::Crash) {
+            crate::tdr_sentinel::mark_legacy_device_loss("gpu_forge_all_vram");
+        }
         p.log("VRAM instável em stock — abortando (problema de memória, não de tuning)".into());
         p.note("VRAM falhou no gate — não é seguro tunar.");
         finish("aborted");
@@ -190,6 +197,11 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
     // 2. Core undervolt at fixed voltage, combined load ---------------------
     p.set("core");
     p.log(format!("2/5 · Core: undervolt travado em {CORE_VOLTAGE_MV} mV, carga combinada…"));
+    if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+        p.log(format!("Voltage lock recusado: {error}"));
+        finish("aborted");
+        return;
+    }
     if gpu::lock_core_voltage_mv(CORE_VOLTAGE_MV).is_err() {
         p.log("Falha ao travar voltagem do core — abortando".into());
         finish("aborted");
@@ -202,7 +214,16 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
             finish("aborted");
             return;
         }
-        let _ = gpu::set_core_offset_mhz(offset);
+        if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+            p.log(format!("Core write recusado: {error}"));
+            finish("aborted");
+            return;
+        }
+        if let Err(error) = gpu::set_core_offset_mhz(offset) {
+            p.log(format!("Falha no core write: {error}"));
+            finish("aborted");
+            return;
+        }
         let (res, clk) = combined_clock(&ctx, 6000);
         p.log(format!("   +{offset} MHz → {clk} MHz : {res:?}"));
         match res {
@@ -214,20 +235,18 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
                 }
             }
             StabilityResult::Crash => {
-                // Device lost / TDR. The ctx is dead — recover it so the memory
-                // and soak phases run against a live device, not garbage.
-                p.log("   device-lost no core — recuperando GPU e recuando".into());
-                let _ = gpu::set_core_offset_mhz(0);
-                if let Some(fresh) = recover_ctx() {
-                    ctx = fresh;
-                    p.log("   GPU recuperada ✓".into());
-                } else {
-                    p.log("   GPU não recuperou — mantendo stock".into());
-                }
-                break;
+                crate::tdr_sentinel::mark_legacy_device_loss("gpu_forge_all_core");
+                p.log("   device-lost no core — reinicie o Windows; nenhuma reaplicação será tentada".into());
+                finish("reboot_required");
+                return;
             }
             StabilityResult::SilentError | StabilityResult::Unstable => break,
         }
+    }
+    if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+        p.log(format!("Reset de offset recusado: {error}"));
+        finish("aborted");
+        return;
     }
     let _ = gpu::set_core_offset_mhz(0);
     if best_clk == 0 {
@@ -240,7 +259,16 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
     // 3. Apply core ---------------------------------------------------------
     p.set("apply-core");
     if core_freq > 0 {
-        let _ = crate::gpu_apply::apply_core(core_point);
+        if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+            p.log(format!("Apply de core recusado: {error}"));
+            finish("aborted");
+            return;
+        }
+        if let Err(error) = crate::gpu_apply::apply_core(core_point) {
+            p.log(format!("Apply de core falhou: {error}"));
+            finish("aborted");
+            return;
+        }
         p.log("Core aplicado ✓".into());
     }
 
@@ -253,7 +281,16 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        let _ = gpu::set_mem_offset_mhz(moff);
+        if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+            p.log(format!("Memory write recusado: {error}"));
+            finish("aborted");
+            return;
+        }
+        if let Err(error) = gpu::set_mem_offset_mhz(moff) {
+            p.log(format!("Falha no memory write: {error}"));
+            finish("aborted");
+            return;
+        }
         let (res, _) = combined_clock(&ctx, 6000);
         let (peak, minbw) = if matches!(res, StabilityResult::Crash) {
             (0.0, 0.0)
@@ -285,15 +322,21 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
                 break;
             }
         } else {
-            // A crash here also kills the device — recover before the soak.
-            if matches!(res, StabilityResult::Crash) {
-                let _ = gpu::set_mem_offset_mhz(0);
-                if let Some(fresh) = recover_ctx() {
-                    ctx = fresh;
-                }
+            if matches!(res, StabilityResult::Crash)
+                || matches!(integ, StabilityResult::Crash)
+            {
+                crate::tdr_sentinel::mark_legacy_device_loss("gpu_forge_all_memory");
+                p.log("Device-lost na memória — reinicie o Windows".into());
+                finish("reboot_required");
+                return;
             }
             break;
         }
+    }
+    if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+        p.log(format!("Reset de memória recusado: {error}"));
+        finish("aborted");
+        return;
     }
     let _ = gpu::set_mem_offset_mhz(0);
     p.log(format!("Memória escolhida: +{best_mem} MHz"));
@@ -304,16 +347,25 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
     // The memory sweep may have left the device in a bad state (a hard
     // bandwidth collapse at the cliff) — start this critical validation on a
     // guaranteed-fresh device, recovering with backoff if it was lost.
-    match GpuCtx::new() {
-        Ok(fresh) => ctx = fresh,
-        Err(_) => {
-            if let Some(fresh) = recover_ctx() {
-                ctx = fresh;
-            }
+    let ctx = match GpuCtx::new() {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            p.log(format!("GPU context indisponível antes do soak: {error}"));
+            finish("aborted");
+            return;
         }
-    }
+    };
     if core_freq > 0 {
-        let _ = crate::gpu_apply::apply_core(core_point);
+        if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+            p.log(format!("Reapply de core recusado: {error}"));
+            finish("aborted");
+            return;
+        }
+        if let Err(error) = crate::gpu_apply::apply_core(core_point) {
+            p.log(format!("Reapply de core falhou: {error}"));
+            finish("aborted");
+            return;
+        }
     }
     let mut mem_final = best_mem;
     let mut soak_ok = false;
@@ -321,7 +373,16 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
         if mem_final < 0 {
             mem_final = 0;
         }
-        let _ = gpu::set_mem_offset_mhz(mem_final);
+        if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+            p.log(format!("Soak memory write recusado: {error}"));
+            finish("aborted");
+            return;
+        }
+        if let Err(error) = gpu::set_mem_offset_mhz(mem_final) {
+            p.log(format!("Soak memory write falhou: {error}"));
+            finish("aborted");
+            return;
+        }
         let (res, _) = combined_clock(&ctx, 120_000);
         if res.is_stable() {
             soak_ok = true;
@@ -329,14 +390,11 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
             break;
         }
         p.log(format!("Pacote instável em mem +{mem_final} ({res:?}) — recuando 100 MHz"));
-        // A crash kills the device — recover before the next attempt, else every
-        // remaining attempt crashes instantly on the dead context.
         if matches!(res, StabilityResult::Crash) {
-            let _ = gpu::set_mem_offset_mhz(0);
-            if let Some(fresh) = recover_ctx() {
-                ctx = fresh;
-                let _ = crate::gpu_apply::apply_core(core_point);
-            }
+            crate::tdr_sentinel::mark_legacy_device_loss("gpu_forge_all_soak");
+            p.log("Device-lost no soak — reinicie o Windows; retry/reapply bloqueado".into());
+            finish("reboot_required");
+            return;
         }
         mem_final -= 100;
         if mem_final <= 0 && attempt >= 1 {
@@ -351,7 +409,16 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
     // Only persist a memory offset that actually survived the package soak —
     // never apply an unvalidated value just because the sweep had found it.
     let mem_opt = if soak_ok && mem_final > 0 { Some(mem_final) } else { None };
-    let _ = crate::gpu_apply::apply_and_persist(label, core_opt, mem_opt, &store);
+    if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+        p.log(format!("Persist/apply final recusado: {error}"));
+        finish("aborted");
+        return;
+    }
+    if let Err(error) = crate::gpu_apply::apply_and_persist(label, core_opt, mem_opt, &store) {
+        p.log(format!("Persist/apply final falhou: {error}"));
+        finish("aborted");
+        return;
+    }
     p.note(if soak_ok {
         "Forja completa e validada — aplicada e persistida. Confirme em jogo."
     } else {

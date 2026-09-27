@@ -50,9 +50,10 @@ fn map_verifier(v: Option<PositiveOffsetVerification>) -> F2ObsVerifier {
 }
 
 /// Map the dwell verdict to the observation form.
-fn map_dwell(d: Option<F2DwellOutcome>, discovery_power_inconclusive: bool) -> F2ObsDwell {
-    if discovery_power_inconclusive {
-        return F2ObsDwell::PowerTelemetryInconclusive;
+fn map_dwell(d: Option<F2DwellOutcome>, discovery_inconclusive: bool, power_inconclusive: bool) -> F2ObsDwell {
+    if discovery_inconclusive {
+        return if power_inconclusive { F2ObsDwell::PowerTelemetryInconclusive }
+            else { F2ObsDwell::DiscoveryInconclusive };
     }
     match d {
         Some(F2DwellOutcome::Stable) => F2ObsDwell::Stable,
@@ -68,9 +69,10 @@ fn map_dwell(d: Option<F2DwellOutcome>, discovery_power_inconclusive: bool) -> F
 /// Map the confirmed-step terminal outcome to the observation outcome. Arm/apply failures aborted before
 /// any stable/unstable result was learned, so they are an abort — NOT an instability that would bracket
 /// the voltage downward.
-fn map_outcome(o: &F2Outcome, discovery_power_inconclusive: bool) -> F2ObsOutcome {
-    if discovery_power_inconclusive {
-        return F2ObsOutcome::PowerTelemetryInconclusive;
+fn map_outcome(o: &F2Outcome, discovery_inconclusive: bool, power_inconclusive: bool) -> F2ObsOutcome {
+    if discovery_inconclusive {
+        return if power_inconclusive { F2ObsOutcome::PowerTelemetryInconclusive }
+            else { F2ObsOutcome::DiscoveryInconclusive };
     }
     match o {
         F2Outcome::Validated => F2ObsOutcome::Validated,
@@ -93,9 +95,11 @@ pub fn observation_from_anchored_step(
     anchored: &AnchoredPositiveOffsetPlan,
     report: &F2StepReport,
 ) -> F2Observation {
-    let discovery_power_inconclusive = ctx.evidence_kind == F2EvidenceKind::Discovery
+    let discovery_inconclusive = ctx.evidence_kind == F2EvidenceKind::Discovery
         && matches!(report.outcome, F2Outcome::Inconclusive);
-    let outcome = map_outcome(&report.outcome, discovery_power_inconclusive);
+    let power_inconclusive = matches!(report.inconclusive_reason.as_deref(),
+        Some("power_telemetry_missing" | "power_p99_inconsistent" | "power_cap_ambiguous"));
+    let outcome = map_outcome(&report.outcome, discovery_inconclusive, power_inconclusive);
     F2Observation {
         run_id: ctx.run_id.clone(),
         timestamp: ctx.timestamp.clone(),
@@ -119,10 +123,11 @@ pub fn observation_from_anchored_step(
         max_flatten_mhz: anchored.max_negative_flatten_mhz,
         lower_bins_elastic: anchored.elastic_below_bins,
         verifier_result: map_verifier(report.verify),
-        dwell_result: map_dwell(report.dwell, discovery_power_inconclusive),
+        dwell_result: map_dwell(report.dwell, discovery_inconclusive, power_inconclusive),
         avg_clock_mhz: report.avg_clock_mhz,
         sustained_clock_mhz: report.p5_clock_mhz,
         sustained_upper_clock_mhz: report.p95_clock_mhz,
+        max_clock_mhz: report.max_clock_mhz,
         watts: report.power_w,
         max_watts: report.max_power_w,
         power_p99_w: report.power_p99_w,
@@ -149,6 +154,7 @@ pub fn observation_from_anchored_step(
         boot_flag_cleared: report.boot_flag_cleared,
         blacklisted: report.blacklisted,
         outcome,
+        inconclusive_reason: report.inconclusive_reason.clone(),
         confidence: outcome.is_validated().then(|| frontier_confidence(1)),
         notes: None,
     }
@@ -557,6 +563,7 @@ mod tests {
     fn step(outcome: F2Outcome, verify: Option<PositiveOffsetVerification>, dwell: Option<F2DwellOutcome>,
     ) -> F2StepReport {
         F2StepReport {
+            inconclusive_reason: None,
             outcome,
             armed: true,
             applied: true,
@@ -565,6 +572,7 @@ mod tests {
             avg_clock_mhz: Some(1815),
             p5_clock_mhz: Some(1815),
             p95_clock_mhz: Some(1815),
+            max_clock_mhz: Some(1815),
             power_w: Some(180),
             max_power_w: Some(188),
             power_p99_w: Some(186.0),
@@ -619,6 +627,7 @@ mod tests {
             &report,
         );
         assert_eq!(o.target_mhz, 1800);
+        assert_eq!(o.max_clock_mhz, Some(1815));
         assert_eq!((o.anchor_mv, o.base_mhz, o.offset_mhz), (975, 1785, 15));
         assert_eq!(o.positive_offset_cap_mhz, 30);
         assert_eq!((o.higher_bins_capped, o.max_flatten_mhz, o.lower_bins_elastic), (26, 150, 40));
@@ -649,16 +658,33 @@ mod tests {
     }
 
     #[test]
-    fn discovery_inconclusive_maps_to_power_telemetry_not_qualification() {
+    fn discovery_inconclusive_keeps_measurement_and_power_reasons_separate() {
+        let mut report = step(
+            F2Outcome::Inconclusive,
+            Some(PositiveOffsetVerification::RaiseVerified),
+            Some(F2DwellOutcome::Inconclusive),
+        );
+        // The last overnight bin had usable power/clock but only one voltage read.
+        report.measured_voltage_sample_count = 1;
+        for reason in [None, Some("voltage_telemetry_low"), Some("voltage_ceiling_exceeded"),
+            Some("clock_ceiling_exceeded"), Some("thermal_throttled"), Some("cancelled")] {
+            report.inconclusive_reason = reason.map(str::to_owned);
+            let observation = observation_from_anchored_step(
+                &ctx(), 1800, &anchored(975, 1785, 1800), &report,
+            );
+            assert_eq!(observation.outcome, F2ObsOutcome::DiscoveryInconclusive);
+            assert_eq!(observation.dwell_result, F2ObsDwell::DiscoveryInconclusive);
+            assert_eq!(observation.inconclusive_reason.as_deref(), reason);
+            assert!(!observation.outcome.is_bad());
+            assert!(!observation.outcome.is_validated());
+            assert!(!observation.blacklisted);
+        }
+        report.inconclusive_reason = Some("power_p99_inconsistent".into());
         let discovery = observation_from_anchored_step(
             &ctx(),
             1800,
             &anchored(975, 1785, 1800),
-            &step(
-                F2Outcome::Inconclusive,
-                Some(PositiveOffsetVerification::RaiseVerified),
-                Some(F2DwellOutcome::Inconclusive),
-            ),
+            &report,
         );
         assert_eq!(
             discovery.outcome,
@@ -668,6 +694,7 @@ mod tests {
             discovery.dwell_result,
             F2ObsDwell::PowerTelemetryInconclusive
         );
+        assert_eq!(discovery.inconclusive_reason.as_deref(), Some("power_p99_inconsistent"));
 
         let mut qualification_ctx = ctx();
         qualification_ctx.evidence_kind = F2EvidenceKind::Qualification;

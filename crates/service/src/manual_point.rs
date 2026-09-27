@@ -2,7 +2,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nidavellir_core::ipc::ManualDiagnosticPointStatus;
-use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
+use nidavellir_core::safe_loop::{
+    BootFlag, SafeLoopStore, TuningPoint, GAME_TRACE_DIAGNOSTIC_PHASE,
+};
 
 pub(crate) type ManualPointStatusSlot = Arc<Mutex<ManualDiagnosticPointStatus>>;
 
@@ -43,6 +45,25 @@ impl ManualPointHandle {
         target_mhz: u32,
         requested_voltage_mv: u32,
     ) -> Result<ManualDiagnosticPointStatus, String> {
+        self.apply_with_mode(store, target_mhz, requested_voltage_mv, false)
+    }
+
+    pub fn apply_curve(
+        &mut self,
+        store: &SafeLoopStore,
+        target_mhz: u32,
+        requested_voltage_mv: u32,
+    ) -> Result<ManualDiagnosticPointStatus, String> {
+        self.apply_with_mode(store, target_mhz, requested_voltage_mv, true)
+    }
+
+    fn apply_with_mode(
+        &mut self,
+        store: &SafeLoopStore,
+        target_mhz: u32,
+        requested_voltage_mv: u32,
+        curve_only: bool,
+    ) -> Result<ManualDiagnosticPointStatus, String> {
         if self.status().active {
             return Err(
                 "A manual diagnostic point is already active; return to stock first".into(),
@@ -55,14 +76,24 @@ impl ManualPointHandle {
             return Err("Requested voltage must be between 500 and 1250 mV".into());
         }
 
-        let record = store.load_record();
+        let record = store.load_record_checked().map_err(|error| {
+            format!("Safe Loop record is unreadable; manual point refused: {error}")
+        })?;
         if record.safe_mode {
             return Err(
                 "Safe Mode is active; recover the GPU before applying a manual point".into(),
             );
         }
-        if store.is_boot_flag_armed() {
-            return Err("Safe Loop recovery is armed; return the GPU to stock before applying a manual point".into());
+        match store.read_boot_flag_checked() {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err("Safe Loop recovery is armed; return the GPU to stock before applying a manual point".into())
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Safe Loop boot flag is unreadable; manual point refused: {error}"
+                ))
+            }
         }
 
         let (resolved_voltage_mv, offset_mhz) =
@@ -71,16 +102,32 @@ impl ManualPointHandle {
                 requested_voltage_mv,
             )?;
 
-        reset_hardware()?;
-        crate::gpu_apply::clear_applied();
-
-        if let Err(error) = apply_resolved_point(
+        crate::gpu_apply::generic_hardware_write_preflight(
             store,
-            target_mhz,
-            resolved_voltage_mv,
-            offset_mhz,
-            "manual_diagnostic_point",
-        ) {
+            Some((target_mhz, resolved_voltage_mv)),
+        )?;
+
+        reset_hardware()?;
+        crate::gpu_apply::clear_applied_checked()?;
+
+        let apply_result = if curve_only {
+            apply_resolved_curve_point(
+                store,
+                target_mhz,
+                resolved_voltage_mv,
+                offset_mhz,
+                GAME_TRACE_DIAGNOSTIC_PHASE,
+            )
+        } else {
+            apply_resolved_point(
+                store,
+                target_mhz,
+                resolved_voltage_mv,
+                offset_mhz,
+                "manual_diagnostic_point",
+            )
+        };
+        if let Err(error) = apply_result {
             let recovery = reset_and_disarm(store);
             return Err(match recovery {
                 Ok(()) => format!("Manual point apply failed ({error}); GPU returned to stock"),
@@ -100,7 +147,12 @@ impl ManualPointHandle {
                 .ok()
                 .map(|duration| duration.as_millis() as u64),
             verified: true,
-            note: "Temporary point is active with a max-clock ceiling and verified voltage lock. Start Game Trace before launching the workload.".into(),
+            note: if curve_only {
+                "Temporary curve is active with a max-clock ceiling and elastic voltage. Game Trace can now monitor the real workload."
+            } else {
+                "Temporary point is active with a max-clock ceiling and verified voltage lock. Start Game Trace before launching the workload."
+            }
+            .into(),
         })?;
         Ok(self.status())
     }
@@ -112,10 +164,13 @@ impl ManualPointHandle {
     }
 
     pub fn mark_reset(&mut self) {
-        let _ = replace_status(&self.status, ManualDiagnosticPointStatus {
-            note: "GPU is at stock; no manual diagnostic point is active.".into(),
-            ..ManualDiagnosticPointStatus::default()
-        });
+        let _ = replace_status(
+            &self.status,
+            ManualDiagnosticPointStatus {
+                note: "GPU is at stock; no manual diagnostic point is active.".into(),
+                ..ManualDiagnosticPointStatus::default()
+            },
+        );
     }
 }
 
@@ -136,6 +191,38 @@ pub(crate) fn apply_resolved_point(
     offset_mhz: i32,
     source: &str,
 ) -> Result<(), String> {
+    // Detector Lab calls this for every lane re-apply. Re-read current reboot/Safe Loop/ledger/cone
+    // state immediately before each write instead of trusting the session-start decision.
+    crate::gpu_apply::generic_hardware_write_preflight(
+        store,
+        Some((target_mhz, resolved_voltage_mv)),
+    )?;
+    arm_manual_point(store, target_mhz, resolved_voltage_mv, offset_mhz, source)?;
+    crate::gpu_undervolt::apply_anchored_undervolt(target_mhz, resolved_voltage_mv)
+}
+
+pub(crate) fn apply_resolved_curve_point(
+    store: &SafeLoopStore,
+    target_mhz: u32,
+    resolved_voltage_mv: u32,
+    offset_mhz: i32,
+    source: &str,
+) -> Result<(), String> {
+    crate::gpu_apply::generic_hardware_write_preflight(
+        store,
+        Some((target_mhz, resolved_voltage_mv)),
+    )?;
+    arm_manual_point(store, target_mhz, resolved_voltage_mv, offset_mhz, source)?;
+    crate::gpu_undervolt::apply_anchored_curve_only(target_mhz, resolved_voltage_mv)
+}
+
+fn arm_manual_point(
+    store: &SafeLoopStore,
+    target_mhz: u32,
+    resolved_voltage_mv: u32,
+    offset_mhz: i32,
+    source: &str,
+) -> Result<(), String> {
     let intent = TuningPoint::from_axes([
         ("gpu_freq_mhz", target_mhz as i64),
         ("gpu_vf_bin_mv", resolved_voltage_mv as i64),
@@ -143,8 +230,7 @@ pub(crate) fn apply_resolved_point(
     ]);
     store
         .arm_boot_flag(&BootFlag::new(intent, source))
-        .map_err(|error| format!("Manual point: failed to arm Safe Loop before write: {error}"))?;
-    crate::gpu_undervolt::apply_anchored_undervolt(target_mhz, resolved_voltage_mv)
+        .map_err(|error| format!("Manual point: failed to arm Safe Loop before write: {error}"))
 }
 
 pub(crate) fn reset_hardware() -> Result<(), String> {
@@ -161,11 +247,33 @@ pub(crate) fn reset_hardware() -> Result<(), String> {
 }
 
 pub(crate) fn reset_and_disarm(store: &SafeLoopStore) -> Result<(), String> {
+    let record = store.load_record_checked();
+    let boot_flag = store.read_boot_flag_checked();
     reset_hardware()?;
-    crate::gpu_apply::clear_applied();
-    store.clear_boot_flag().map_err(|error| {
-        format!("GPU reset completed but Safe Loop flag could not be cleared: {error}")
-    })
+    crate::gpu_apply::clear_applied_checked()?;
+    record.map_err(|error| {
+        format!(
+            "GPU reset completed but Safe Loop record is unreadable; recovery state remains armed: {error}"
+        )
+    })?;
+    let boot_flag = boot_flag.map_err(|error| {
+        format!(
+            "GPU reset completed but Safe Loop boot flag is unreadable and remains armed: {error}"
+        )
+    })?;
+    let Some(expected) = boot_flag.as_ref() else {
+        return Ok(());
+    };
+    match store.clear_boot_flag_if_matches(expected) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(
+            "GPU reset completed, but boot-flag ownership changed; the newer transaction remains armed"
+                .into(),
+        ),
+        Err(error) => Err(format!(
+            "GPU reset completed but its owned Safe Loop flag could not be cleared: {error}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +303,53 @@ mod tests {
         handle.mark_reset();
         assert!(!handle.status().active);
         assert!(handle.status().target_mhz.is_none());
+    }
+
+    #[test]
+    fn manual_point_shared_preflight_blocks_pending_and_cone_but_allows_first_above() {
+        use nidavellir_core::safe_loop::{ForgeIncident, ForgeIncidentKind, SafeLoopRecord};
+        let mut pending = SafeLoopRecord::default();
+        assert!(pending.record_forge_incident(ForgeIncident::new(
+            ForgeIncidentKind::RuntimeFailure,
+            Some("run-pending".into()),
+            Some("gpu-a".into()),
+            None,
+            None,
+            "pending recovery",
+        )));
+        let mut cone = nidavellir_core::condemnation::CondemnedPairs::default();
+        cone.rigid.push((1800, 881));
+        assert!(crate::gpu_power_sweep::f2_apply_preflight_from_sources(
+            &pending, &cone, 1800, 893,
+        )
+        .unwrap_err()
+        .contains("acknowledgement"));
+
+        let clean = SafeLoopRecord::default();
+        assert!(
+            crate::gpu_power_sweep::f2_apply_preflight_from_sources(&clean, &cone, 1800, 875,)
+                .is_err()
+        );
+        assert!(
+            crate::gpu_power_sweep::f2_apply_preflight_from_sources(&clean, &cone, 1800, 893,)
+                .is_ok()
+        );
+
+        let mut quarantine = nidavellir_core::condemnation::CondemnedPairs::default();
+        quarantine.quarantine.push((1800, 893));
+        assert!(crate::gpu_power_sweep::f2_apply_preflight_from_sources(
+            &clean,
+            &quarantine,
+            1800,
+            893,
+        )
+        .is_err(), "hardware Apply treats the quarantined exact pair as prohibited");
+        assert!(crate::gpu_power_sweep::f2_apply_preflight_from_sources(
+            &clean,
+            &quarantine,
+            1800,
+            900,
+        )
+        .is_ok());
     }
 }

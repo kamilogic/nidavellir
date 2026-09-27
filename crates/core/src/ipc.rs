@@ -20,6 +20,9 @@ pub enum IpcRequest {
     /// Explicitly acknowledge the pending Forge restart/runtime incident. This releases only the
     /// acknowledgement latch; durable blacklist and incident history remain.
     AcknowledgeForgeIncident,
+    /// Development console only: authorize one fresh Standard validation while preserving all
+    /// negative evidence. The service must opt in; authorization never starts a workload.
+    AuthorizeDevelopmentValidation { reason: String },
     GetGpuCurve,
     StartGpuValidation,
     GetGpuValidation,
@@ -35,11 +38,10 @@ pub enum IpcRequest {
     ApplyDeepCalm,
     ApplyMemPeak,
     ResetGpuTuning,
-    /// Deep reset: same emergency recovery as [`IpcRequest::ResetGpuTuning`] (stock GPU, Safe Loop
-    /// latch released, run checkpoint cleared) but ALSO discards all learning — the Safe Loop
-    /// blacklist, the F2 observation frontier, and legacy knowledge. Additive; the UI offers it as a
-    /// separate, stronger-confirmation "forget everything" control.
+    /// Returns to stock and clears all saved GPU learning, including negative history and archives.
     ResetGpuTuningFull,
+    /// Returns to stock and clears positive learning/checkpoints, preserving known failures.
+    ResetGpuTuningSoft,
     GetAppliedProfile,
     VerifyAppliedProfile,
     StartForgeAll,
@@ -49,13 +51,9 @@ pub enum IpcRequest {
     StopBenchmark,
     GetBenchmarkProgress,
     StartPowerSweep,
-    /// EXPERIMENTAL clean-run variant of `StartPowerSweep` (development): the same Standard dwell
-    /// policy, but the search is fully ORGANIC — pre-run observations/frontier and `forge_state`
-    /// are archived under `forge-archive/<run_id>/`, prior GPU V/F blacklist regions are stripped
-    /// from `safe_loop.json` (snapshotted first) and the durable condemnation ledger is read
-    /// run-scoped only. Failures produced DURING the run still block and steer repairs; sentinel,
-    /// startup recovery and Safe Mode stay fully active. Additive — production learning keeps the
-    /// existing requests.
+    /// Clean-run variant of `StartPowerSweep`: uses the Standard dwell policy while rebuilding
+    /// positive discovery/profile evidence. Effective Safe Loop blacklist, Rigid/Quarantine ledger
+    /// entries and the persistent TDR cone remain global and active before every candidate write.
     StartPowerSweepClean,
     /// Deprecated wire alias retained for mixed-version clients; service executes Standard and
     /// never restores the former provisional Fast behavior.
@@ -92,6 +90,12 @@ pub enum IpcRequest {
     /// Apply one operator-selected F2 point for real-world diagnostics. The point is temporary,
     /// never becomes a persisted profile and remains protected by the Safe Loop until reset.
     ApplyManualDiagnosticPoint {
+        target_mhz: u32,
+        voltage_mv: u32,
+    },
+    /// Apply the same temporary point as an elastic anchored curve (no voltage lock). This is used
+    /// only for real-workload diagnostics and remains Safe-Loop armed until explicit reset.
+    ApplyManualDiagnosticCurvePoint {
         target_mhz: u32,
         voltage_mv: u32,
     },
@@ -219,10 +223,15 @@ pub struct PowerSweepPoint {
     pub power_w: f32,
     /// Peak sampled power (W) — the spike headroom indicator.
     pub max_power_w: f32,
-    /// Sustained high-power percentile (W) used by F2 frontier decisions and profile calibration.
+    /// Sustained high-power percentile (W): calibration before qualification, then the maximum
+    /// including every completed Apply stress lane. Ranking uses comparison_power_p99_w.
     /// `None` for legacy/F1 points and observations that predate discovery contract v3.
     #[serde(default)]
     pub power_p99_w: Option<f32>,
+    /// Comparable PowerRender p99 at this exact Apply anchor. Never overwritten by stress lanes.
+    /// Missing on older results; worst-case stress power must not stand in for this metric.
+    #[serde(default)]
+    pub comparison_power_p99_w: Option<f32>,
     /// Std-dev of power (W) — workload spikiness, for the Brokkr's headroom calc.
     pub power_std_w: f32,
     /// Fraction of samples (0–1) the card was power-capped (SW_POWER_CAP).
@@ -339,13 +348,81 @@ pub struct ForgeResumeCompatibility {
     pub driver_info: String,
 }
 
-/// Power-target sweep: for a range of locked voltages, the max stable clock and
-/// the sustained power it draws under a heavy load — used to find the perf/watt
-/// knee (best performance just before diminishing returns) under the power cap.
+/// Durable clock-search evidence; policy exclusions are distinct from tested voltages.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForgeClockSearch {
+    pub target_mhz: u32,
+    pub last_good_mv: Option<u32>,
+    pub first_bad_mv: Option<u32>,
+    /// A policy exclusion, not a measured minimum stable voltage.
+    pub censored_floor_mv: Option<u32>,
+    pub stop_reason: String,
+    pub completed: bool,
+}
+
+/// Run-scoped discovery budget. This records search policy, never GPU stability evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeDiscoverySearch {
+    pub version: u32,
+    pub attempts_used: u32,
+    pub attempts_limit: u32,
+    pub time_budget_ms: u64,
+    pub elapsed_ms: u64,
+    pub stop_reason: Option<String>,
+    pub integrity_errors: u32,
+    /// At most one clean discovery control reapplication per run; Resume cannot renew it.
+    #[serde(default)]
+    pub control_retries_used: u32,
+    pub next_band_index: usize,
+    pub bands: Vec<ForgeDiscoveryBand>,
+}
+
+/// Stable band identity survives Resume and changes in the highest qualified clock.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeDiscoveryBand {
+    pub id: String,
+    pub target_clock_mhz: u32,
+    pub voltage_mv: u32,
+    pub clock_ceiling_mhz: u32,
+    /// pending, in_flight or closed; none of these states certifies stability.
+    pub status: String,
+    pub attempts: u32,
+    pub stop_reason: Option<String>,
+    pub power_preparation_used: bool,
+    /// Failed voltage at the current clock; power jumps never land at/below it. Not a stability bound.
+    #[serde(default)]
+    pub integrity_floor_voltage_mv: Option<u32>,
+    pub last_qualified_clock_mhz: Option<u32>,
+    pub last_qualified_voltage_mv: Option<u32>,
+    /// Performance exploration alternates one lower voltage bin and one higher clock bin.
+    pub next_raise_clock: bool,
+}
+
+/// Power-target sweep and the measured profile trade-offs, with search coverage separate from
+/// point qualification.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PowerSweepProgress {
+    #[serde(default)]
+    pub discovery_search: Option<ForgeDiscoverySearch>,
+    /// Durable per-clock outcomes, independent of the bounded human-readable log tail.
+    #[serde(default)]
+    pub clock_search: Vec<ForgeClockSearch>,
+    /// One bounded economic extension per run, based on final Godforge sustained p5 clock;
+    /// persisted so Resume cannot renew its budget.
+    #[serde(default)]
+    pub economic_extension_cmax_mhz: Option<u32>,
+    /// Coverage of the 90% economic domain of the final selected Godforge, not point stability.
+    #[serde(default)]
+    pub profile_search_complete: bool,
     pub running: bool,
     pub phase: String,
+    /// Live service refusal for new exploration; recomputed after either learning reset.
+    /// Recomputed for GetPowerSweepProgress; not proof that a start is otherwise eligible.
+    #[serde(default)]
+    pub start_block_reason: Option<String>,
+    /// Runtime-only development authorization status; never restores permission from a checkpoint.
+    #[serde(default, skip_deserializing)]
+    pub development_validation_note: Option<String>,
     pub log: Vec<String>,
     pub points: Vec<PowerSweepPoint>,
     /// Enforced power cap (W).
@@ -754,6 +831,13 @@ pub struct SafeLoopStatus {
     /// True when Forge/Apply must remain blocked until explicit operator acknowledgement.
     #[serde(default)]
     pub recovery_pending_ack: bool,
+    /// True after a GPU driver reset in the current Windows boot. GPU-mutating actions remain
+    /// blocked until Windows restarts even if the driver appears to have recovered.
+    #[serde(default)]
+    pub gpu_reboot_required: bool,
+    /// Event Log timestamp that latched `gpu_reboot_required`, when available.
+    #[serde(default)]
+    pub gpu_reboot_event: Option<String>,
     /// The exact attributed candidate when available; absent coordinates are intentionally unknown.
     #[serde(default)]
     pub pending_forge_incident: Option<ForgeIncident>,
@@ -866,6 +950,21 @@ mod tests {
             req,
             IpcRequest::ApplyManualDiagnosticPoint {
                 target_mhz: 1800,
+                voltage_mv: 869,
+            }
+        ));
+    }
+
+    #[test]
+    fn manual_diagnostic_curve_request_roundtrips_parameter_object() {
+        let req = parse_request(
+            r#"{"method":"ApplyManualDiagnosticCurvePoint","params":{"target_mhz":1860,"voltage_mv":869}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            req,
+            IpcRequest::ApplyManualDiagnosticCurvePoint {
+                target_mhz: 1860,
                 voltage_mv: 869,
             }
         ));
@@ -1024,5 +1123,7 @@ mod tests {
         }"#;
         let status: SafeLoopStatus = serde_json::from_str(legacy).unwrap();
         assert!(status.condemnations.is_empty());
+        assert!(!status.gpu_reboot_required);
+        assert!(status.gpu_reboot_event.is_none());
     }
 }

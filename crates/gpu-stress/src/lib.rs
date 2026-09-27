@@ -124,6 +124,33 @@ pub struct RenderResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WgpuBackend {
+    Vulkan,
+    Dx12,
+}
+
+impl WgpuBackend {
+    fn backends(self) -> wgpu::Backends {
+        match self {
+            Self::Vulkan => wgpu::Backends::VULKAN,
+            Self::Dx12 => wgpu::Backends::DX12,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WgpuRenderGoldens {
+    pub power: u32,
+    pub boost: u32,
+    pub texrop: u32,
+    pub cadence: u32,
+    pub geometry: u32,
+    pub stream: u32,
+    pub stream_frame_reference_ms: u32,
+    pub boost_frame_reference_us: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderGoldens {
     pub power: u32,
     pub boost: u32,
@@ -147,11 +174,31 @@ pub struct RenderGoldens {
     /// Stock native-DX11 checksum and adapter identity. Captured before any candidate write so the
     /// exact-Apply DX11 gate compares the same physical NVIDIA adapter against its own reference.
     pub dx11: Dx11Golden,
+    /// Stock goldens captured through an explicitly selected Direct3D 12 backend. The top-level
+    /// fields remain the explicitly selected Vulkan reference used by the existing qualifier.
+    pub dx12: WgpuRenderGoldens,
+}
+
+impl RenderGoldens {
+    pub fn for_dx12(self) -> Self {
+        Self {
+            power: self.dx12.power,
+            boost: self.dx12.boost,
+            texrop: self.dx12.texrop,
+            cadence: self.dx12.cadence,
+            geometry: self.dx12.geometry,
+            stream: self.dx12.stream,
+            stream_frame_reference_ms: self.dx12.stream_frame_reference_ms,
+            boost_frame_reference_us: self.dx12.boost_frame_reference_us,
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Dx11Golden {
     pub checksum: u32,
+    pub compute_checksum: u32,
     pub adapter_luid: i64,
     pub frame_reference_us: u32,
 }
@@ -169,6 +216,7 @@ pub struct Dx11QualificationResult {
     pub result: StabilityResult,
     pub frames: u64,
     pub checks: u32,
+    pub compute_checks: u32,
     pub fps: f64,
     pub elapsed_ms: u64,
     pub timed_out: bool,
@@ -383,13 +431,13 @@ pub fn vf_qualifier_workload_fingerprint(pattern: VfQualifierPattern) -> &'stati
         VfQualifierPattern::Fsgl3A => "f2q-texhop-v10-r1/fsgl3-a",
         VfQualifierPattern::Fsgl3B => "f2q-texhop-v10-r1/fsgl3-b",
         VfQualifierPattern::V8HighFps => "f2q-texhop-v10-r1/v8-high-fps",
-        VfQualifierPattern::V8Texture => "f2q-texhop-v13-r3/v13-persistent-field-concurrency",
+        VfQualifierPattern::V8Texture => "f2q-texhop-v13-r4/v13-stock-checked-field-concurrency",
         VfQualifierPattern::V8Transitions => {
             "f2q-texhop-v10-r1/v8-transitions"
         }
         VfQualifierPattern::V8Memory => "f2q-texhop-v10-r1/v8-memory",
         VfQualifierPattern::Endurance => {
-            "f2q-texhop-v13-r3/endurance-persistent-field-concurrency"
+            "f2q-texhop-v13-r4/endurance-stock-checked-field-concurrency"
         }
         VfQualifierPattern::TransitionShock => {
             "f2q-texhop-v10-r1/transition-shock"
@@ -402,7 +450,7 @@ pub fn vf_qualifier_workload_fingerprint(pattern: VfQualifierPattern) -> &'stati
 
 /// Stable description of the framebuffer integrity mechanism persisted with F2 evidence.
 pub fn vf_qualifier_checksum_method() -> &'static str {
-    "reduce3-gpu-compare-r1;dense-default;sparse16=boost-edge,mixed-game,field-concurrency;primary=rotating-final;secondary=persistent-device-texture-selfcheck"
+    "reduce3-gpu-compare-r1;dense-default;sparse16=boost-edge,mixed-game,field-concurrency;primary=rotating-final;secondary=persistent-device-texture-stock-golden;peer-stop=first-failure"
 }
 
 fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u32> {
@@ -482,15 +530,66 @@ fn render_integrity_result(crashed: bool, diverged: bool) -> StabilityResult {
 }
 
 fn stronger_stability_failure(a: StabilityResult, b: StabilityResult) -> StabilityResult {
-    fn rank(result: StabilityResult) -> u8 {
-        match result {
-            StabilityResult::Stable => 0,
-            StabilityResult::Unstable => 1,
-            StabilityResult::SilentError => 2,
-            StabilityResult::Crash => 3,
+    if stability_failure_rank(b) > stability_failure_rank(a) { b } else { a }
+}
+
+fn stability_failure_rank(result: StabilityResult) -> u8 {
+    match result {
+        StabilityResult::Stable => 0,
+        StabilityResult::Unstable => 1,
+        StabilityResult::SilentError => 2,
+        StabilityResult::Crash => 3,
+    }
+}
+
+#[derive(Default)]
+struct FieldRunControl {
+    stop: AtomicBool,
+    failure: AtomicU8,
+}
+
+impl FieldRunControl {
+    fn record_failure(&self, result: StabilityResult) {
+        if result != StabilityResult::Stable {
+            self.failure.fetch_max(stability_failure_rank(result), Ordering::SeqCst);
+            self.stop.store(true, Ordering::SeqCst);
         }
     }
-    if rank(b) > rank(a) { b } else { a }
+
+    fn failure(&self) -> StabilityResult {
+        match self.failure.load(Ordering::SeqCst) {
+            3 => StabilityResult::Crash,
+            2 => StabilityResult::SilentError,
+            1 => StabilityResult::Unstable,
+            _ => StabilityResult::Stable,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RenderCancellation<'a> {
+    external: Option<&'a AtomicBool>,
+    field: Option<&'a FieldRunControl>,
+}
+
+impl RenderCancellation<'_> {
+    fn is_cancelled(self) -> bool {
+        self.external.is_some_and(|stop| stop.load(Ordering::SeqCst))
+            || self.field.is_some_and(|control| control.stop.load(Ordering::SeqCst))
+    }
+
+    fn record_failure(self, result: StabilityResult) {
+        if let Some(control) = self.field {
+            control.record_failure(result);
+        }
+    }
+
+    fn may_check_pending_integrity(self) -> bool {
+        // Normal primary completion stops further secondary frames, but its last submitted frame
+        // still needs a checksum readback. A user stop or detected peer failure does not earn a pass.
+        !self.external.is_some_and(|stop| stop.load(Ordering::SeqCst))
+            && self.field.is_none_or(|control| control.failure() == StabilityResult::Stable)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +606,9 @@ fn merge_field_canary(
     secondary: FieldCanaryReport,
     phase: VfQualifierPhase,
 ) {
+    // A first-frame failure may have no usable coverage. Preserve it before evaluating coverage;
+    // peer cancellation and an incomplete checksum count must never hide physical failure.
+    primary.result = stronger_stability_failure(primary.result, secondary.result);
     if primary.result == StabilityResult::Stable {
         let missing_secondary = secondary.cycles == 0 || secondary.checksum_count < 2;
         if secondary.inconclusive_reason.is_some() || missing_secondary {
@@ -520,7 +622,6 @@ fn merge_field_canary(
         }
     }
 
-    primary.result = stronger_stability_failure(primary.result, secondary.result);
     primary.frames = primary.frames.saturating_add(secondary.frames);
     if let Some(report) = primary.phase_reports.first_mut() {
         report.result = primary.result;
@@ -530,7 +631,60 @@ fn merge_field_canary(
     }
     if primary.result != StabilityResult::Stable {
         primary.failure_phase = Some(phase);
+        primary.inconclusive_reason = None;
     }
+}
+
+/// Coordinate both queues without detaching either worker. Stop means cease future submissions;
+/// a driver wait or device teardown can still block. The caller may only restore stock after this
+/// function returns, never concurrently with a GPU worker that has merely received cancellation.
+fn run_field_workers(
+    phase: VfQualifierPhase,
+    primary_work: impl FnOnce(&FieldRunControl) -> RenderResult,
+    secondary_work: impl FnOnce(&FieldRunControl) -> FieldCanaryReport + Send,
+) -> RenderResult {
+    let control = FieldRunControl::default();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                secondary_work(&control)
+            })).unwrap_or(FieldCanaryReport {
+                result: StabilityResult::Stable,
+                cycles: 0,
+                frames: 0,
+                checksum_count: 0,
+                inconclusive_reason: Some("field_secondary_worker_panicked".into()),
+            });
+            control.record_failure(report.result);
+            if report.inconclusive_reason.is_some() {
+                control.stop.store(true, Ordering::SeqCst);
+            }
+            report
+        });
+        let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            primary_work(&control)
+        }));
+        let mut primary = match primary {
+            Ok(result) => result,
+            Err(panic) => {
+                // The scoped join still owns the secondary lifetime during primary unwinding.
+                control.stop.store(true, Ordering::SeqCst);
+                std::panic::resume_unwind(panic)
+            }
+        };
+        control.record_failure(primary.result);
+        control.stop.store(true, Ordering::SeqCst);
+        let secondary = worker.join().unwrap_or(FieldCanaryReport {
+            result: StabilityResult::Stable,
+            cycles: 0,
+            frames: 0,
+            checksum_count: 0,
+            inconclusive_reason: Some("field_secondary_worker_panicked".into()),
+        });
+        primary.result = stronger_stability_failure(primary.result, control.failure());
+        merge_field_canary(&mut primary, secondary, phase);
+        primary
+    })
 }
 
 /// Marginal-silicon frame-time gate for the banded/light regimes (TextureStream, BoostEdge): true
@@ -731,10 +885,9 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 8),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 6),
     ];
-    // v14 candidate-only endurance soak — WORST-REALISTIC (harsher than a real game, on purpose, so a
-    // PASS means real games are safe with margin — but NOT a synthetic power-virus that would reject
-    // game-stable points). ONE continuous dwell, never resets mid-run, so thermal saturation truly
-    // accumulates. Four ingredients, each targeting a real undervolt failure mode:
+    // v14 candidate-only endurance soak: one continuous mixed dwell, never resets mid-run, so
+    // thermal exposure accumulates. A pass covers this recipe and duration, not every game or all
+    // future conditions. Four ingredients target different undervolt failure modes:
     //   1. SUSTAINED max-power (HeavySpike held) → junction/VRM/current saturation a game's average
     //      load never reaches.
     //   2. CAP-SLAM (HeavySpike burst ↔ IdlePulse release, repeated) → oscillates the VRM; under the
@@ -1439,10 +1592,13 @@ pub struct GpuAdapterIdentity {
     pub backend: String,
     pub driver: String,
     pub driver_info: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
 }
 
 /// A live GPU device for running the battery (set up once, reused per stage).
 pub struct GpuCtx {
+    adapter: Arc<wgpu::Adapter>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pub adapter_name: String,
@@ -1454,8 +1610,16 @@ pub struct GpuCtx {
 
 impl GpuCtx {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_backends(wgpu::Backends::VULKAN | wgpu::Backends::DX12)
+    }
+
+    pub fn new_for_backend(backend: WgpuBackend) -> Result<Self, String> {
+        Self::new_with_backends(backend.backends())
+    }
+
+    fn new_with_backends(backends: wgpu::Backends) -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            backends,
             ..Default::default()
         });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -1464,6 +1628,10 @@ impl GpuCtx {
             force_fallback_adapter: false,
         }))
         .ok_or_else(|| "no suitable GPU adapter found".to_string())?;
+        Self::new_on_adapter(Arc::new(adapter))
+    }
+
+    fn new_on_adapter(adapter: Arc<wgpu::Adapter>) -> Result<Self, String> {
         let adapter_info = adapter.get_info();
         let adapter_name = adapter_info.name.clone();
         let adapter_identity = GpuAdapterIdentity {
@@ -1471,6 +1639,8 @@ impl GpuCtx {
             backend: format!("{:?}", adapter_info.backend).to_ascii_lowercase(),
             driver: adapter_info.driver,
             driver_info: adapter_info.driver_info,
+            vendor_id: adapter_info.vendor,
+            device_id: adapter_info.device,
         };
         // Request the adapter's full limits so we can allocate large
         // VRAM-resident buffers (cache-busting + VRAM coverage).
@@ -1495,6 +1665,7 @@ impl GpuCtx {
             }));
         }
         Ok(Self {
+            adapter,
             device,
             queue,
             adapter_name,
@@ -2432,7 +2603,12 @@ impl GpuCtx {
         )
     }
 
-    fn run_field_canary_worker(target_ms: u64, stop: Arc<AtomicBool>) -> FieldCanaryReport {
+    fn run_field_canary_worker(
+        target_ms: u64,
+        adapter: Arc<wgpu::Adapter>,
+        stock_texrop: u32,
+        cancel: RenderCancellation<'_>,
+    ) -> FieldCanaryReport {
         let started = std::time::Instant::now();
         let mut report = FieldCanaryReport {
             result: StabilityResult::Stable,
@@ -2444,19 +2620,19 @@ impl GpuCtx {
 
         let initial_delay = FIELD_CANARY_INITIAL_DELAY_MS.min(target_ms);
         while started.elapsed().as_millis() < u128::from(initial_delay)
-            && !stop.load(Ordering::SeqCst)
+            && !cancel.is_cancelled()
         {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
 
         let remaining = target_ms.saturating_sub(started.elapsed().as_millis() as u64);
-        if remaining < 600 || stop.load(Ordering::SeqCst) {
+        if remaining < 600 || cancel.is_cancelled() {
             return report;
         }
 
         // One independent queue remains resident for the phase. This keeps real multi-queue
         // scheduling pressure without repeatedly allocating and tearing down whole wgpu devices.
-        let ctx = match Self::new() {
+        let ctx = match Self::new_on_adapter(adapter) {
             Ok(ctx) => ctx,
             Err(error) => {
                 report.inconclusive_reason =
@@ -2464,15 +2640,15 @@ impl GpuCtx {
                 return report;
             }
         };
-        let canary = ctx.run_render_profile(
+        let canary = ctx.run_render_profile_with_cancel(
             remaining,
             VfWorkload::TextureRop,
             Some(VfQualifierPhase::CompositeGameLoad),
             false,
             true,
+            Some(RenderIntegrityGoldens::Single(stock_texrop)),
             None,
-            None,
-            Some(stop.as_ref()),
+            cancel,
         );
         report.cycles = 1;
         report.frames = canary.frames;
@@ -2486,42 +2662,46 @@ impl GpuCtx {
     }
 
     /// Field-derived v13 Texture Stack: a game-envelope render stays resident on this device while
-    /// one persistent secondary device runs the exact TextureRop self-check used by the live
-    /// Sentinel. The independent queues retain the concurrency seen in trace `1784411518295`
-    /// without turning device-lifetime churn into a false candidate verdict.
+    /// one persistent secondary device on the same adapter/backend runs TextureRop against its
+    /// stock reference. The deterministic render configuration is the same TextureRop workload
+    /// used by capture_one_golden; never derive a reference from the active undervolt candidate.
     fn run_field_concurrency_profile(
         &self,
         target_ms: u64,
         phase: VfQualifierPhase,
         goldens: Option<RenderIntegrityGoldens>,
+        stock_texrop: Option<u32>,
         cancel: Option<&AtomicBool>,
     ) -> RenderResult {
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let worker = std::thread::spawn(move || {
-            Self::run_field_canary_worker(target_ms, worker_stop)
-        });
-        let mut primary = self.run_render_profile(
-            target_ms,
-            VfWorkload::CompositeGameLoad,
-            Some(phase),
-            false,
-            true,
-            goldens,
-            None,
-            cancel,
-        );
-        stop.store(true, Ordering::SeqCst);
-        let secondary = worker.join().unwrap_or(FieldCanaryReport {
-            result: StabilityResult::Stable,
-            cycles: 0,
-            frames: 0,
-            checksum_count: 0,
-            inconclusive_reason: Some("field_secondary_worker_panicked".into()),
-        });
-
-        merge_field_canary(&mut primary, secondary, phase);
-        primary
+        let Some(stock_texrop) = stock_texrop else {
+            return RenderResult {
+                result: StabilityResult::Stable,
+                frames: 0,
+                fps: 0.0,
+                failure_phase: None,
+                inconclusive_reason: Some("field_secondary_stock_golden_missing".into()),
+                phase_reports: Vec::new(),
+            };
+        };
+        run_field_workers(
+            phase,
+            |control| self.run_render_profile_with_cancel(
+                target_ms,
+                VfWorkload::CompositeGameLoad,
+                Some(phase),
+                false,
+                true,
+                goldens,
+                None,
+                RenderCancellation { external: cancel, field: Some(control) },
+            ),
+            |control| Self::run_field_canary_worker(
+                target_ms,
+                Arc::clone(&self.adapter),
+                stock_texrop,
+                RenderCancellation { external: cancel, field: Some(control) },
+            ),
+        )
     }
 
     /// Stock preflight for the field-concurrency path. A platform that cannot create two healthy
@@ -2536,6 +2716,7 @@ impl GpuCtx {
             target_ms,
             VfQualifierPhase::CompositeGameLoad,
             integrity_goldens_for_workload(goldens, VfWorkload::CompositeGameLoad),
+            Some(goldens.texrop),
             None,
         )
     }
@@ -2942,6 +3123,7 @@ impl GpuCtx {
                     segment.duration_ms,
                     segment.phase,
                     goldens.and_then(|g| integrity_goldens_for_workload(g, workload)),
+                    goldens.map(|g| g.texrop),
                     cancel,
                 ),
                 other => self.run_render_profile(
@@ -3087,6 +3269,40 @@ impl GpuCtx {
         frame_reference_us: Option<u64>,
         cancel: Option<&AtomicBool>,
     ) -> RenderResult {
+        self.run_render_profile_with_cancel(
+            target_ms,
+            profile,
+            phase,
+            idle_pulses,
+            full_workload_duration,
+            goldens,
+            frame_reference_us,
+            RenderCancellation { external: cancel, field: None },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_render_profile_with_cancel(
+        &self,
+        target_ms: u64,
+        profile: VfWorkload,
+        phase: Option<VfQualifierPhase>,
+        idle_pulses: bool,
+        full_workload_duration: bool,
+        goldens: Option<RenderIntegrityGoldens>,
+        frame_reference_us: Option<u64>,
+        cancel: RenderCancellation<'_>,
+    ) -> RenderResult {
+        if cancel.is_cancelled() {
+            return RenderResult {
+                result: StabilityResult::Stable,
+                frames: 0,
+                fps: 0.0,
+                failure_phase: None,
+                inconclusive_reason: Some("workload_cancelled".into()),
+                phase_reports: Vec::new(),
+            };
+        }
         let start = std::time::Instant::now();
         let mut frames: u64 = 0;
         const DIM: u32 = 1536; // 1536*4 = 6144 B/row (256-aligned for copy)
@@ -3549,7 +3765,8 @@ impl GpuCtx {
         });
 
         while (workload_start.elapsed().as_millis() as u64) < target_ms
-            && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+            && !self.crashed.load(Ordering::SeqCst)
+            && !cancel.is_cancelled()
         {
             if frame_cadence {
                 // paced after submit
@@ -3613,7 +3830,7 @@ impl GpuCtx {
                     }
                     if stalled
                         || self.crashed.load(Ordering::SeqCst)
-                        || cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+                        || cancel.is_cancelled()
                     {
                         break;
                     }
@@ -3723,6 +3940,9 @@ impl GpuCtx {
                 cp.set_bind_group(0, bind, &[]);
                 cp.dispatch_workgroups(COMPOSITE_LANES / 64, 1, 1);
             }
+            if cancel.is_cancelled() {
+                break;
+            }
             self.queue.submit(Some(enc.finish()));
             frames += 1;
 
@@ -3746,7 +3966,7 @@ impl GpuCtx {
                 let idle_start = std::time::Instant::now();
                 while (idle_start.elapsed().as_millis() as u64) < gap_ms
                     && !self.crashed.load(Ordering::SeqCst)
-                    && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+                    && !cancel.is_cancelled()
                 {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
@@ -3775,7 +3995,7 @@ impl GpuCtx {
                     let spin_start = std::time::Instant::now();
                     while (spin_start.elapsed().as_micros() as u64) < bubble_us
                         && !self.crashed.load(Ordering::SeqCst)
-                        && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+                        && !cancel.is_cancelled()
                     {
                         std::hint::spin_loop();
                     }
@@ -3785,6 +4005,7 @@ impl GpuCtx {
             }
 
             if self.crashed.load(Ordering::SeqCst) {
+                cancel.record_failure(StabilityResult::Crash);
                 break;
             }
 
@@ -3797,6 +4018,7 @@ impl GpuCtx {
                         .is_some_and(|buf| self.read_u32(buf) > 0)
                     {
                         diverged = true;
+                        cancel.record_failure(StabilityResult::SilentError);
                         break;
                     }
                 }
@@ -3810,6 +4032,7 @@ impl GpuCtx {
                     &mut observed_sequences,
                 );
                 if diverged {
+                    cancel.record_failure(StabilityResult::SilentError);
                     break;
                 }
             } else if last_check.elapsed().as_millis() >= 250 {
@@ -3835,6 +4058,7 @@ impl GpuCtx {
                     Some(reference) => {
                         if sum != reference {
                             diverged = true;
+                            cancel.record_failure(StabilityResult::SilentError);
                             break;
                         }
                     }
@@ -3846,7 +4070,7 @@ impl GpuCtx {
         }
         if !diverged
             && !self.crashed.load(Ordering::SeqCst)
-            && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+            && cancel.may_check_pending_integrity()
         {
             if golden_mode {
                 self.device.poll(wgpu::Maintain::Wait);
@@ -3881,12 +4105,13 @@ impl GpuCtx {
         let mut result = render_integrity_result(self.crashed.load(Ordering::SeqCst), diverged);
         if result == StabilityResult::Stable
             && (stalled || degraded)
-            && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+            && !cancel.is_cancelled()
         {
             // Not a wrong result (no divergence) and not a crash — the bin is behaviourally
             // unstable: a band stalled toward the TDR watchdog or throughput collapsed.
             result = StabilityResult::Unstable;
         }
+        cancel.record_failure(result);
         let secs = start.elapsed().as_secs_f64().max(0.001);
         let phase_reports = phase
             .map(|phase| {
@@ -3904,7 +4129,8 @@ impl GpuCtx {
             frames,
             fps: frames as f64 / secs,
             failure_phase: (result != StabilityResult::Stable).then_some(phase).flatten(),
-            inconclusive_reason: None,
+            inconclusive_reason: (result == StabilityResult::Stable && cancel.is_cancelled())
+                .then(|| "workload_cancelled".into()),
             phase_reports,
         }
     }
@@ -4156,6 +4382,7 @@ mod tests {
             stream_frame_reference_ms: 7,
             boost_frame_reference_us: 8,
             dx11: Dx11Golden::default(),
+            dx12: WgpuRenderGoldens::default(),
         };
         assert_eq!(
             integrity_goldens_for_workload(goldens, VfWorkload::CompositeGameLoad),
@@ -4169,17 +4396,82 @@ mod tests {
     }
 
     #[test]
+    fn dx12_golden_projection_replaces_only_wgpu_reference_fields() {
+        let dx11 = Dx11Golden {
+            checksum: 9,
+            compute_checksum: 10,
+            adapter_luid: 11,
+            frame_reference_us: 12,
+        };
+        let dx12 = WgpuRenderGoldens {
+            power: 21,
+            boost: 22,
+            texrop: 23,
+            cadence: 24,
+            geometry: 25,
+            stream: 26,
+            stream_frame_reference_ms: 27,
+            boost_frame_reference_us: 28,
+        };
+        let projected = RenderGoldens {
+            power: 1,
+            boost: 2,
+            texrop: 3,
+            cadence: 4,
+            geometry: 5,
+            stream: 6,
+            stream_frame_reference_ms: 7,
+            boost_frame_reference_us: 8,
+            dx11,
+            dx12,
+        }
+        .for_dx12();
+        assert_eq!(projected.power, 21);
+        assert_eq!(projected.stream, 26);
+        assert_eq!(projected.dx11, dx11);
+        assert_eq!(projected.dx12, dx12);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "stock-GPU API backend smoke; run explicitly on Windows hardware"]
+    fn explicit_vulkan_and_dx12_backends_capture_stock_goldens() {
+        for (backend, expected) in [
+            (WgpuBackend::Vulkan, "vulkan"),
+            (WgpuBackend::Dx12, "dx12"),
+        ] {
+            let ctx = GpuCtx::new_for_backend(backend).expect("explicit graphics backend");
+            assert_eq!(ctx.adapter_identity().backend, expected);
+            let (golden, _) = ctx
+                .capture_one_golden(VfWorkload::TextureRop, 2_000)
+                .expect("deterministic API-specific golden");
+            assert_ne!(golden, 0);
+            let cancel = RenderCancellation { external: None, field: None };
+            let secondary = GpuCtx::run_field_canary_worker(
+                2_000, Arc::clone(&ctx.adapter), golden, cancel,
+            );
+            assert_eq!(secondary.result, StabilityResult::Stable);
+            assert!(secondary.checksum_count >= 2);
+            let wrong_reference = GpuCtx::run_field_canary_worker(
+                2_000, Arc::clone(&ctx.adapter), golden ^ 1, cancel,
+            );
+            assert_eq!(wrong_reference.result, StabilityResult::SilentError,
+                "secondary must compare with stock, never adopt its first candidate output");
+        }
+    }
+
+    #[test]
     fn workload_fingerprints_are_pattern_specific_and_capture_texture_hop_revision() {
         let texture = vf_qualifier_workload_fingerprint(VfQualifierPattern::V8Texture);
         let endurance = vf_qualifier_workload_fingerprint(VfQualifierPattern::Endurance);
         assert_ne!(texture, endurance);
         assert_eq!(
             texture,
-            "f2q-texhop-v13-r3/v13-persistent-field-concurrency"
+            "f2q-texhop-v13-r4/v13-stock-checked-field-concurrency"
         );
         assert_eq!(
             endurance,
-            "f2q-texhop-v13-r3/endurance-persistent-field-concurrency"
+            "f2q-texhop-v13-r4/endurance-stock-checked-field-concurrency"
         );
         assert!(vf_qualifier_checksum_method().contains("secondary=persistent-device"));
         assert!(!vf_qualifier_checksum_method().contains("fresh-device"));
@@ -4238,6 +4530,190 @@ mod tests {
             primary.phase_reports.is_empty(),
             "the primary queue alone must not complete Field Concurrency"
         );
+    }
+
+    fn field_primary(result: StabilityResult) -> RenderResult {
+        RenderResult {
+            result,
+            frames: 10,
+            fps: 60.0,
+            failure_phase: None,
+            inconclusive_reason: None,
+            phase_reports: vec![VfPhaseReport {
+                phase: VfQualifierPhase::CompositeGameLoad,
+                result,
+                frames: 10,
+                checksum_count: 4,
+                elapsed_ms: 1_000,
+            }],
+        }
+    }
+
+    fn field_secondary(result: StabilityResult, checks: u32) -> FieldCanaryReport {
+        FieldCanaryReport {
+            result,
+            cycles: 1,
+            frames: u64::from(checks),
+            checksum_count: checks,
+            inconclusive_reason: None,
+        }
+    }
+
+    fn wait_field_stop(control: &FieldRunControl) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !control.stop.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "peer did not receive stop");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn field_secondary_first_frame_failure_is_not_hidden_by_missing_coverage() {
+        for failure in [StabilityResult::SilentError, StabilityResult::Crash] {
+            let mut primary = field_primary(StabilityResult::Stable);
+            primary.inconclusive_reason = Some("workload_cancelled".into());
+            merge_field_canary(
+                &mut primary,
+                field_secondary(failure, 0),
+                VfQualifierPhase::CompositeGameLoad,
+            );
+            assert_eq!(primary.result, failure);
+            assert!(primary.inconclusive_reason.is_none());
+            assert_eq!(primary.failure_phase, Some(VfQualifierPhase::CompositeGameLoad));
+        }
+    }
+
+    #[test]
+    fn field_normal_completion_drains_integrity_but_abort_cannot_be_a_pass() {
+        let control = FieldRunControl::default();
+        let external = AtomicBool::new(false);
+        let cancel = RenderCancellation { external: Some(&external), field: Some(&control) };
+        control.stop.store(true, Ordering::SeqCst);
+        assert!(cancel.is_cancelled());
+        assert!(cancel.may_check_pending_integrity(), "check last submitted secondary frame");
+        external.store(true, Ordering::SeqCst);
+        assert!(!cancel.may_check_pending_integrity());
+        external.store(false, Ordering::SeqCst);
+        control.record_failure(StabilityResult::SilentError);
+        assert!(!cancel.may_check_pending_integrity());
+    }
+
+    #[test]
+    fn field_secondary_failure_stops_primary_before_secondary_returns() {
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let result = run_field_workers(
+            VfQualifierPhase::CompositeGameLoad,
+            |control| {
+                wait_field_stop(control);
+                assert_eq!(control.failure(), StabilityResult::SilentError);
+                observed_tx.send(()).unwrap();
+                let mut result = field_primary(StabilityResult::Stable);
+                result.inconclusive_reason = Some("workload_cancelled".into());
+                result
+            },
+            move |control| {
+                let cancel = RenderCancellation { external: None, field: Some(control) };
+                cancel.record_failure(StabilityResult::SilentError);
+                // The primary must stop while this worker is still alive, not after join().
+                observed_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                field_secondary(StabilityResult::SilentError, 1)
+            },
+        );
+        assert_eq!(result.result, StabilityResult::SilentError);
+        assert!(result.inconclusive_reason.is_none());
+    }
+
+    #[test]
+    fn field_primary_failure_stops_secondary_and_late_crash_keeps_priority() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let result = run_field_workers(
+            VfQualifierPhase::CompositeGameLoad,
+            |_| {
+                started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                field_primary(StabilityResult::SilentError)
+            },
+            |control| {
+                started_tx.send(()).unwrap();
+                wait_field_stop(control);
+                field_secondary(StabilityResult::Crash, 0)
+            },
+        );
+        assert_eq!(result.result, StabilityResult::Crash);
+        assert!(result.inconclusive_reason.is_none());
+    }
+
+    #[test]
+    fn field_external_cancel_is_visible_to_both_workers() {
+        let external = AtomicBool::new(false);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let result = run_field_workers(
+            VfQualifierPhase::CompositeGameLoad,
+            |control| {
+                started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                external.store(true, Ordering::SeqCst);
+                assert!(RenderCancellation { external: Some(&external), field: Some(control) }
+                    .is_cancelled());
+                observed_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                let mut result = field_primary(StabilityResult::Stable);
+                result.inconclusive_reason = Some("workload_cancelled".into());
+                result
+            },
+            |control| {
+                started_tx.send(()).unwrap();
+                let cancel = RenderCancellation { external: Some(&external), field: Some(control) };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !cancel.is_cancelled() {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                assert!(!control.stop.load(Ordering::SeqCst),
+                    "external Stop must reach secondary before primary has returned");
+                observed_tx.send(()).unwrap();
+                field_secondary(StabilityResult::Stable, 0)
+            },
+        );
+        assert_eq!(result.result, StabilityResult::Stable);
+        assert!(result.inconclusive_reason.is_some());
+        assert!(result.phase_reports.is_empty());
+    }
+
+    #[test]
+    fn field_secondary_panic_cannot_erase_an_observed_silent_error() {
+        let result = run_field_workers(
+            VfQualifierPhase::CompositeGameLoad,
+            |control| {
+                wait_field_stop(control);
+                field_primary(StabilityResult::Stable)
+            },
+            |control| {
+                control.record_failure(StabilityResult::SilentError);
+                panic!("secondary teardown failed after detection");
+            },
+        );
+        assert_eq!(result.result, StabilityResult::SilentError);
+        assert!(result.inconclusive_reason.is_none());
+    }
+
+    #[test]
+    fn field_primary_panic_cancels_and_joins_secondary_before_unwinding() {
+        let secondary_finished = AtomicBool::new(false);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let result = std::panic::catch_unwind(|| run_field_workers(
+            VfQualifierPhase::CompositeGameLoad,
+            |_| {
+                started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                panic!("primary failed");
+            },
+            |control| {
+                started_tx.send(()).unwrap();
+                wait_field_stop(control);
+                secondary_finished.store(true, Ordering::SeqCst);
+                field_secondary(StabilityResult::Stable, 0)
+            },
+        ));
+        assert!(result.is_err());
+        assert!(secondary_finished.load(Ordering::SeqCst));
     }
 
     #[test]

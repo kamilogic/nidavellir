@@ -47,6 +47,9 @@ impl BenchmarkHandle {
     pub fn progress(&self) -> BenchmarkProgress {
         self.progress.lock().map(|p| p.clone()).unwrap_or_else(|_| idle())
     }
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
@@ -76,6 +79,16 @@ fn set(progress: &Arc<Mutex<BenchmarkProgress>>, p: BenchmarkProgress) {
     if let Ok(mut g) = progress.lock() {
         *g = p;
     }
+}
+
+#[cfg(windows)]
+fn reset_benchmark_to_stock(store: &SafeLoopStore) -> Result<(), String> {
+    crate::tdr_sentinel::legacy_stock_reset_guard(store)?;
+    nidavellir_core::nvml_gpu::reset_core_clock_lock()
+        .map_err(|error| format!("benchmark core-lock reset failed: {error}"))?;
+    crate::tdr_sentinel::legacy_stock_reset_guard(store)?;
+    nidavellir_gpu_nvapi::reset_all()
+        .map_err(|error| format!("benchmark NVAPI stock reset failed: {error}"))
 }
 
 /// NVML sample accumulator over a workload window.
@@ -184,7 +197,6 @@ fn run_benchmark(
     stop: Arc<AtomicBool>,
     store: SafeLoopStore,
 ) {
-    use nidavellir_gpu_nvapi as gpu;
     use nidavellir_gpu_stress::GpuCtx;
 
     info!("Benchmark starting (before/after)");
@@ -194,7 +206,16 @@ fn run_benchmark(
     prog.log.push("Benchmark antes/depois — preparando…".into());
     set(&progress, prog.clone());
 
-    let applied = crate::gpu_apply::load_applied();
+    let applied = match crate::gpu_apply::load_applied_checked() {
+        Ok(applied) => applied,
+        Err(error) => {
+            prog.running = false;
+            prog.phase = "aborted".into();
+            prog.note = Some(format!("Perfil persistido ilegível; benchmark recusado: {error}"));
+            set(&progress, prog);
+            return;
+        }
+    };
     if applied.is_none() {
         prog.running = false;
         prog.phase = "done".into();
@@ -206,8 +227,20 @@ fn run_benchmark(
     // ---- STOCK pass --------------------------------------------------------
     prog.log.push("1/2 · Stock: revertendo para fábrica e medindo…".into());
     set(&progress, prog.clone());
-    let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
-    let _ = gpu::reset_all();
+    if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+        prog.running = false;
+        prog.phase = "aborted".into();
+        prog.note = Some(format!("Benchmark recusado antes do reset stock: {error}"));
+        set(&progress, prog);
+        return;
+    }
+    if let Err(error) = reset_benchmark_to_stock(&store) {
+        prog.running = false;
+        prog.phase = "aborted".into();
+        prog.note = Some(format!("Benchmark abortado durante o reset stock: {error}"));
+        set(&progress, prog);
+        return;
+    }
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let ctx = match GpuCtx::new() {
@@ -221,6 +254,17 @@ fn run_benchmark(
         }
     };
     let stock = bench_pass(&ctx, &stop);
+    if stock.fps <= 0.0 || stock.bandwidth_gbps <= 0.0 {
+        crate::tdr_sentinel::mark_legacy_device_loss("gpu_benchmark_stock");
+        prog.running = false;
+        prog.phase = "reboot_required".into();
+        prog.note = Some(
+            "A carga stock não retornou métricas válidas; reapply bloqueado até reiniciar o Windows."
+                .into(),
+        );
+        set(&progress, prog);
+        return;
+    }
     prog.power_limit_w = sample_power_limit();
     prog.stock = Some(stock.clone());
     prog.log.push(format!(
@@ -232,10 +276,13 @@ fn run_benchmark(
     drop(ctx);
 
     if stop.load(Ordering::SeqCst) {
-        finish_restore(&applied, &store);
+        let restored = finish_restore(&applied, &store);
         prog.running = false;
         prog.phase = "done".into();
-        prog.note = Some("Cancelado — perfil reaplicado.".into());
+        prog.note = Some(match restored {
+            Ok(()) => "Cancelado — perfil reaplicado.".into(),
+            Err(error) => format!("Cancelado em stock; reapply recusado: {error}"),
+        });
         set(&progress, prog);
         return;
     }
@@ -244,7 +291,13 @@ fn run_benchmark(
     prog.phase = "tuned".into();
     prog.log.push("2/2 · Tuned: aplicando perfil e medindo…".into());
     set(&progress, prog.clone());
-    apply_profile(&applied);
+    if let Err(error) = apply_profile(&applied, &store) {
+        prog.running = false;
+        prog.phase = "aborted".into();
+        prog.note = Some(format!("Perfil não foi reaplicado: {error}"));
+        set(&progress, prog);
+        return;
+    }
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let ctx = match GpuCtx::new() {
@@ -258,6 +311,17 @@ fn run_benchmark(
         }
     };
     let tuned = bench_pass(&ctx, &stop);
+    if tuned.fps <= 0.0 || tuned.bandwidth_gbps <= 0.0 {
+        crate::tdr_sentinel::mark_legacy_device_loss("gpu_benchmark_tuned");
+        prog.running = false;
+        prog.phase = "reboot_required".into();
+        prog.note = Some(
+            "A carga tuned não retornou métricas válidas; reinicie o Windows antes de outra mutação."
+                .into(),
+        );
+        set(&progress, prog);
+        return;
+    }
     prog.tuned = Some(tuned.clone());
     prog.log.push(format!(
         "   tuned: {:.0} fps · {} MHz · {:.0} W · {:.0} GB/s{}",
@@ -287,22 +351,86 @@ fn run_benchmark(
     info!("Benchmark finished: fps {fps_d:+.0}%, perf/watt {ppw_d:+.0}%");
 }
 
-/// Re-apply the saved profile (used to restore after the stock pass / on cancel).
+/// Re-apply the saved profile (used to restore after the stock pass / on cancel). Every individual
+/// hardware write re-reads the reboot latch and the checked Safe Loop record, because Sentinel may
+/// have stopped this already-running legacy worker between the core and memory operations.
 #[cfg(windows)]
-fn apply_profile(applied: &Option<crate::gpu_apply::AppliedProfile>) {
-    if let Some(ap) = applied {
-        if let Some(c) = ap.core {
-            let _ = crate::gpu_apply::apply_core(c);
-        }
-        if let Some(m) = ap.mem_offset_mhz {
-            let _ = nidavellir_gpu_nvapi::set_mem_offset_mhz(m);
-        }
-    }
+#[derive(Debug, PartialEq, Eq)]
+struct BenchmarkF2ApplyDescriptor {
+    target_mhz: u32,
+    anchor_mv: u32,
+    gpu_key: String,
+    run_id: String,
+    contract: u32,
 }
 
 #[cfg(windows)]
-fn finish_restore(applied: &Option<crate::gpu_apply::AppliedProfile>, _store: &SafeLoopStore) {
-    apply_profile(applied);
+fn benchmark_f2_apply_descriptor(
+    applied: &crate::gpu_apply::AppliedProfile,
+) -> Result<Option<BenchmarkF2ApplyDescriptor>, String> {
+    let Some(undervolt) = applied.undervolt.as_ref() else {
+        return Ok(None);
+    };
+    let gpu_key = undervolt
+        .gpu_key
+        .clone()
+        .ok_or_else(|| "F2 benchmark restore refused: descriptor has no GPU proof identity".to_string())?;
+    let run_id = undervolt.qualification_run_id.clone().ok_or_else(|| {
+        "F2 benchmark restore refused: descriptor has no qualification run proof".to_string()
+    })?;
+    let contract = undervolt.qualification_contract_version.ok_or_else(|| {
+        "F2 benchmark restore refused: descriptor has no qualification contract proof".to_string()
+    })?;
+    Ok(Some(BenchmarkF2ApplyDescriptor {
+        target_mhz: undervolt.target_mhz,
+        anchor_mv: undervolt.anchor_mv,
+        gpu_key,
+        run_id,
+        contract,
+    }))
+}
+
+#[cfg(windows)]
+fn apply_profile(
+    applied: &Option<crate::gpu_apply::AppliedProfile>,
+    store: &SafeLoopStore,
+) -> Result<(), String> {
+    if let Some(ap) = applied {
+        if let Some(descriptor) = benchmark_f2_apply_descriptor(ap)? {
+            // Never route an anchored F2 descriptor through `apply_core` (the F1 ceiling writer).
+            // The canonical F2 writer revalidates current GPU/run/contract, exact-Apply matrices,
+            // Safe Loop state, condemnation cone and owned boot transaction before touching VF.
+            return crate::gpu_apply::apply_and_persist_undervolt(
+                ap.label.clone(),
+                descriptor.target_mhz,
+                descriptor.anchor_mv,
+                descriptor.gpu_key,
+                descriptor.run_id,
+                descriptor.contract,
+                ap.mem_offset_mhz,
+                store,
+            );
+        }
+        // Preserve the legacy F1 benchmark path exactly: core ceiling then memory offset, with the
+        // complete last-moment legacy guard before each independent write.
+        if let Some(c) = ap.core {
+            crate::tdr_sentinel::legacy_gpu_write_guard(store)?;
+            crate::gpu_apply::apply_core(c)?;
+        }
+        if let Some(m) = ap.mem_offset_mhz {
+            crate::tdr_sentinel::legacy_gpu_write_guard(store)?;
+            nidavellir_gpu_nvapi::set_mem_offset_mhz(m)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn finish_restore(
+    applied: &Option<crate::gpu_apply::AppliedProfile>,
+    store: &SafeLoopStore,
+) -> Result<(), String> {
+    apply_profile(applied, store)
 }
 
 /// Read the enforced power limit (W) directly from NVML, 0 if unavailable.
@@ -313,4 +441,47 @@ fn sample_power_limit() -> f32 {
         .next()
         .and_then(|r| r.power_limit_w)
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn benchmark_routes_f2_only_with_complete_proof_descriptor() {
+        let legacy = crate::gpu_apply::AppliedProfile::default();
+        assert_eq!(benchmark_f2_apply_descriptor(&legacy).unwrap(), None);
+
+        let mut f2 = crate::gpu_apply::AppliedProfile {
+            label: "Godforge".into(),
+            undervolt: Some(crate::gpu_apply::UndervoltApply {
+                target_mhz: 1860,
+                anchor_mv: 900,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(benchmark_f2_apply_descriptor(&f2)
+            .unwrap_err()
+            .contains("GPU proof identity"));
+
+        let descriptor = f2.undervolt.as_mut().unwrap();
+        descriptor.gpu_key = Some("gpu-a".into());
+        descriptor.qualification_run_id = Some("run-a".into());
+        descriptor.qualification_contract_version = Some(
+            nidavellir_core::f2_observation::F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION,
+        );
+        assert_eq!(
+            benchmark_f2_apply_descriptor(&f2).unwrap(),
+            Some(BenchmarkF2ApplyDescriptor {
+                target_mhz: 1860,
+                anchor_mv: 900,
+                gpu_key: "gpu-a".into(),
+                run_id: "run-a".into(),
+                contract:
+                    nidavellir_core::f2_observation::F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION,
+            })
+        );
+    }
 }

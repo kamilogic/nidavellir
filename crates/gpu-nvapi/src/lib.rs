@@ -5,6 +5,56 @@
 //! path (`set_pstates` clock offset, `set_vfp_locks` undervolt, `set_power_limit`)
 //! is added in a later, carefully-gated stage.
 
+// NvAPI_Initialize increments the driver's reference count on EVERY call. Curve scans and
+// high-rate voltage reads share one owned reference, never one initialization per sample.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct NvapiLifecycle {
+    initialized: bool,
+    shutdown_result: Option<Result<(), String>>,
+}
+
+#[cfg(any(windows, test))]
+impl NvapiLifecycle {
+    fn ensure(&mut self, initialize: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        if self.shutdown_result.is_some() {
+            return Err("NVAPI runtime is closed; restart the service before hardware access".into());
+        }
+        if !self.initialized {
+            initialize()?;
+            self.initialized = true;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self, unload: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        if let Some(result) = &self.shutdown_result { return result.clone(); }
+        let result = if self.initialized { unload() } else { Ok(()) };
+        // Never reopen after either a successful or failed unload during terminal cleanup.
+        self.shutdown_result = Some(result.clone());
+        result
+    }
+}
+
+#[cfg(windows)]
+static NVAPI_RUNTIME: std::sync::Mutex<NvapiLifecycle> = std::sync::Mutex::new(NvapiLifecycle {
+    initialized: false, shutdown_result: None,
+});
+
+#[cfg(windows)]
+fn ensure_initialized() -> Result<(), String> {
+    NVAPI_RUNTIME.lock().map_err(|_| "NVAPI lifecycle lock is poisoned".to_string())?
+        .ensure(|| nvapi::initialize().map_err(|e| format!("NvAPI_Initialize failed: {e:?}")))
+}
+
+/// Release this crate's one NVAPI reference. Terminal only: the caller MUST close admission
+/// and wait for all GPU readers/writers to quiesce first. Never use between tuning steps.
+#[cfg(windows)]
+pub fn shutdown_runtime() -> Result<(), String> {
+    NVAPI_RUNTIME.lock().map_err(|_| "NVAPI lifecycle lock is poisoned".to_string())?
+        .close(|| nvapi::unload().map_err(|e| format!("NvAPI_Unload failed: {e:?}")))
+}
+
 /// One point of the GPU's voltage/frequency curve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfCurvePoint {
@@ -36,7 +86,7 @@ impl GpuCurve {
 /// Read the live V/F curve from the first NVIDIA GPU (read-only, safe).
 #[cfg(windows)]
 pub fn read_curve() -> Result<GpuCurve, String> {
-    nvapi::initialize().map_err(|e| format!("NvAPI_Initialize failed: {e:?}"))?;
+    ensure_initialized()?;
     let gpu = nvapi::PhysicalGpu::enumerate()
         .map_err(|e| format!("enumerate failed: {e:?}"))?
         .into_iter()
@@ -189,6 +239,51 @@ pub struct CoreVoltageLock {
     pub voltage_mv: u32,
 }
 
+const CORE_VOLTAGE_UNLOCK_ATTEMPTS: usize = 10;
+const CORE_VOLTAGE_UNLOCK_RETRY_MS: u64 = 100;
+
+fn confirm_core_voltage_unlocked_with_retry<C, R, W>(
+    attempts: usize,
+    mut clear: C,
+    mut read: R,
+    mut wait: W,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+    R: FnMut() -> Result<Vec<CoreVoltageLock>, String>,
+    W: FnMut(),
+{
+    let mut last_failure = String::new();
+    for attempt in 1..=attempts {
+        let clear_result = clear();
+        match read() {
+            Ok(active) if active.is_empty() => return Ok(()),
+            Ok(active) => {
+                let clear = clear_result
+                    .err()
+                    .unwrap_or_else(|| "command accepted".to_string());
+                last_failure = format!(
+                    "attempt {attempt}/{attempts}: {clear}; active locks: {active:?}"
+                );
+            }
+            Err(read_error) => {
+                let clear = clear_result
+                    .err()
+                    .unwrap_or_else(|| "command accepted".to_string());
+                last_failure = format!(
+                    "attempt {attempt}/{attempts}: {clear}; readback failed: {read_error}"
+                );
+            }
+        }
+        if attempt < attempts {
+            wait();
+        }
+    }
+    Err(format!(
+        "core voltage unlock was not confirmed after {attempts} attempt(s): {last_failure}"
+    ))
+}
+
 /// Lock the core voltage to `mv` (the GPU runs at the curve frequency for that
 /// voltage). Reversible via [`unlock_core_voltage`].
 ///
@@ -262,15 +357,26 @@ pub fn read_core_voltage_lock_mv() -> Result<Option<u32>, String> {
 /// Release any core voltage lock (back to the dynamic curve).
 #[cfg(windows)]
 pub fn unlock_core_voltage() -> Result<(), String> {
-    let gpu = first_gpu()?;
-    let locks = gpu
-        .vfp_locks()
-        .map_err(|e| format!("get_vfp_locks before unlock failed: {e:?}"))?;
-    if locks.is_empty() {
-        return Ok(());
-    }
-    gpu.set_vfp_locks(locks.keys().copied().map(|id| (id, None)))
-        .map_err(|e| format!("set_vfp_locks(all None) failed: {e:?}"))
+    confirm_core_voltage_unlocked_with_retry(
+        CORE_VOLTAGE_UNLOCK_ATTEMPTS,
+        || {
+            let gpu = first_gpu()?;
+            let locks = gpu
+                .vfp_locks()
+                .map_err(|e| format!("get_vfp_locks before unlock failed: {e:?}"))?;
+            if locks.is_empty() {
+                return Ok(());
+            }
+            gpu.set_vfp_locks(locks.keys().copied().map(|id| (id, None)))
+                .map_err(|e| format!("set_vfp_locks(all None) failed: {e:?}"))
+        },
+        read_core_voltage_locks,
+        || {
+            std::thread::sleep(std::time::Duration::from_millis(
+                CORE_VOLTAGE_UNLOCK_RETRY_MS,
+            ));
+        },
+    )
 }
 
 /// Read the current core voltage in mV (parsed from NVAPI's formatted value).
@@ -382,7 +488,7 @@ mod vfcurve {
         if index >= NPTS {
             return None;
         }
-        let _ = nvapi::initialize();
+        super::ensure_initialized().ok()?;
         let p = qi(ID_STATUS)?;
         let h = handle()?;
         type F = extern "C" fn(RawGpuHandle, *mut Status) -> i32;
@@ -408,7 +514,7 @@ mod vfcurve {
         if index >= NPTS {
             return None;
         }
-        let _ = nvapi::initialize();
+        super::ensure_initialized().ok()?;
         let p = qi(ID_STATUS)?;
         let h = handle()?;
         type F = extern "C" fn(RawGpuHandle, *mut Status) -> i32;
@@ -429,10 +535,27 @@ mod vfcurve {
         Some((b.freq_khz, b.voltage_uv))
     }
 
+    /// Base and effective tuples from ONE GetStatus call, for time-aligned diagnostics.
+    pub fn get_status_pair(index: usize) -> Option<(u32, u32, u32, u32)> {
+        if index >= NPTS { return None; }
+        super::ensure_initialized().ok()?;
+        let p = qi(ID_STATUS)?;
+        let h = handle()?;
+        type F = extern "C" fn(RawGpuHandle, *mut Status) -> i32;
+        let f: F = unsafe { core::mem::transmute(p) };
+        let mut s: Box<Status> = Box::new(unsafe { core::mem::zeroed() });
+        s.version = VER_STATUS;
+        s.mask[index / 32] = 1u32 << (index % 32);
+        if f(h, s.as_mut()) != 0 || s.b_base_supported == 0 { return None; }
+        let point = s.points[index];
+        if point.base.freq_khz == 0 || point.base.voltage_uv == 0 { return None; }
+        Some((point.base.freq_khz, point.base.voltage_uv, point.freq_khz, point.voltage_uv))
+    }
+
     /// Diagnostic: GetStatus for sampled points — confirms the struct version and
     /// shows real freq/voltage data (proves the curve is read, not zeroed).
     pub fn dump_status() -> String {
-        let _ = nvapi::initialize();
+        if let Err(error) = super::ensure_initialized() { return error; }
         let Some(p) = qi(ID_STATUS) else { return "qi(status) fail".into();
         };
         let Some(h) = handle() else { return "handle fail".into();
@@ -475,7 +598,7 @@ mod vfcurve {
     /// status — 0 means the modern API + struct version work on this driver.
     /// Status `-1001`/`-1002` are our own markers (QueryInterface / enum failed).
     pub fn probe_get() -> i32 {
-        let _ = nvapi::initialize();
+        if super::ensure_initialized().is_err() { return -1004; }
         let Some(p) = qi(ID_GET) else { return -1001 };
         let Some(h) = handle() else { return -1002 };
         type F = extern "C" fn(RawGpuHandle, *mut Control) -> i32;
@@ -490,7 +613,7 @@ mod vfcurve {
     /// Reports the GET status + current freq offset for a few sampled points so we
     /// can confirm the modern GET reads the right field with the corrected struct.
     pub fn dump_points() -> String {
-        let _ = nvapi::initialize();
+        if let Err(error) = super::ensure_initialized() { return error; }
         let Some(p) = qi(ID_GET) else { return "qi fail".into();
         };
         let Some(h) = handle() else { return "handle fail".into();
@@ -518,7 +641,7 @@ mod vfcurve {
         if index >= NPTS {
             return None;
         }
-        let _ = nvapi::initialize();
+        super::ensure_initialized().ok()?;
         let p = qi(ID_GET)?;
         let h = handle()?;
         type F = extern "C" fn(RawGpuHandle, *mut Control) -> i32;
@@ -540,7 +663,7 @@ mod vfcurve {
         if index >= NPTS {
             return -1003;
         }
-        let _ = nvapi::initialize();
+        if super::ensure_initialized().is_err() { return -1004; }
         let Some(pset) = qi(ID_SET) else { return -1001 };
         let Some(pget) = qi(ID_GET) else { return -1001 };
         let Some(h) = handle() else { return -1002 };
@@ -625,6 +748,12 @@ pub fn read_vf_base_curve_modern() -> Vec<(usize, u32, u32)> {
         }
     }
     out
+}
+
+/// Read-only base MHz/mV and effective MHz/mV from the same driver response.
+#[cfg(windows)]
+pub fn read_vf_point_snapshot(index: usize) -> Option<(u32, u32, u32, u32)> {
+    vfcurve::get_status_pair(index).map(|(bf, bv, f, v)| (bf / 1000, bv / 1000, f / 1000, v / 1000))
 }
 
 /// Snap a *measured* (sensor) voltage to a deterministic VF-table bin: the lowest
@@ -1384,7 +1513,7 @@ pub fn vf_curve_probe_status() -> i32 {
 
 #[cfg(windows)]
 fn first_gpu() -> Result<nvapi::PhysicalGpu, String> {
-    nvapi::initialize().map_err(|e| format!("NvAPI_Initialize failed: {e:?}"))?;
+    ensure_initialized()?;
     nvapi::PhysicalGpu::enumerate()
         .map_err(|e| format!("enumerate failed: {e:?}"))?
         .into_iter()
@@ -1395,7 +1524,7 @@ fn first_gpu() -> Result<nvapi::PhysicalGpu, String> {
 /// Count of NVIDIA GPUs (binding sanity check).
 #[cfg(windows)]
 pub fn probe() -> Result<usize, String> {
-    nvapi::initialize().map_err(|e| format!("NvAPI_Initialize failed: {e:?}"))?;
+    ensure_initialized()?;
     let gpus = nvapi::PhysicalGpu::enumerate().map_err(|e| format!("enumerate failed: {e:?}"))?;
     Ok(gpus.len())
 }
@@ -1407,12 +1536,139 @@ pub fn probe() -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nvapi_many_concurrent_reads_own_one_initialization_and_one_unload() {
+        use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+        let lifecycle = Arc::new(Mutex::new(super::NvapiLifecycle::default()));
+        let starts = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let lifecycle = Arc::clone(&lifecycle);
+                let starts = Arc::clone(&starts);
+                scope.spawn(move || {
+                    for _ in 0..10_000 {
+                        lifecycle.lock().unwrap().ensure(|| {
+                            starts.fetch_add(1, Ordering::SeqCst); Ok(())
+                        }).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        let mut state = lifecycle.lock().unwrap();
+        let closes = AtomicUsize::new(0);
+        for _ in 0..3 {
+            state.close(|| { closes.fetch_add(1, Ordering::SeqCst); Ok(()) }).unwrap();
+        }
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert!(state.ensure(|| panic!("must not reopen after shutdown")).is_err());
+    }
+
+    #[test]
+    fn nvapi_failed_init_does_not_claim_a_reference_and_failed_close_stays_failed() {
+        let mut state = super::NvapiLifecycle::default();
+        assert!(state.ensure(|| Err("unavailable".into())).is_err());
+        state.ensure(|| Ok(())).unwrap();
+        assert_eq!(state.close(|| Err("unload failed".into())), Err("unload failed".into()));
+        assert_eq!(state.close(|| panic!("do not unload twice")), Err("unload failed".into()));
+        assert!(state.ensure(|| panic!("closed even after unload failure")).is_err());
+        let mut unused = super::NvapiLifecycle::default();
+        unused.close(|| panic!("no reference to release on an unused system")).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Read-only NVIDIA lifecycle probe; no tuning or workload, explicit execution only"]
+    fn readonly_nvapi_lifecycle_exits_after_voltage_polling() {
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "NIDAVELLIR_NVAPI_LIFECYCLE_PROBE";
+        if std::env::var_os(CHILD).is_some() {
+            for _ in 0..128 {
+                assert!(super::read_core_voltage_mv().is_some(), "voltage read failed");
+            }
+            super::shutdown_runtime().unwrap();
+            assert!(super::read_core_voltage_mv().is_none(), "closed runtime must not reopen");
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::readonly_nvapi_lifecycle_exits_after_voltage_polling", "--ignored"])
+            .env(CHILD, "1").spawn().unwrap();
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "read-only probe failed: {status}");
+                eprintln!("128 voltage reads + NVAPI release + process exit: {:?}", start.elapsed());
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                let _ = child.kill();
+                panic!("read-only probe process {} did not exit within 10s; termination requested", child.id());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     use super::{
+        confirm_core_voltage_unlocked_with_retry, CoreVoltageLock,
         nearest_vf_bin_at_or_above, plan_bounded_anchored_positive_offset,
         plan_bounded_positive_offset, plan_vf_ceiling, plan_vf_ceiling_monotone, AnchoredBinRole,
         PositiveOffsetLimits, VfBinClass, POS_OFFSET_MAX_MHZ, POS_OFFSET_STEP_MAX_MHZ,
         TARGET_SWEEP_HORIZON_MAX_MHZ,
     };
+    use std::cell::Cell;
+
+    #[test]
+    fn voltage_unlock_retries_stale_readback_until_clear() {
+        let clears = Cell::new(0usize);
+        let reads = Cell::new(0usize);
+        let waits = Cell::new(0usize);
+        let result = confirm_core_voltage_unlocked_with_retry(
+            4,
+            || {
+                clears.set(clears.get() + 1);
+                Ok(())
+            },
+            || {
+                let read = reads.get() + 1;
+                reads.set(read);
+                if read < 3 {
+                    Ok(vec![CoreVoltageLock {
+                        entry_id: 3,
+                        voltage_mv: 1081,
+                    }])
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+            || waits.set(waits.get() + 1),
+        );
+        assert!(result.is_ok());
+        assert_eq!((clears.get(), reads.get(), waits.get()), (3, 3, 2));
+    }
+
+    #[test]
+    fn voltage_unlock_fails_after_finite_persistent_readback() {
+        let clears = Cell::new(0usize);
+        let waits = Cell::new(0usize);
+        let error = confirm_core_voltage_unlocked_with_retry(
+            3,
+            || {
+                clears.set(clears.get() + 1);
+                Ok(())
+            },
+            || {
+                Ok(vec![CoreVoltageLock {
+                    entry_id: 3,
+                    voltage_mv: 1081,
+                }])
+            },
+            || waits.set(waits.get() + 1),
+        )
+        .unwrap_err();
+        assert_eq!((clears.get(), waits.get()), (3, 2));
+        assert!(error.contains("not confirmed after 3 attempt"));
+        assert!(error.contains("1081"));
+    }
 
     // (index, voltage_mv, freq_mhz) — shape of read_vf_curve_modern().
     fn curve() -> Vec<(usize, u32, u32)> {

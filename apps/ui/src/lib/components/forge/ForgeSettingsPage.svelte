@@ -45,7 +45,7 @@
     <div class="settings-title">
       <Settings size={34} strokeWidth={1.55} />
       <div>
-        <h1 id="forge-settings-title">Settings</h1>
+        <h1 id="forge-settings-title" data-forge-heading tabindex="-1">Settings</h1>
         <p>Personalize the interface without changing how Nidavellir tunes your GPU.</p>
       </div>
     </div>

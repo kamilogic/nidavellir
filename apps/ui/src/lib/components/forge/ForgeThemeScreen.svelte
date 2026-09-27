@@ -21,8 +21,8 @@
   } from "@lucide/svelte";
   import ForgeSettingsPage from "./ForgeSettingsPage.svelte";
   import ForgeProgress from "./ForgeProgress.svelte";
+  import { distinctForgeProfiles, forgePrimaryAction, nvidiaGpu } from "../../forge-workflow.js";
   import TelemetrySpark from "./TelemetrySpark.svelte";
-  import commandGpu from "../../assets/themes/command-gpu.png";
   import commandMark from "../../assets/themes/nidavellir-mark.png";
   import instrumentGauge from "../../assets/themes/instrument-gauge.png";
   import instrumentLockup from "../../assets/themes/instrument-lockup.png";
@@ -42,7 +42,17 @@
     forgeMode = "standard",
     powerRunning = false,
     fullResetBusy = false,
+    actionBusy = false,
     fullResetFeedback = null,
+    error = null,
+    serviceStatus = "connecting",
+    serviceError = null,
+    hardwareError = null,
+    exporting = false,
+    exportMsg = "",
+    exportFailed = false,
+    onExportLog,
+    onViewSafetyHistory,
     onThemeChange,
     onForgeModeChange,
     onStartPower,
@@ -52,15 +62,20 @@
     onApplyPower,
     onReportProfileUnstable,
     onFullReset,
+    onReset,
+    onDismissError,
     onDismissFullResetFeedback,
     onViewChange,
   } = $props();
 
   let resetConfirmOpen = $state(false);
+  let resetMode = $state("full");
   let resetDialog = $state(null);
   let resetTrigger = $state(null);
   let resetCancelButton = $state(null);
   let expandedProfile = $state(null);
+  let safetyDetailsOpen = $state(false);
+  let safetyDetails = $state(null);
 
   const profileMeta = [
     {
@@ -73,7 +88,7 @@
       key: "brokkrs",
       name: "Brokkr’s Best",
       line: "Balanced daily performance",
-      summary: "Tempered for daily use, balancing strong performance with lower power, heat and noise.",
+      summary: "Recommended for daily use, balancing sustained performance with lower measured power.",
     },
     {
       key: "deep_calm",
@@ -83,9 +98,15 @@
     },
   ];
 
-  const primaryGpu = $derived(hardware?.gpu?.[0] ?? null);
-  const gpuName = $derived(primaryGpu?.model ?? "NVIDIA GPU");
-  const gpuConnectionLabel = $derived(primaryGpu ? "GPU Connected" : "Waiting for GPU");
+  const primaryGpu = $derived(nvidiaGpu(hardware));
+  const gpuName = $derived.by(() => {
+    const detected = String(primaryGpu?.model ?? gpu?.name ?? "").trim();
+    return detected || "NVIDIA GPU";
+  });
+  const gpuDetected = $derived(Boolean(primaryGpu));
+  const serviceReady = $derived(serviceStatus === "online");
+  const serviceLabel = $derived(serviceReady ? "Online" : serviceStatus === "offline" ? "Offline" : "Connecting");
+  const gpuConnectionLabel = $derived(gpuDetected ? "Detected" : serviceReady ? "Waiting" : "Unavailable");
   const hasCompleteProfileSet = $derived(
     Boolean(powerSweep?.godforge && powerSweep?.brokkrs && powerSweep?.deep_calm),
   );
@@ -100,10 +121,25 @@
   const profilesQualified = $derived(
     Boolean(profilesReady && (!isUndervolt || powerSweep?.profiles_qualified)),
   );
+  const displayedProfiles = $derived(profilesReady ? distinctForgeProfiles(profileMeta, powerSweep) : profileMeta);
+  const censoredClocks = $derived((powerSweep?.clock_search ?? []).filter((clock) => clock.censored_floor_mv != null).length);
   const hasForgeRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
   const forgePaused = $derived(powerSweep?.phase === "paused");
-  const resumeAvailable = $derived(Boolean(forgePaused && powerSweep?.resume_available));
+  const rebootRequired = $derived(Boolean(safeLoop?.gpu_reboot_required));
+  const forgeBlocked = $derived(Boolean(powerSweep?.start_block_reason));
+  const safetyNeedsAttention = $derived(
+    Boolean(safeLoop?.safe_mode || safeLoop?.state === "unstable" || safeLoop?.boot_flag_armed || safeLoop?.recovery_pending_ack),
+  );
+  const runFinished = $derived(powerSweep?.phase === "finished");
+  const runNeedsAttention = $derived(
+    ["needs_attention", "incomplete", "field_rejected", "interrupted", "provisional"].includes(powerSweep?.phase),
+  );
+  const progressPriority = $derived(Boolean(powerRunning || forgePaused || runNeedsAttention || safetyNeedsAttention));
   const state = $derived.by(() => {
+    if (serviceStatus === "connecting") return "CONNECTING";
+    if (!serviceReady) return "OFFLINE";
+    if (!gpuDetected) return "WAITING";
+    if (rebootRequired || safetyNeedsAttention || runNeedsAttention || forgeBlocked) return "ATTENTION";
     if (powerRunning) return "FORGING";
     if (profilesReady && profileMeta.some((profile) => appliedMatches(profile))) return "FORGED";
     if (profilesReady) return "REFINED";
@@ -116,20 +152,74 @@
   const safeLoopKnown = $derived(Boolean(safeLoop));
   const recoveryPending = $derived(Boolean(safeLoop?.recovery_pending_ack));
   const protectedState = $derived(
-    Boolean(safeLoopKnown && !(safeLoop?.safe_mode || safeLoop?.state === "unstable")),
+    Boolean(safeLoopKnown && !rebootRequired && !safetyNeedsAttention),
   );
   const protectionLabel = $derived(
-    !safeLoopKnown ? "Awaiting" : recoveryPending ? "Needs Attention" : protectedState ? "Protected" : "Review",
+    !safeLoopKnown
+      ? "Awaiting"
+      : rebootRequired
+        ? "Restart Windows"
+        : recoveryPending
+          ? "Recovery needed"
+          : protectedState
+            ? "Protected"
+            : "Needs attention",
   );
   const protectionMessage = $derived(
     !safeLoopKnown
       ? "Waiting for Safe Loop status."
+      : rebootRequired
+        ? "The GPU driver recovered. Restart Windows once before any tuning action."
       : recoveryPending
-        ? (safeLoop?.pending_forge_incident?.message ?? "Interrupted Forge requires acknowledgement before continuing.")
+        ? "A previous Forge was interrupted. Recover Forge to return to stock and check whether that run can continue. Safety history is saved."
       : protectedState
-        ? "Your GPU is monitored and ready."
-        : "Safe Loop needs your attention.",
+        ? (forgeBlocked ? "Safe Loop recovery is clear. Automatic tuning is blocked separately; review the reason below." : "Your GPU is monitored and ready.")
+        : "Choose Return to stock to clear the active recovery state. If an incident remains pending, choose Recover Forge to acknowledge it. Safety history stays preserved.",
   );
+  const primaryAction = $derived(forgePrimaryAction({
+    serviceStatus, gpuDetected, safeLoop, powerSweep,
+    busy: actionBusy || fullResetBusy, hasProfiles: profilesReady,
+  }));
+  const primaryActionDisabled = $derived(primaryAction.disabled);
+  const runModeDisabled = $derived(
+    Boolean(actionBusy || fullResetBusy || powerRunning || forgePaused || recoveryPending || forgeBlocked || !serviceReady || !gpuDetected || !safeLoopKnown || rebootRequired),
+  );
+  const actionLabel = $derived(primaryAction.label);
+  const primaryActionReason = $derived(primaryAction.reason);
+  const heroMessage = $derived.by(() => {
+    if (state === "OFFLINE") return "Core Service is unavailable. No GPU action can start.";
+    if (state === "CONNECTING") return "Connecting to the protected local Core Service.";
+    if (state === "WAITING") return "Waiting for the local NVIDIA GPU to be identified.";
+    if (powerSweep?.start_block_reason) return powerSweep.start_block_reason;
+    if (state === "ATTENTION") return runNeedsAttention
+      ? (powerSweep?.note ?? "Forge stopped without publishing a qualified profile set. Review the preserved result below.")
+      : protectionMessage;
+    if (state === "FORGED") return "Profiles are qualified and ready for daily use.";
+    if (state === "REFINED") return "Measured profiles are ready for review.";
+    if (state === "FORGING") return "Qualification is active; progress and safety take priority below.";
+    return "Ready to begin a supervised one-click forge.";
+  });
+  const alertTitle = $derived(
+    rebootRequired
+      ? "Restart Windows before continuing"
+      : safetyNeedsAttention
+        ? "Safe Loop needs attention"
+        : forgeBlocked
+          ? "Automatic tuning blocked"
+        : !serviceReady && serviceStatus === "offline"
+          ? "Core Service is offline"
+          : "Action could not be completed",
+  );
+  const alertMessage = $derived(
+    error
+      || (rebootRequired || safetyNeedsAttention ? protectionMessage : null)
+      || (forgeBlocked && serviceReady ? powerSweep.start_block_reason : null)
+      || (!serviceReady && serviceStatus === "offline"
+        ? "Nidavellir could not reach the elevated Core Service. Start it to restore hardware detection and GPU actions."
+        : serviceError)
+      || (!gpuDetected ? hardwareError : null),
+  );
+  const fullResetDisabled = $derived(Boolean(actionBusy || fullResetBusy || powerRunning || !serviceReady || !gpuDetected || !safeLoopKnown || rebootRequired));
 
   function finite(value) {
     if (value == null || value === "") return null;
@@ -146,6 +236,18 @@
   const voltage = $derived(finite(gpu?.voltage_mv));
   const fan = $derived(finite(gpu?.fan_speed_pct));
   const usage = $derived(finite(gpu?.utilization_pct));
+  const commandMetrics = $derived.by(() => {
+    const metrics = [
+      { key: "temp", label: "Temperature", value: temperature, unit: "°C" },
+      { key: "power", label: "Power", value: power, unit: "W" },
+      { key: "core", label: "Clock", value: clock, unit: "MHz" },
+      { key: "mem", label: "VRAM", value: memory, unit: "MHz", hint: vramCapacity(vramTotal) },
+      { key: "voltage", label: "Voltage", value: voltage, unit: "mV", hint: voltage == null ? "Sensor not exposed" : "Live core voltage" },
+      { key: "fan", label: "Fan", value: fan, unit: "%", hint: fan == null ? "Sensor not exposed" : "Average duty" },
+      { key: "usage", label: "Utilization", value: usage, unit: "%" },
+    ];
+    return powerRunning ? metrics.filter((metric) => ["temp", "power", "core", "usage"].includes(metric.key)) : metrics;
+  });
 
   function values(key) {
     const live = sparks?.[key] ?? [];
@@ -212,11 +314,13 @@
   }
 
   function profileEfficiency(point) {
+    if (isUndervolt && !(finite(point?.comparison_power_p99_w) > 0)) return "—";
     const efficiency = finite(point?.perf_per_watt);
     return efficiency == null ? "—" : `${efficiency.toFixed(1)} MHz/W`;
   }
 
   function profileEfficiencyVsStock(point) {
+    if (isUndervolt && !(finite(point?.comparison_power_p99_w) > 0)) return "—";
     const stockClock = finite(powerSweep?.stock_clock_mhz);
     const stockPower = finite(powerSweep?.stock_power_p99_w);
     const efficiency = finite(point?.perf_per_watt);
@@ -244,12 +348,18 @@
   }
 
   function profileActive(key) {
-    return activeKey === key;
+    if (activeKey === key) return true;
+    if (!activeKey) return false;
+    const current = pointFor(activeKey);
+    const candidate = pointFor(key);
+    return Boolean(current && candidate &&
+      sameNumber(current.target_clock_mhz ?? current.clock_mhz, candidate.target_clock_mhz ?? candidate.clock_mhz) &&
+      sameNumber(current.vf_table_voltage_mv ?? current.voltage_mv, candidate.vf_table_voltage_mv ?? candidate.voltage_mv));
   }
 
   function canApply(key) {
     const point = pointFor(key);
-    if (!profilesReady || !point || profileActive(key)) return false;
+    if (actionBusy || fullResetBusy || recoveryPending || !profilesReady || !point || profileActive(key) || !serviceReady || !gpuDetected || !safeLoopKnown || rebootRequired || safetyNeedsAttention || forgeBlocked) return false;
     if (!isUndervolt) return true;
     const sustainedP99 = finite(point.power_p99_w);
     return Boolean(
@@ -265,21 +375,24 @@
     onApplyPower?.(key);
   }
 
-  function runForge() {
-    if (powerRunning) return;
-    if (forgePaused) {
-      if (resumeAvailable) onResumePower?.();
-      return;
+  function runForge(event) {
+    if (primaryActionDisabled) return;
+    if (primaryAction.kind === "recover") onRecoverContinue?.();
+    else if (primaryAction.kind === "review") {
+      safetyDetailsOpen = true;
+      requestAnimationFrame(() => {
+        safetyDetails?.querySelector("summary")?.focus();
+        safetyDetails?.scrollIntoView({ block: "nearest" });
+      });
     }
-    if (recoveryPending) {
-      onRecoverContinue?.(forgeMode);
-      return;
-    }
-    onStartPower?.(forgeMode);
+    else if (primaryAction.kind === "resume") onResumePower?.();
+    else if (primaryAction.kind === "reset") onReset?.();
+    else if (primaryAction.kind === "start_over") openResetConfirmation(event);
+    else if (primaryAction.kind === "start") onStartPower?.(forgeMode);
   }
 
   function reportProfile(profile) {
-    if (powerRunning || !pointFor(profile.key)) return;
+    if (powerRunning || !serviceReady || rebootRequired || !pointFor(profile.key)) return;
     onReportProfileUnstable?.(profile.key);
   }
 
@@ -295,8 +408,9 @@
     onViewChange?.(["forge", "advanced", "settings"].includes(target) ? target : "forge");
   }
 
-  function openResetConfirmation(event) {
-    if (fullResetBusy) return;
+  function openResetConfirmation(event, mode = "full") {
+    if (fullResetDisabled) return;
+    resetMode = mode;
     resetTrigger = event.currentTarget;
     resetConfirmOpen = true;
     requestAnimationFrame(() => {
@@ -314,10 +428,9 @@
 
   async function confirmFullReset() {
     if (fullResetBusy) return;
-    await onFullReset?.();
-    resetDialog?.close();
-    resetConfirmOpen = false;
-    requestAnimationFrame(() => resetTrigger?.focus());
+    const mode = resetMode;
+    closeResetConfirmation();
+    await onFullReset?.(mode);
   }
 
   function handleResetDialogCancel(event) {
@@ -382,35 +495,140 @@
         <div class="profile-card-metrics">
           <span><small>Target clock</small><strong>{profileTarget(point)}</strong></span>
           <span><small>Target voltage</small><strong>{profileVoltage(point)}</strong></span>
-          <span><small>Maximum power</small><strong>{profilePeakPowerText(point)}</strong></span>
-          <span><small>Efficiency vs stock</small><strong>{profileEfficiencyVsStock(point)}</strong></span>
-          <span><small>Efficiency</small><strong>{profileEfficiency(point)}</strong></span>
+          <span><small>Stress peak power</small><strong>{profilePeakPowerText(point)}</strong></span>
+          <span><small>Comparison power · PowerRender p99</small><strong>{finite(point?.comparison_power_p99_w) > 0 ? `${point.comparison_power_p99_w.toFixed(1)} W` : "—"}</strong></span>
+          <span><small>Clock/W vs stock · PowerRender</small><strong>{profileEfficiencyVsStock(point)}</strong></span>
+          <span><small>Clock/W proxy · not game FPS</small><strong>{profileEfficiency(point)}</strong></span>
         </div>
         <div class="profile-card-actions">
           <button class="profile-apply" type="button" onclick={() => profileAction(profile.key)} disabled={!canApply(profile.key)}>
             {#if profileActive(profile.key)}<ShieldCheck size={17} />Applied{:else}Apply {profile.name}{/if}
           </button>
-          <button class="field-failure" type="button" onclick={() => reportProfile(profile)} disabled={powerRunning || !point}>Mark unstable</button>
+          <button class="field-failure" type="button" onclick={() => reportProfile(profile)} disabled={powerRunning || !serviceReady || rebootRequired || !point}>Mark unstable</button>
         </div>
       </div>
     {/if}
   </article>
 {/snippet}
 
+{#snippet safetyNotice()}
+  {#if profilesReady}
+    <aside class="command-alert" role="status">
+      <ShieldCheck size={22} strokeWidth={1.8} />
+      <div>
+        <strong>{displayedProfiles.length} distinct {displayedProfiles.length === 1 ? "setting" : "settings"} · {profilesQualified ? "qualified" : "qualification pending"}</strong>
+        <p>{powerSweep?.discovery_search
+          ? "Profiles use the candidates qualified within this run's search budget. Better trade-offs may remain unexplored; shared objectives are shown once."
+          : powerSweep?.profile_search_complete ? "The economic clock range was explored. Shared objectives are shown once." : "Economic search coverage is incomplete or unavailable in this saved result. Better trade-offs may remain unexplored."}</p>
+        {#if censoredClocks > 0}<p>{censoredClocks} clock searches had voltage ranges excluded by known-failure policy. Those exclusions are not measured stability limits.</p>{/if}
+      </div>
+    </aside>
+  {/if}
+  {#if powerSweep?.development_validation_note}
+    <aside class="command-alert" role="status">
+      <ShieldCheck size={22} strokeWidth={1.8} />
+      <div><strong>Development validation</strong><p>{powerSweep.development_validation_note}</p></div>
+    </aside>
+  {/if}
+  {#if alertMessage}
+    <aside class="command-alert" class:critical={Boolean(error || rebootRequired || safetyNeedsAttention || forgeBlocked || serviceStatus === "offline")} role={error || rebootRequired || serviceStatus === "offline" ? "alert" : "status"}>
+      <TriangleAlert size={22} strokeWidth={1.8} />
+      <div>
+        <strong>{alertTitle}</strong><p>{alertMessage}</p>
+        {#if forgeBlocked && serviceReady}
+          <p>Soft Reset keeps known failures. Full Reset erases all GPU learning, including failure history. A required Windows restart or development authorization still applies.</p>
+          <details class="safety-details" bind:this={safetyDetails} bind:open={safetyDetailsOpen}>
+            <summary>Why tuning is blocked and what to do</summary>
+            {#if alertMessage !== powerSweep.start_block_reason}<p>{powerSweep.start_block_reason}</p>{/if}
+            <p>Keep the GPU at its default settings. Review the reason above. Soft Reset preserves known failures; Full Reset erases them. A required Windows restart or development authorization must be completed separately. Export the diagnostic report if you need help.</p>
+            <div class="safety-actions">
+              {#if applied?.core || applied?.mem_offset_mhz}
+                <button type="button" onclick={onReset} disabled={actionBusy || fullResetBusy || powerRunning || rebootRequired}>Return to stock</button>
+              {/if}
+              <button type="button" onclick={onExportLog} disabled={exporting || !onExportLog}>{exporting ? "Exporting…" : "Export diagnostic report"}</button>
+              <button type="button" onclick={onViewSafetyHistory}>View safety history</button>
+            </div>
+            {#if exportMsg}<p class:export-error={exportFailed}>{exportMsg}</p>{/if}
+          </details>
+        {/if}
+      </div>
+      {#if error && onDismissError}
+        <button type="button" onclick={onDismissError} aria-label="Dismiss error"><X size={18} /></button>
+      {/if}
+    </aside>
+  {/if}
+{/snippet}
+
 {#snippet fullResetControl()}
   {#if !powerRunning}
-    <section class="full-reset-strip" aria-label="Reset total">
+    <section class="full-reset-strip" aria-label="Full Reset">
       <div class="full-reset-copy">
-        <span>RECUPERAÇÃO DESTRUTIVA</span>
-        <strong>Reset Total</strong>
-        <p>Volta a GPU para stock, limpa a forja ativa e prepara a próxima execução como Clean Run.</p>
+        <span>START OVER</span>
+        <strong>Full Reset</strong>
+        <p>Full Reset forgets all GPU learning, profiles and known failures. Choose Soft Reset to remeasure while keeping known failures blocked.</p>
       </div>
-      <button class="full-reset-action" type="button" onclick={openResetConfirmation} disabled={fullResetBusy}>
+      <button class="soft-reset-action" type="button" onclick={(event) => openResetConfirmation(event, "soft")} disabled={fullResetDisabled}>Soft Reset</button>
+      <button class="full-reset-action" type="button" onclick={openResetConfirmation} disabled={fullResetDisabled} title={!serviceReady ? "Core Service must be online" : rebootRequired ? "Restart Windows before tuning actions" : undefined}>
         <Trash2 size={18} strokeWidth={1.7} />
-        <span>Reset Total</span>
+        <span>Full Reset</span>
       </button>
     </section>
   {/if}
+{/snippet}
+
+{#snippet commandTelemetry()}
+  <section
+    class="command-telemetry"
+    class:essential={powerRunning}
+    aria-labelledby="command-telemetry-title"
+  >
+    <h2 id="command-telemetry-title" class="sr-only">Live GPU telemetry</h2>
+    {#each commandMetrics as metric}
+      <article class="command-metric">
+        <div class="metric-title">
+          {#if metric.key === "temp"}<Thermometer size={25} />
+          {:else if metric.key === "power"}<Zap size={25} />
+          {:else if metric.key === "core"}<Gauge size={25} />
+          {:else if metric.key === "fan"}<Fan size={25} />
+          {:else if metric.key === "voltage"}<Activity size={25} />
+          {:else if metric.key === "usage"}<CircleGauge size={25} />
+          {:else}<Cpu size={25} />{/if}
+          <span>{metric.label}</span>
+        </div>
+        <div class="metric-reading"><strong>{display(metric.value)}</strong><span>{metric.unit}</span></div>
+        {#if metric.hint}<small>{metric.hint}</small>{/if}
+        <TelemetrySpark values={values(metric.key)} color="#80bd31" fill="rgba(128, 189, 49, 0.08)" height={40} />
+      </article>
+    {/each}
+  </section>
+{/snippet}
+
+{#snippet commandProfiles()}
+  <section class="command-profiles" class:profile-overview={!profilesReady} aria-labelledby="command-profiles-title">
+    <div class="section-label">
+      <h2 id="command-profiles-title">{profilesReady ? "Forged profiles" : "Profile goals"}</h2>
+      <span>{profilesReady ? "Measured on this GPU" : "Created after qualification"}</span>
+      {#if applied?.core || applied?.mem_offset_mhz}
+        <button class="profile-apply" onclick={onReset} disabled={!serviceReady || !safeLoopKnown || actionBusy || fullResetBusy || powerRunning}>Return to stock</button>
+      {/if}
+    </div>
+    {#each displayedProfiles as profile}
+      {@render profileDisclosure(profile, "command")}
+    {/each}
+  </section>
+{/snippet}
+
+{#snippet commandProgress()}
+  <ForgeProgress
+    {powerSweep}
+    {powerRunning}
+    {safeLoop}
+    {forgeMode}
+    {onStopPower}
+    {onStartPower}
+    {onRecoverContinue}
+    {onResumePower}
+  />
 {/snippet}
 
 <section class={`forge-theme-screen ${theme}`} style={backgroundStyle}>
@@ -421,12 +639,22 @@
         <span>NIDAVELLIR</span>
       </button>
       <nav class="command-nav" aria-label="Primary navigation">
-        <button class:active={activeView === "forge"} onclick={() => navigate("forge")}>Forge</button>
-        <button class:active={activeView === "settings"} onclick={() => navigate("settings")}>Settings</button>
+        <button class:active={activeView === "forge"} aria-current={activeView === "forge" ? "page" : undefined} onclick={() => navigate("forge")}>Forge</button>
+        <button class:active={activeView === "settings"} aria-current={activeView === "settings" ? "page" : undefined} onclick={() => navigate("settings")}>Settings</button>
       </nav>
-      <div class="connected" class:pending={!primaryGpu}>
-        <i></i>
-        <span><strong>{gpuConnectionLabel}</strong><small>{gpuName}</small></span>
+      <div class="command-system-status" aria-label="System readiness">
+        <span class="system-item" class:pending={!serviceReady} class:problem={serviceStatus === "offline"}>
+          <small>CORE SERVICE</small><strong><i></i>{serviceLabel}</strong>
+        </span>
+        <span class="system-item" class:pending={!gpuDetected} title={gpuName}>
+          <small>GPU</small><strong><i></i>{gpuConnectionLabel}</strong>
+        </span>
+        <span class="system-item" class:pending={!protectedState} class:problem={rebootRequired || safetyNeedsAttention}>
+          <small>SAFE LOOP</small><strong><i></i>{protectionLabel}</strong>
+        </span>
+        <span class="system-item profile-state">
+          <small>PROFILE</small><strong>{activeName}</strong>
+        </span>
       </div>
     </header>
 
@@ -436,33 +664,36 @@
       <div class="command-page">{@render children?.()}</div>
     {:else}
     <div class="command-body">
-      <section class="command-hero">
-        <div class="command-gpu-wrap"><img class="command-gpu" src={commandGpu} alt="NVIDIA graphics card" /></div>
+      <section class="command-hero" class:compact={progressPriority} class:attention={state === "ATTENTION"}>
         <div class="command-identity">
-          <span class="eyebrow">GPU</span>
-          <h1>{gpuName.replace(/^NVIDIA\s+/i, "")}</h1>
+          <span class="eyebrow">LOCAL NVIDIA GPU</span>
+          <h1 data-forge-heading tabindex="-1">{gpuName}</h1>
+          <span class="gpu-source">{gpuDetected ? (primaryGpu?.driver ?? "Identified by local sensors") : "Waiting for local hardware detection"}</span>
           <div class="state-status">
-            <div><span>STATE</span><strong>{state}</strong></div>
+            <div><span>STATE</span><strong class="state-value" class:problem={["OFFLINE", "ATTENTION"].includes(state)} class:pending={["CONNECTING", "WAITING"].includes(state)} class:working={["RAW", "FORGING", "REFINED"].includes(state)}>{state}</strong></div>
             <div><span>STATUS</span><strong class="protected" class:pending={!safeLoopKnown}><ShieldCheck size={38} />{protectionLabel}</strong></div>
           </div>
-          <p>{state === "FORGED" ? "Ready for daily use." : state === "FORGING" ? "Building safe profiles now." : "Ready to begin a supervised forge."}</p>
+          <p>{heroMessage}</p>
         </div>
         <div class="command-cta">
-          <button class="plate-button" onclick={runForge} disabled={powerRunning || (forgePaused && !resumeAvailable)}>
+          <button class="plate-button" onclick={runForge} disabled={primaryActionDisabled} aria-describedby="primary-action-reason">
             <img src={copperPlate} alt="" />
-            <span>{powerRunning ? "Forging…" : resumeAvailable ? "Resume Forge" : forgePaused ? "Resume unavailable" : recoveryPending ? "Review & Continue" : "Forge GPU"}</span>
+            <span>{actionLabel}</span>
           </button>
           <div class="command-run-mode">
+            <details>
+              <summary>Run options · {forgeMode === "standard" ? "Standard recommended" : forgeMode === "clean" ? "Clean Run" : "Long"}</summary>
             <label for="command-run-mode">
-              <span>RUN</span>
-              <select id="command-run-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>
-                <option value="clean">Clean Run · ignores prior boundaries</option>
-                <option value="standard">Standard · compact proof</option>
-                <option value="long">Long · exhaustive proof</option>
+              <span>OPTIONAL</span>
+              <select id="command-run-mode" value={forgeMode} onchange={selectMode} disabled={runModeDisabled}>
+                <option value="standard">Standard · recommended</option>
+                <option value="long">Long · extended qualification</option>
+                <option value="clean">Clean Run · rebuild measurements</option>
               </select>
               <ChevronDown size={18} />
             </label>
-            <small>{forgeMode === "long" ? "Explicit long run · exhaustive evidence" : forgeMode === "clean" ? "Organic learning · compact Standard proof" : "Recommended · compact proof to completion"}</small>
+            </details>
+            <small id="primary-action-reason">{primaryActionReason}</small>
           </div>
           {#if profilesReady}
             <span class="refine">Profiles forged from measured hardware data <ShieldCheck size={23} /></span>
@@ -470,52 +701,21 @@
         </div>
       </section>
 
-      {#if hasForgeRun}
-        <ForgeProgress
-          {powerSweep}
-          {powerRunning}
-          {safeLoop}
-          {forgeMode}
-          {onStopPower}
-          {onStartPower}
-          {onRecoverContinue}
-          {onResumePower}
-        />
+      {@render safetyNotice()}
+
+      {#if progressPriority}
+        {#if hasForgeRun}{@render commandProgress()}{/if}
+        {@render commandTelemetry()}
+        {@render commandProfiles()}
+      {:else if profilesReady || runFinished}
+        {@render commandProfiles()}
+        {#if hasForgeRun}{@render commandProgress()}{/if}
+        {@render commandTelemetry()}
+      {:else}
+        {@render commandProfiles()}
+        {@render commandTelemetry()}
+        {#if hasForgeRun}{@render commandProgress()}{/if}
       {/if}
-
-      <section class="command-telemetry" aria-label="Live GPU telemetry">
-        {#each [
-          { key: "temp", label: "Temperature", value: temperature, unit: "°C" },
-          { key: "power", label: "Power", value: power, unit: "W" },
-          { key: "core", label: "Clock", value: clock, unit: "MHz" },
-          { key: "mem", label: "VRAM", value: memory, unit: "MHz", hint: vramCapacity(vramTotal) },
-          { key: "voltage", label: "Voltage", value: voltage, unit: "mV", hint: voltage == null ? "Sensor not exposed" : "Live core voltage" },
-          { key: "fan", label: "Fan", value: fan, unit: "%", hint: fan == null ? "Sensor not exposed" : "Average duty" },
-          { key: "usage", label: "Utilization", value: usage, unit: "%" },
-        ] as metric}
-          <article class="command-metric">
-            <div class="metric-title">
-              {#if metric.key === "temp"}<Thermometer size={29} />
-              {:else if metric.key === "power"}<Zap size={29} />
-              {:else if metric.key === "core"}<Gauge size={29} />
-              {:else if metric.key === "fan"}<Fan size={29} />
-              {:else if metric.key === "voltage"}<Activity size={29} />
-              {:else}<Cpu size={29} />{/if}
-              <span>{metric.label}</span>
-            </div>
-            <div class="metric-reading"><strong>{display(metric.value)}</strong><span>{metric.unit}</span></div>
-            {#if metric.hint}<small>{metric.hint}</small>{/if}
-            <TelemetrySpark values={values(metric.key)} color="#80bd31" fill="rgba(128, 189, 49, 0.08)" height={48} />
-          </article>
-        {/each}
-      </section>
-
-      <section class="command-profiles" class:profile-overview={!profilesReady}>
-        <div class="section-label"><span>{profilesReady ? "FORGED PROFILES" : "PROFILE OVERVIEW"}</span></div>
-        {#each profileMeta as profile}
-          {@render profileDisclosure(profile, "command")}
-        {/each}
-      </section>
 
       {@render fullResetControl()}
 
@@ -544,7 +744,7 @@
         <div class="instrument-main-column">
           <section class="instrument-intro">
             <span class="instrument-kicker"><i></i> ACTIVE GPU</span>
-            <h1>{gpuName}</h1>
+            <h1 data-forge-heading tabindex="-1">{gpuName}</h1>
             <p><ShieldCheck size={34} /> {protectionMessage}</p>
           </section>
 
@@ -566,6 +766,7 @@
             </div>
           </section>
 
+          {@render safetyNotice()}
           {#if hasForgeRun}
             <ForgeProgress
               {powerSweep}
@@ -582,7 +783,7 @@
           <section class="recommended-panel">
             <span class="instrument-kicker">{profilesReady ? "FORGED PROFILES" : "PROFILE OVERVIEW"}</span>
             <div class="instrument-profile-grid" class:ready={profilesReady}>
-              {#each profileMeta as profile}
+              {#each displayedProfiles as profile}
                 {@render profileDisclosure(profile, "instrument")}
               {/each}
             </div>
@@ -592,16 +793,16 @@
 
         <aside class="instrument-action-panel">
           <span class="panel-kicker">PRIMARY ACTION</span>
-          <button class="instrument-forge" onclick={runForge} disabled={powerRunning || (forgePaused && !resumeAvailable)}><Anvil size={42} /><strong>{powerRunning ? "FORGING…" : resumeAvailable ? "RESUME FORGE" : forgePaused ? "RESUME UNAVAILABLE" : recoveryPending ? "REVIEW & CONTINUE" : "FORGE GPU"}</strong></button>
+            <button class="instrument-forge" onclick={runForge} disabled={primaryActionDisabled}><Anvil size={42} /><strong>{actionLabel}</strong></button>
           <div class="mode-block">
             <label for="instrument-mode">MODE</label>
-            <select id="instrument-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>
-              <option value="clean">Clean Run — ignores prior boundaries</option>
+                <select id="instrument-mode" value={forgeMode} onchange={selectMode} disabled={runModeDisabled}>
+              <option value="clean">Clean Run — remeasures positives</option>
               <option value="standard">Standard — compact proof</option>
               <option value="long">Long — exhaustive proof</option>
             </select>
-            <p>Builds safe profiles while you use your PC.</p>
-            <small>Learns your GPU, tests limits safely and creates personalized profiles.</small>
+            <p>Standard is recommended. Other modes are optional.</p>
+            <small>Measures this GPU and publishes only qualified profiles. Duration depends on the measurements.</small>
           </div>
           <div class="safe-loop-block">
             <span>SAFE LOOP</span>
@@ -634,12 +835,12 @@
         <div class="workshop-page">{@render children?.()}</div>
       {:else}
       <section class="workshop-hero">
-        <h1>{primaryGpu ? "Your GPU is ready" : "Waiting for GPU"}</h1>
+            <h1 data-forge-heading tabindex="-1">{forgeBlocked ? "Automatic tuning is blocked" : primaryGpu ? "Your GPU is ready" : "Waiting for GPU"}</h1>
         <h2>{gpuName}</h2>
         <p class:pending={!safeLoopKnown} class:review={safeLoopKnown && !protectedState}><i></i> {safeLoopKnown ? (protectedState ? "Protected by Safe Loop" : "Safe Loop needs review") : "Safe Loop status unavailable"}</p>
         <div class="workshop-actions">
-          <button class="workshop-forge" onclick={runForge} disabled={powerRunning || (forgePaused && !resumeAvailable)}><Anvil size={25} />{powerRunning ? "Forging…" : resumeAvailable ? "Resume Forge" : forgePaused ? "Resume unavailable" : recoveryPending ? "Review & Continue" : "Forge GPU"}</button>
-          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}><option value="clean">Clean Run · Ignores prior boundaries</option><option value="standard">Standard · Compact proof</option><option value="long">Long · Exhaustive proof</option></select><ChevronDown size={20} /></label>
+            <button class="workshop-forge" onclick={runForge} disabled={primaryActionDisabled}><Anvil size={25} />{actionLabel}</button>
+            <label><select value={forgeMode} onchange={selectMode} disabled={runModeDisabled}><option value="clean">Clean Run · Remeasures positives</option><option value="standard">Standard · Compact proof</option><option value="long">Long · Exhaustive proof</option></select><ChevronDown size={20} /></label>
         </div>
       </section>
 
@@ -658,9 +859,10 @@
         </div>
       {/if}
 
+      {@render safetyNotice()}
       <section class="workshop-profile" class:ready={profilesReady}>
         <div class="workshop-current"><span>Current profile</span><div><span class="workshop-profile-icon"><Hammer size={33} /></span><strong>{activeName}</strong></div><small><i></i>{activeKey ? "Applied" : "Stock"}</small></div>
-        {#each profileMeta as profile}
+        {#each displayedProfiles as profile}
           {@render profileDisclosure(profile, "workshop")}
         {/each}
       </section>
@@ -701,11 +903,13 @@
     >
       {#if fullResetFeedback.tone === "success"}
         <ShieldCheck size={22} strokeWidth={1.8} />
+      {:else if fullResetFeedback.tone === "progress"}
+        <Activity size={22} strokeWidth={1.8} />
       {:else}
         <TriangleAlert size={22} strokeWidth={1.8} />
       {/if}
       <div>
-        <strong>{fullResetFeedback.tone === "success" ? "Reset concluído" : fullResetFeedback.tone === "warning" ? "Reset concluído com aviso" : "Falha no reset"}</strong>
+        <strong>{fullResetFeedback.title ?? (fullResetFeedback.tone === "success" ? "Reset completed" : fullResetFeedback.tone === "warning" ? "Reset needs review" : "Reset failed")}</strong>
         <p>{fullResetFeedback.message}</p>
       </div>
       <button type="button" onclick={onDismissFullResetFeedback} aria-label="Fechar mensagem do reset">
@@ -726,17 +930,17 @@
       <div class="reset-dialog-heading">
         <span class="reset-dialog-icon"><TriangleAlert size={25} strokeWidth={1.7} /></span>
         <div>
-          <span>CONFIRMAÇÃO OBRIGATÓRIA</span>
-          <h2 id="reset-dialog-title">Reset Total</h2>
+          <span>CONFIRM START OVER</span>
+          <h2 id="reset-dialog-title">{resetMode === "full" ? "Full Reset" : "Soft Reset"}</h2>
         </div>
       </div>
-      <p id="reset-dialog-description">Isto apaga os perfis forjados, as observações da forja e o histórico do Sentinela. A GPU volta a stock e a próxima execução é preparada como Clean Run.</p>
-      <p class="reset-dialog-note">Falhas reais já confirmadas continuam guardadas no ledger durável, mas não influenciam essa próxima busca orgânica.</p>
+      <p id="reset-dialog-description">{resetMode === "full" ? "Return the GPU to stock and permanently erase all saved GPU learning: profiles, measurements, checkpoints, learning archives, blacklist and failure history. The next Forge discovers this GPU from scratch." : "Return the GPU to stock, clear profiles, successful measurements and the saved run, and acknowledge recovery. Known failures, blacklist and their safety boundaries stay preserved."}</p>
+      <p class="reset-dialog-note">{resetMode === "full" ? "This cannot be undone. Previously rejected points may be tested again. This does not bypass a required Windows restart or grant development authorization." : "The next Forge takes fresh measurements while avoiding known failures. No run starts automatically."}</p>
       <div class="reset-dialog-actions">
-        <button bind:this={resetCancelButton} class="reset-cancel" type="button" onclick={closeResetConfirmation} disabled={fullResetBusy}>Cancelar</button>
+        <button bind:this={resetCancelButton} class="reset-cancel" type="button" onclick={closeResetConfirmation} disabled={fullResetBusy}>Cancel</button>
         <button class="reset-confirm" type="button" onclick={confirmFullReset} disabled={fullResetBusy}>
           <Trash2 size={18} strokeWidth={1.8} />
-          <span>{fullResetBusy ? "Apagando…" : "Apagar tudo e recomeçar"}</span>
+          <span>{fullResetBusy ? "Resetting…" : resetMode === "full" ? "Erase all GPU learning" : "Clear measurements, keep failures"}</span>
         </button>
       </div>
     </dialog>
@@ -829,7 +1033,7 @@
   .full-reset-copy > span {
     grid-column: 1 / -1;
     color: #936f66;
-    font-size: 10px;
+    font-size: 12px;
     font-weight: 700;
     letter-spacing: 0.12em;
   }
@@ -849,6 +1053,7 @@
     text-wrap: pretty;
   }
 
+  .soft-reset-action,
   .full-reset-action,
   .reset-dialog-actions button {
     display: inline-flex;
@@ -868,6 +1073,7 @@
       opacity 150ms ease;
   }
 
+  .soft-reset-action:hover:not(:disabled),
   .full-reset-action:hover:not(:disabled),
   .reset-confirm:hover:not(:disabled) {
     border-color: #d27361;
@@ -875,6 +1081,7 @@
     color: #f0b1a4;
   }
 
+  .soft-reset-action:focus-visible,
   .full-reset-action:focus-visible,
   .reset-dialog-actions button:focus-visible,
   .reset-feedback button:focus-visible {
@@ -882,6 +1089,7 @@
     outline-offset: 3px;
   }
 
+  .soft-reset-action:disabled,
   .full-reset-action:disabled,
   .reset-dialog-actions button:disabled {
     cursor: not-allowed;
@@ -966,7 +1174,7 @@
 
   .reset-dialog-heading > div > span {
     color: #9b746b;
-    font-size: 10px;
+    font-size: 12px;
     font-weight: 700;
     letter-spacing: 0.12em;
   }
@@ -1073,13 +1281,24 @@
   }
 
   /* Command Deck */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
   .command-header {
     display: grid;
-    grid-template-columns: max-content minmax(220px, 1fr) minmax(230px, 320px);
+    grid-template-columns: max-content minmax(180px, 0.55fr) minmax(500px, 1.45fr);
     align-items: center;
-    height: 102px;
+    min-height: 88px;
     border-bottom: 1px solid rgba(164, 171, 177, 0.35);
-    background: rgba(5, 8, 9, 0.86);
+    background: rgba(5, 8, 9, 0.92);
+    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.2);
   }
 
   .brand {
@@ -1094,17 +1313,17 @@
     height: 100%;
     align-items: center;
     gap: 12px;
-    padding-left: 32px;
+    padding: 0 28px;
     color: #aeb0b2;
-    font-size: 24px;
+    font-size: 20px;
     font-weight: 650;
     letter-spacing: 0.17em;
     white-space: nowrap;
   }
 
   .command-brand img {
-    width: 48px;
-    height: 48px;
+    width: 42px;
+    height: 42px;
     object-fit: contain;
   }
 
@@ -1113,17 +1332,17 @@
     min-width: 0;
     height: 100%;
     align-items: stretch;
-    gap: 14px;
+    gap: 4px;
   }
 
   .command-nav button {
     position: relative;
-    min-width: 94px;
+    min-width: 82px;
     border: 0;
     padding: 0 14px;
     background: transparent;
     color: #a5a9ae;
-    font-size: 18px;
+    font-size: 16px;
     cursor: pointer;
   }
 
@@ -1136,169 +1355,210 @@
     content: "";
     position: absolute;
     right: 10px;
-    bottom: 22px;
+    bottom: 17px;
     left: 10px;
     height: 2px;
     background: #c5864f;
   }
 
-  .connected {
-    display: flex;
+  .command-system-status {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     align-items: center;
-    gap: 13px;
-    min-height: 54px;
+    min-height: 52px;
     border-left: 1px solid rgba(255, 255, 255, 0.18);
-    padding: 0 28px 0 18px;
+    padding-right: 20px;
   }
 
-  .connected i {
-    width: 12px;
-    height: 12px;
+  .system-item {
+    display: flex;
+    min-width: 0;
+    min-height: 48px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 5px;
+    border-left: 1px solid rgba(255, 255, 255, 0.09);
+    padding: 0 14px;
+  }
+
+  .system-item:first-child { border-left: 0; }
+
+  .system-item small {
+    overflow: hidden;
+    color: #92999d;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .system-item strong {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 7px;
+    overflow: hidden;
+    color: #a9cf73;
+    font-size: 13px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .system-item i {
+    flex: 0 0 auto;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
     background: #79b52f;
     box-shadow: 0 0 0 2px rgba(121, 181, 47, 0.2);
   }
 
-  .connected span {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-  }
-
-  .connected strong {
-    color: #86bd37;
-    font-size: 16px;
-    font-weight: 500;
-  }
-
-  .connected.pending i {
+  .system-item.pending strong { color: #9aa2a7; }
+  .system-item.pending i {
     background: #687177;
     box-shadow: 0 0 0 2px rgba(104, 113, 119, 0.18);
   }
 
-  .connected.pending strong {
-    color: #8e979d;
+  .system-item.problem strong { color: #d89479; }
+  .system-item.problem i {
+    background: #c56857;
+    box-shadow: 0 0 0 2px rgba(197, 104, 87, 0.18);
   }
 
-  .connected small {
-    color: #a9abad;
-    font-size: 14px;
-  }
+  .system-item.profile-state strong { color: #d7d9d7; }
 
   .command-body {
     display: flex;
     flex-direction: column;
-    gap: 20px;
-    padding: 28px clamp(20px, 2.35vw, 36px) 44px;
+    gap: 16px;
+    padding: 20px clamp(20px, 2.35vw, 36px) 40px;
   }
 
   .command-page {
-    min-height: calc(100vh - 102px);
+    min-height: calc(100vh - 88px);
     padding: 28px 36px 44px;
   }
 
   .command-hero {
     display: grid;
-    grid-template-columns: minmax(300px, 410px) minmax(330px, 1fr) minmax(300px, 420px);
+    grid-template-columns: minmax(0, 1fr) minmax(290px, 355px);
     align-items: center;
-    min-height: 276px;
+    gap: clamp(28px, 4vw, 68px);
+    min-height: 224px;
+    border: 1px solid rgba(126, 136, 143, 0.32);
+    border-radius: 12px;
+    padding: 24px clamp(24px, 3vw, 44px);
+    background:
+      linear-gradient(115deg, rgba(198, 134, 79, 0.055), transparent 42%),
+      rgba(8, 11, 12, 0.7);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025), 0 18px 45px rgba(0, 0, 0, 0.18);
   }
 
-  .command-gpu-wrap {
-    display: flex;
-    height: 265px;
-    align-items: center;
-    overflow: hidden;
-    outline: 1px solid rgba(255, 255, 255, 0.1);
-    outline-offset: -1px;
-  }
-
-  .command-gpu {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-    object-position: center;
-    transform: scale(1.12, 1.18);
-  }
+  .command-hero.compact { min-height: 156px; padding-block: 18px; }
+  .command-hero.attention { border-color: rgba(197, 104, 87, 0.48); }
 
   .command-identity {
     align-self: center;
-    padding: 0 44px 0 36px;
+    min-width: 0;
+    padding: 0;
   }
 
   .eyebrow,
   .state-status span {
-    color: #a2a6aa;
-    font-size: 16px;
+    color: #a5aaad;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
   }
 
   .command-identity h1 {
-    margin: 2px 0 24px;
+    margin: 4px 0 2px;
     color: #f0f0ef;
-    font-size: clamp(38px, 3.7vw, 56px);
-    font-weight: 500;
-    line-height: 1.02;
+    font-size: clamp(32px, 3.2vw, 46px);
+    font-weight: 540;
+    line-height: 1.08;
     letter-spacing: -0.025em;
     text-wrap: balance;
   }
 
+  .command-identity h1:focus { outline: none; }
+
+  .gpu-source {
+    display: block;
+    margin-bottom: 18px;
+    color: #92999d;
+    font-size: 12px;
+  }
+
   .state-status {
     display: grid;
-    grid-template-columns: 165px 230px;
-    width: 395px;
+    grid-template-columns: minmax(120px, 0.45fr) minmax(190px, 1fr);
+    width: min(100%, 460px);
     border-bottom: 1px solid rgba(255, 255, 255, 0.28);
-    padding-bottom: 22px;
+    padding-bottom: 14px;
   }
 
   .state-status > div {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 6px;
   }
 
   .state-status > div + div {
     border-left: 1px solid rgba(255, 255, 255, 0.3);
-    padding-left: 66px;
+    padding-left: clamp(24px, 3vw, 46px);
   }
 
   .state-status strong {
     color: #79b72e;
-    font-size: 40px;
+    font-size: 28px;
     line-height: 1;
   }
+
+  .state-status .state-value.problem { color: #d98270; }
+  .state-status .state-value.pending { color: #9aa2a7; }
+  .state-status .state-value.working { color: #d0a15f; }
 
   .state-status .protected {
     display: flex;
     align-items: center;
-    gap: 12px;
-    font-size: 25px;
+    gap: 9px;
+    font-size: 18px;
     font-weight: 500;
   }
 
   .state-status .protected.pending { color: #8e979d; }
 
   .command-identity p {
-    margin: 14px 0 0;
+    max-width: 62ch;
+    margin: 12px 0 0;
     color: #b8bbbe;
-    font-size: 20px;
+    font-size: 15px;
+    line-height: 1.45;
   }
 
   .command-cta {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 18px;
+    gap: 12px;
   }
 
   .plate-button {
     position: relative;
-    width: 335px;
-    height: 118px;
+    width: min(100%, 315px);
+    height: 98px;
     overflow: visible;
     border: 0;
     background: transparent;
     cursor: pointer;
+    transition: filter 150ms ease, transform 100ms ease;
   }
+
+  .plate-button:hover:not(:disabled) { filter: brightness(1.07); }
+  .plate-button:active:not(:disabled) { transform: scale(0.96); }
 
   .plate-button img {
     position: absolute;
@@ -1313,17 +1573,19 @@
     position: relative;
     z-index: 1;
     color: #15110d;
-    font-size: 28px;
+    font-size: 23px;
     font-weight: 600;
   }
 
   .plate-button:disabled {
-    opacity: 0.65;
+    cursor: not-allowed;
+    filter: grayscale(0.55);
+    opacity: 0.54;
   }
 
   .command-run-mode {
     display: grid;
-    width: 335px;
+    width: min(100%, 315px);
     gap: 7px;
   }
 
@@ -1340,8 +1602,8 @@
 
   .command-run-mode label > span {
     grid-column: 1 / -1;
-    color: #7f8b94;
-    font-size: 10px;
+    color: #92999d;
+    font-size: 12px;
     font-weight: 700;
     letter-spacing: 0.14em;
   }
@@ -1378,9 +1640,9 @@
   }
 
   .command-run-mode small {
-    color: #78838b;
-    font-size: 11px;
-    line-height: 1.35;
+    color: #92999d;
+    font-size: 12px;
+    line-height: 1.45;
     text-align: center;
   }
 
@@ -1393,11 +1655,58 @@
     padding: 0 0 7px;
     background: transparent;
     color: #8f99a4;
-    font-size: 19px;
+    font-size: 14px;
     cursor: default;
   }
 
   .refine :global(svg) { color: #7eae3a; }
+
+  .command-alert {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 12px;
+    border: 1px solid rgba(190, 145, 86, 0.42);
+    border-left: 3px solid #c19057;
+    border-radius: 9px;
+    padding: 14px 16px;
+    background: rgba(39, 29, 20, 0.56);
+    color: #d2a267;
+  }
+
+  .command-alert.critical {
+    border-color: rgba(197, 104, 87, 0.42);
+    border-left-color: #c56857;
+    background: rgba(43, 23, 20, 0.58);
+    color: #d98270;
+  }
+
+  .command-alert strong { color: #e3e0da; font-size: 14px; font-weight: 650; }
+  .command-alert p { margin: 4px 0 0; color: #b9b3ad; font-size: 13px; line-height: 1.5; }
+  .command-alert button {
+    display: grid;
+    width: 44px;
+    min-height: 44px;
+    place-items: center;
+    border: 0;
+    background: transparent;
+    color: #aaa39e;
+    cursor: pointer;
+  }
+
+  .safety-details { margin-top: 12px; }
+  .safety-details summary { cursor: pointer; font-weight: 600; color: #eee5d7; }
+  .safety-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .command-alert .safety-actions button {
+    width: auto;
+    padding: 8px 14px;
+    border: 1px solid #8a7663;
+    border-radius: 6px;
+    color: #f2e9dd;
+    background: #312b25;
+  }
+  .command-alert .safety-actions button:disabled { opacity: 0.5; cursor: default; }
+  .safety-details .export-error { color: #f29c8c; }
 
   .command-telemetry {
     display: grid;
@@ -1408,11 +1717,13 @@
     background: #555c61;
   }
 
+  .command-telemetry.essential { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
   .command-metric {
     position: relative;
     min-width: 0;
-    min-height: 188px;
-    padding: 23px clamp(18px, 1.5vw, 28px) 16px;
+    min-height: 142px;
+    padding: 18px clamp(12px, 1.15vw, 20px) 12px;
     background: rgba(8, 11, 12, 0.94);
   }
 
@@ -1423,9 +1734,9 @@
   .metric-title {
     display: flex;
     align-items: center;
-    gap: 13px;
-    color: #8f989f;
-    font-size: 15px;
+    gap: 9px;
+    color: #a1a9ae;
+    font-size: 12px;
     letter-spacing: 0.04em;
     text-transform: uppercase;
   }
@@ -1435,12 +1746,12 @@
     min-width: 0;
     align-items: baseline;
     gap: clamp(6px, 0.65vw, 10px);
-    margin: 8px 0 10px clamp(0px, 2.5vw, 36px);
+    margin: 9px 0 8px;
   }
 
   .metric-reading strong {
     color: #eceeed;
-    font-size: clamp(38px, 3.1vw, 45px);
+    font-size: clamp(28px, 2.5vw, 38px);
     font-weight: 500;
     line-height: 1;
     font-variant-numeric: tabular-nums;
@@ -1449,36 +1760,53 @@
   .metric-reading span {
     flex: 0 0 auto;
     color: #b4b7b9;
-    font-size: 17px;
+    font-size: 13px;
   }
 
   .command-metric small {
     display: block;
     margin-top: 2px;
     color: #93989d;
-    text-align: right;
+    font-size: 12px;
+    text-align: left;
     min-height: 1.25rem;
     overflow-wrap: anywhere;
   }
 
   .section-label {
-    display: flex;
+    display: grid;
+    grid-template-columns: auto auto minmax(24px, 1fr);
     align-items: center;
-    gap: 18px;
-    height: 24px;
-    color: #9da2a6;
-    font-size: 14px;
+    gap: 12px;
+    min-height: 32px;
+    margin-bottom: 7px;
   }
 
-  .section-label::before,
   .section-label::after {
     content: "";
     height: 1px;
     background: #4e555a;
   }
 
-  .section-label::before { width: 18px; }
   .section-label::after { flex: 1; }
+
+  .section-label h2 {
+    margin: 0;
+    color: #d5d8d8;
+    font-size: 16px;
+    font-weight: 620;
+    letter-spacing: -0.01em;
+  }
+
+  .section-label > span {
+    color: #92999d;
+    font-size: 12px;
+  }
+
+  .command-body :global(.forge-progress) {
+    border-radius: 11px;
+    box-shadow: 0 14px 38px rgba(0, 0, 0, 0.16);
+  }
 
   .field-failure {
     min-height: 40px !important;
@@ -1487,7 +1815,7 @@
     padding: 0 6px !important;
     background: transparent !important;
     color: #9b9189 !important;
-    font-size: 11px !important;
+    font-size: 12px !important;
     letter-spacing: 0.03em;
     text-decoration: underline;
     text-underline-offset: 3px;
@@ -1512,6 +1840,20 @@
     color: #c2c5c8;
     cursor: pointer;
     text-align: left;
+    transition: background-color 150ms ease, border-color 150ms ease, transform 100ms ease;
+  }
+
+  .command-advanced:hover {
+    border-color: #747d82;
+    background: rgba(255, 255, 255, 0.025);
+  }
+
+  .command-advanced:active { transform: scale(0.99); }
+
+  .command button:focus-visible,
+  .command select:focus-visible {
+    outline: 2px solid #cf955d;
+    outline-offset: 3px;
   }
 
   .command-advanced > span {
@@ -1907,7 +2249,7 @@
   }
 
   .instrument-runtime > div + div { border-left: 1px solid #555952; }
-  .instrument-runtime span { display: flex; flex-direction: column; gap: 6px; color: #8d9290; font-size: 11px; }
+  .instrument-runtime span { display: flex; flex-direction: column; gap: 6px; color: #8d9290; font-size: 12px; }
   .instrument-runtime strong { color: #cfd0cd; font-size: 16px; font-weight: 500; font-variant-numeric: tabular-nums; }
 
   .instrument-apply {
@@ -2167,7 +2509,7 @@
   .workshop-telemetry article em {
     max-width: 18ch;
     color: #858b89;
-    font-size: 11px;
+    font-size: 12px;
     font-style: normal;
     line-height: 1.35;
     overflow-wrap: anywhere;
@@ -2215,17 +2557,6 @@
   .workshop-footer :global(svg) { color: #71b866; }
   .workshop-footer.pending :global(svg) { color: #777f7c; }
 
-  @media (max-width: 1440px) {
-    .command-hero { grid-template-columns: minmax(300px, 390px) minmax(360px, 1fr); }
-    .command-cta { grid-column: 1 / -1; flex-direction: row; justify-content: center; }
-  }
-
-  @media (min-width: 981px) and (max-width: 1599px) {
-    .command-telemetry { grid-template-columns: repeat(12, minmax(0, 1fr)); }
-    .command-metric { grid-column: span 3; }
-    .command-metric:nth-last-child(-n + 3) { grid-column: span 4; }
-  }
-
   @media (max-width: 1380px) {
     .instrument-content { grid-template-columns: 1fr; }
     .instrument-action-panel { grid-row: 2; }
@@ -2233,18 +2564,18 @@
   }
 
   @media (max-width: 1180px) {
-    .command-header { grid-template-columns: 280px minmax(190px, 1fr) 240px; }
+    .command-header { grid-template-columns: 238px 174px minmax(0, 1fr); }
+    .command-brand { padding-inline: 20px; }
     .command-nav { gap: 2px; }
     .command-nav button { min-width: auto; padding-inline: 10px; }
-    .command-hero { grid-template-columns: minmax(280px, 330px) 1fr; }
+    .system-item { padding-inline: 10px; }
+    .command-hero { grid-template-columns: minmax(0, 1fr) minmax(280px, 320px); }
     .workshop-telemetry { grid-template-columns: repeat(3, 1fr); gap: 28px 0; padding-block: 28px; }
   }
 
   @media (min-width: 561px) and (max-width: 980px) {
     .command-telemetry { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .command-metric,
-    .command-metric:nth-last-child(-n + 3) { grid-column: auto; }
-    .command-metric:last-child { grid-column: 1 / -1; }
+    .command-telemetry.essential { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
 
   @media (max-width: 820px) {
@@ -2259,22 +2590,21 @@
     .full-reset-copy > span,
     .full-reset-copy > strong,
     .full-reset-copy > p { grid-column: 1; }
-    .full-reset-action { width: 100%; }
+    .soft-reset-action,
+  .full-reset-action { width: 100%; }
     .workshop .full-reset-strip { margin-inline: 24px; padding-inline: 0; }
     .reset-dialog { padding: 20px; }
     .reset-dialog-actions { flex-direction: column-reverse; }
     .reset-dialog-actions button { width: 100%; }
     .reset-confirm { min-width: 0; }
     .reset-feedback { right: 12px; bottom: 12px; width: calc(100% - 24px); }
-    .command-header { grid-template-columns: 1fr auto; height: auto; min-height: 82px; }
+    .command-header { grid-template-columns: auto minmax(0, 1fr); height: auto; min-height: 82px; }
     .command-brand { padding-left: 20px; }
-    .command-nav { grid-column: 1 / -1; order: 3; overflow-x: auto; height: 58px; padding-left: 10px; }
-    .command-page { min-height: calc(100vh - 140px); padding: 22px 18px 36px; }
-    .connected { display: none; }
+    .command-nav { justify-self: end; overflow-x: auto; height: 58px; padding-right: 10px; }
+    .command-system-status { grid-column: 1 / -1; min-height: 64px; border-top: 1px solid rgba(255, 255, 255, 0.08); border-left: 0; padding: 8px 12px; }
+    .command-page { min-height: calc(100vh - 146px); padding: 22px 18px 36px; }
     .command-hero { grid-template-columns: 1fr; }
-    .command-cta { flex-wrap: wrap; }
-    .command-gpu-wrap { height: 220px; }
-    .command-identity { padding: 0; }
+    .command-cta { align-items: flex-start; }
     .command-telemetry { grid-template-columns: 1fr 1fr; }
     .instrument-frame { grid-template-columns: 1fr; }
     .instrument-rail { min-height: auto; border-right: 0; }
@@ -2298,6 +2628,8 @@
     .command-brand span { font-size: 17px; }
     .command-hero { min-height: 0; }
     .command-identity h1 { font-size: 34px; }
+    .command-system-status { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .system-item:nth-child(3) { border-left: 0; }
     .state-status { width: 100%; grid-template-columns: 1fr 1fr; }
     .state-status > div + div { padding-left: 20px; }
     .state-status strong { font-size: 30px; }
@@ -2305,9 +2637,7 @@
     .plate-button,
     .command-run-mode { width: min(100%, 320px); }
     .command-telemetry { grid-template-columns: 1fr; }
-    .command-metric,
-    .command-metric:nth-last-child(-n + 3),
-    .command-metric:last-child { grid-column: auto; }
+    .command-telemetry.essential { grid-template-columns: 1fr; }
     .gauge-side { grid-template-columns: 1fr; }
     .gauge-side > div { min-height: 170px; border-right: 0; border-bottom: 1px solid #5b605d; }
     .gauge-side.right > div:first-child { border-left: 0; }
@@ -2430,7 +2760,7 @@
 
   .profile-card-state small {
     overflow: hidden;
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 680;
     letter-spacing: 0.04em;
     text-overflow: ellipsis;
@@ -2478,8 +2808,8 @@
   }
 
   .profile-card-metrics small {
-    color: #737d82;
-    font-size: 9px;
+    color: #92999d;
+    font-size: 12px;
     font-weight: 700;
     letter-spacing: 0.06em;
     text-transform: uppercase;
@@ -2514,7 +2844,7 @@
     background: transparent;
     color: #aeb4b4;
     font: inherit;
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 670;
     cursor: pointer;
     transition: background-color 150ms ease, box-shadow 150ms ease, color 150ms ease, transform 100ms ease;
@@ -2642,12 +2972,24 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .full-reset-action,
+    .soft-reset-action,
+  .full-reset-action,
     .reset-dialog-actions button,
+    .plate-button,
+    .command-advanced,
+    .command-alert button,
+    .command-nav button,
     .profile-disclosure,
     .profile-card-state :global(svg),
     .profile-card-actions button {
       transition: none;
+    }
+
+    .plate-button:active:not(:disabled),
+    .command-advanced:active,
+    .profile-disclosure:active:not(:disabled),
+    .profile-card-actions button:active:not(:disabled) {
+      transform: none;
     }
   }
 </style>

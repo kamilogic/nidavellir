@@ -1,14 +1,723 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. Current state is the 2026-07-23 qualification-v25 authoritative-point
-build plus uncapped Standard and the isolated Detector Lab v14 bake-off below. Older dated sections
-remain as history;
-where they describe qualification v22 cap
-coverage, device-churn Field Concurrency or a single frontier for both learning and publication, the
-v25 section supersedes them.
-Apply still requests 12 mV above the learned boundary, snaps upward to a physical VF bin and must
-pass the complete exact-Apply gate before publication.
+## LATEST — publish after crash (B) + band-only inconclusive (2026-09-26 night)
+
+User chose B: an attributed in-process CandidateCrash still stops the run, but the terminal close
+publishes profiles from pairs with a complete current-run matrix after the condemnation is durable
+and stock restored, excluding the recomputed TDR cone; Apply stays latched until the incident is
+acknowledged (Recover Forge) and re-checks the cone. Bugcheck (process death) still publishes
+nothing. Inconclusive now closes only its band; before a qualified top the search still ends.
+702 Rust tests passed/3 hardware ignored, release check passed. No hardware, UI unchanged.
+Next: user closes Core, BAT rebuild, Full Reset → Clean (~7 h).
+
+## Previous — DX11 power-limit attribution fix (2026-09-26 night)
+
+Run1790466472114 (search7) worked through discovery (1075→943→937) and the 30 s screening, then
+stopped at DX11 `dx11_target_unexercised`: cap bit on 100% of samples but only 0.14 s credited,
+because NVML power is a 1 s average on Ampere and the rule also demanded >=97% of limit per sample.
+Fixed: power-limited = SW power-cap bit without thermal bit. 701 Rust tests passed/3 hardware
+ignored. Crash-at-edge risk resolved by the entry above (option B).
+Next: user closes Core, BAT rebuild, Full Reset → Clean; expect ~7 h for 24 admissions.
+
+## Previous — representative-load contract + search7 (2026-09-26 evening)
+
+User chose the representative load (PowerRender) as the power envelope; heavy matrix loads may
+reach the 200 W limit. Frontier32/ExactApply35/search7 (Discovery9, matrix27 unchanged):
+power-bound jumps to the lowest bin above the measured equilibrium voltage; qualification samples
+below target with SW power cap (97% condition later removed) count as held; heavy phases <20 samples skipped
+(fixes every 30 s screening going `heavy_phase_telemetry_low`); selection uses PowerRender p99.
+Evidence and test log: target/beta/representative-load-20260926/. See memory.md Current and
+qualification-rules-2026-09-25.md (new top section). No hardware run, reset or live change.
+Next: user closes Core, rebuilds via scripts/dev-launch.bat, Full Reset → Clean; check the first
+power-bound jump log line, the Texture screening verdict and DX11 `power_limited_active_ms`.
+
+## Previous — nominal clock envelope (2026-09-26)
+
+Run1790446614161 proves repeated1905->1920 excursions with voltage held1043 and no faults.
+User rejects endless abort/retry; current contracts Discovery9/Frontier31/ExactApply34/search5
+allow measured nominal..nominal+15MHz throughout discovery/heavy qualification. NVML request
+remains nominal, voltage/power unchanged. Peak saved separately from p95; absent/out-of-range
+peak cannot authorize current evidence. No higher profile inferred from transient peaks.
+Snapshot/tests: target/beta/clock-envelope-20260926/. Hardware validation pending; no live
+process stopped, reset or started. See memory.md Current and qualification-rules-2026-09-25.md.
+697 Rust tests passed/3 hardware ignored; release cargo check and UI build passed. Core PID14884
+still open: no new executable loaded. User closes Core and rebuilds through BAT for validation.
+
+## Previous — control stop diagnosis and bounded recovery (2026-09-26)
+
+Run f2-forge-1790445480585 correctly began1920@1081, stopped attempt9/24 at1920@1031
+after a control excursion. No TDR/integrity fault; reset confirmed. Peak clock was not saved,
+so exact overshoot is unknown. Search4 adds one durable same-pair discovery retry after clean
+recovery, and explicit peak diagnostics; repeated control failure still stops. No hardware run
+started/stopped. Core PID8152 still has old code; user closes it and rebuilds via BAT for new run.
+Read memory.md Current and target/beta/control-stop-20260926/ for preserved evidence.
+Verification:696 Rust tests passed/3 hardware ignored; release cargo check/UI build passed.
+No new release executable loaded and no physical retry tested.
+
+## Previous — organic top seed correction (2026-09-26)
+
+- Root cause: f2_qualified_search_seeds limited target to preheat sustained p5, despite a higher
+  stock VF domain. Removed that parameter; first target is the real domain maximum, not1740
+  or a hardcoded1905. Voltage remains stock-derived with bounded offset planning.
+- Search3 descends after an unavailable top; see memory.md and updated qualification rules.
+  Existing hardware protections/qualification contracts unchanged. Search2 cannot Resume.
+- 693 Rust tests passed/3 hardware ignored; logs under target/beta/top-seed-20260926/.
+  Release replacement blocked by Windows access denied while Core PID22656 remained open.
+  Live Core was not changed; stop run/close Core, then BAT rebuild is required before validation.
+  No service start, stop, reset or physical test. Next: user new Core via BAT, Full Reset/Clean;
+  inspect first-candidate log and real upper-domain evidence. Do not promise historical1905.
+
+## Previous — worst-load qualification software validation (2026-09-25)
+
+- Discovery8 / Frontier30 / ExactApply33 / search2. Only performance starts; complete pass raises
+  clock first, power-bound descends voltage at same clock, economic seeds derive from qualified top.
+- Maximum sampled clock (no +15 tolerance), voltage authority also on ClockDrop, all-lane power
+  strictly below board cap; heavy DX11 phases each30s/95%, other heavy phases20samples/95%.
+- Removed power-bound5% residency exception. Cancel preserves neutral status; telemetry stalls and
+  current ClockDrop do not establish instability. Contaminated dwell faults skip nominal blacklist;
+  independent Sentinel/BootFlag TDR protections still conservative and not automatically erased.
+- See docs/qualification-rules-2026-09-25.md for full criteria, transitions and physical limitations.
+-690 Rust tests passed/3 hardware ignored; final classifier recheck476 service tests passed.
+ 18 UI unit +6 qualification browser tests passed; Core release/UI production builds passed.
+ Logs, hashes and backups: target/beta/worst-load-20260925/verification.json. No hardware run,
+ service start, reset, acknowledgement or live tuning. Next: user-started Full Reset/Clean via
+ scripts/dev-launch.bat, inspect heavy phase evidence/control refusals before accepting hardware.
+
+
+## Previous — stopped run analyzed; top-first objective restored (2026-09-25)
+
+Read memory.md Current and docs/clean-run-results-2026-09-25.md. User rejected low provisional
+results. Evidence confirms no target above1740 was tested; performance band closed on missing
+DX11 exposure, not hardware failure. Manual cancel wrongly closed balanced band too. Paused,
+stock cleanup confirmed by checkpoint/observations; no new hardware action performed.
+User requires highest qualified clock under board power budget first, then[90%,100%] profile
+search. Current3-stock-band strategy misses that priority. No code changed in this review.
+Power criterion answered: ALL loads including heaviest stress must sustain target below board
+limit. Reduced-duty exposure alone cannot approve a top.1740@937 initial DX11 full-duty max1680.
+Preserve integrity/recovery, redesign top-first scheduling and qualification contract together;
+then derive[90%,100%] economic domain. Do not promise manual gaming clock under worst load.
+
+## Previous — qualified discovery delivered; user-started clean run next (2026-09-24)
+
+Read memory.md Current and docs/undervolt-discovery-proposal-2026-09-18.md. The implementation
+is complete and software-tested: qualification-first3-band discovery,24 admissions/8h Standard,
+full same-pair matrix before any refinement, durable limits/closed bands and one power-bound
+preparation. No TDR Resume. Frontier29/ExactApply32. Stock secondary oracle/peer cancellation.
+Old exhaustive frontier and vertical-repair code removed; no parallel old live algorithm remains.
+UI separates short-stage success, complete candidate proof, coverage and budget/stop reasons.
+
+Verification:692 workspace tests passed,3 hardware tests ignored;18 UI unit and33 browser cases
+passed; Core release and UI production build passed. No Rust warnings. Logs and exact hashes:
+target/beta/qualified-discovery-20260924/verification.json. Core is
+ target/release/nidavellir-service.exe (12,672,512 bytes; SHA256 in verification file).
+No service start, GPU load, reset, acknowledgement or installer operation. Review also fixed
+Stop hiding integrity failure, global-vs-pair exclusions, exact-clock summaries and offset reference.
+
+NEXT: user closes old UI/Core if open and launches scripts/dev-launch.bat, which rebuilds release;
+Full Reset -> Clean Run manually, then exports report.8h run budget is independent of Codex quota.
+Inspect first complete-pair time, total time, bands/stop reasons, errors/TDR, cleanup and profiles.
+Do not call software tests physical acceptance; do not manufacture proof from the previous run or
+restart an automatic crash campaign. Hardware/game and product/installer acceptance stay pending.
+
+## Previous — stronger discovery design ready, implementation pending (2026-09-18)
+
+Read docs/undervolt-discovery-proposal-2026-09-18.md. User requested a more trustworthy
+triage/discovery design and accepts longer tests. Recommend few candidates qualified by
+the existing full ordered matrix BEFORE further descent, with finite persistent budgets
+and regional stops on integrity error.12 attempts/4h are pilot limits pending planner reach
+replay, not stability thresholds or production defaults. Stock-derived bands allow one
+bounded preparation step under confirmed power limitation. Do not treat a short pass as
+qualification or assume user has accepted every numeric detail.
+First fix secondary canary stock-reference and prompt error propagation: currently it
+self-references at the candidate and reports its failure only after primary completion.
+No proof either gap caused868's bugcheck.1890@875 passed only short tests; it is not a
+demonstrated false pass. No source change, build, hardware test or state reset in this design
+turn. Keep Full Reset forget-all, manual BAT validation and explicit incomplete coverage.
+
+## Previous — manual Clean Run reboot investigated (2026-09-18 afternoon)
+
+Read docs/clean-run-results-2026-09-18.md. Run1789720117824 failed in Texture Frontier at
+1890@868: driver153 at05:47:34, durable CandidateCrash+Stop05:47:36, Windows bugcheck0x116
+and nvlddmkm.sys attribution at next boot05:49. Stock cleanup for that transaction is NOT
+confirmed; armed flag/checkpoint preserved. No current Core process.38 completed observations,
+all their cleanups confirmed; no final Apply or profiles.1890@875 passed short tests only.
+Investigation did not start Core, clear evidence, acknowledge, Resume or run GPU load. Dump
+access denied, so no claimed blocked-call/stack diagnosis. Next: review cancellation/cleanup
+after first TDR; distinguish detector recording success from actual driver recovery. Evidence:
+target/beta/restart-investigation-20260918-151401/. Preserve before any operator Full Reset.
+
+## Previous — four post-run corrections implemented; manual acceptance next (2026-09-18)
+
+Read memory.md Current and docs/contracts/ui-backend.md first section. Source changes:
+separate confirmed PowerRender comparison p99 from worst Apply stress p99; remove the common
+1% F2 energy veto without changing board-limit programming or v31 physical qualification;
+persist per-clock stop/censoring records; allow one economic-range extension based on final
+Godforge sustained p5 with budget surviving Resume; deduplicate UI cards and disclose coverage.
+Full Reset forgets everything as already implemented; Soft preserves negatives. No live reset.
+725 workspace tests,18 UI unit tests,28 browser cases and production UI build passed;208 final
+sweep tests passed after coverage/persistence refinements. Release cargo check passed; Clippy
+completed with existing warnings.
+Offline replay identifies9 clean DX11 passes that would continue; it cannot qualify their missing
+API lanes. The3 target-unexercised cases remain refused. Evidence:target/beta/profile-policy-20260918/.
+Core7696 was idle via read-only IPC and left untouched. It predates these source edits. User
+should close UI/Core normally and reopen the BAT, which rebuilds release, then Full Reset ->
+Clean Run manually. No hardware load, no service restart, no installer and no history erasure.
+Release executable/sidecar not replaced in this turn; no need to install for BAT validation.
+Inspect new run for actual trade-offs and incomplete/censored coverage before declaring quality
+solved. No hardcoded manual reference, no automatic run and no unbounded extension.
+
+## Previous — Full/Soft Reset implemented; build waiting on old Core (2026-09-17)
+
+User explicitly changed reset policy: Full must forget all GPU knowledge INCLUDING negatives;
+Soft must preserve known failures and clear positive results. This supersedes prior guidance.
+Implementation in gpu_apply/ipc_server, additive ResetGpuTuningSoft IPC, UI confirmations and
+BAT wording. Full deletes active stores/learning archives after stock/quiescence, clears RAM
+results; a persistent pending marker blocks tuning/reapply until interrupted deletion is retried.
+Reboot guards and development authorization remain. See contracts first section and decisions.
+722 workspace tests,17 UI unit tests,25 browser journeys, Clippy and UI build passed. Hardware reset not executed;
+user data unchanged. Evidence:target/beta/reset-modes-20260917/ (before/patches/logs).
+BLOCKER: release executable is held by Core17032 (run finished, process remains). User asked
+to close via async question. After exit: cargo build --release -p nidavellir-service, copy to
+apps/ui/src-tauri/binaries/nidavellir-service-x86_64-pc-windows-msvc.exe, verify hashes, update
+manifest/status. Do not force kill, authorize a run or erase actual learning automatically.
+Do not present profile optimization as solved; the other analysis findings still need correction.
+
+## Previous — completed run produced one qualified point under three names (2026-09-17)
+
+Read docs/profile-selection-analysis-2026-09-17.md and memory.md Current. Run1789668446810
+finished after2h08;1710@868/196.668W passed all4 Apply lanes and was duplicated across profiles.
+12 higher pairs exceeded the common198W ceiling;9 had passed DX11,3 also lacked exposure.
+No active overshoot, physical failure or failed reset in this run. Profile quality remains open.
+Primary chain: historical TDR cone censors lower voltages despite fresh-positive Clean -> different
+PowerRender/DX11 power costs eliminate almost all Apply pairs -> original90%-of1890 floor at1710
+leaves no lower economic alternatives -> synthesis aliases sole point as all3 qualified profiles.
+1920@943 historical incident originated in restart reconciliation; audit its attribution and the
+inferred cone, never silently erase negatives or assume removing one event permits1800@875.
+Next corrections are in report; user requested analysis, no algorithm/history changes performed.
+Evidence:target/beta/profile-selection-20260917/. New tests/build are unnecessary for this analysis.
+No service running at collection, but post-run shutdown timing was not captured.
+
+## Previous — delayed Core exit and NVAPI lifecycle correction (2026-09-17)
+
+Read memory.md Current and docs/shutdown-investigation-2026-09-17.md. Old Core10272 remained
+enumerated with one busy kernel thread more than3min after its clean marker, then exited itself.
+No stack proves the exact kernel cause. Fixed repeated unbalanced NvAPI_Initialize calls in11
+wrapper sites; one shared initialization and one terminal unload after GPU users quiesce.
+719 workspace tests passed (3 hardware tests ignored); separately128 read-only voltage reads,
+unload and subprocess exit passed in123.0905ms. Clippy/release passed; release/sidecar hashes match.
+This build ALSO includes the preceding clock-control diagnostics/routing changes, previously
+blocked from release replacement by the running Core. No service start or GPU workload executed.
+Evidence:target/beta/shutdown-lag-20260917/. Next is bounded manual BAT/Clean Run acceptance,
+including closing Core after the run. Do not claim the short probe proves full-run shutdown or
+that clock containment is solved. Keep workload thresholds and negative safety evidence intact.
+
+## Previous — clock-control diagnostics and bounded routing implemented (2026-09-17)
+
+Read memory.md Current and docs/contracts/ui-backend.md first section. Upper excursions now
+retain phase/time/voltage/temperature and optional post-query curve context, independently of
+exposure/power refusals. Reset-clean complete lanes exclude only the pair as ClockControlExceeded;
+one alternate, then stop if control violation recurs. Resume restores the budget from observations.
+No blacklist/voltage escalation for control failure; physical/cleanup faults remain terminal.
+717 workspace tests passed (2 hardware tests ignored), Clippy passed existing warnings. No tuned
+workload or service restart. Evidence:target/beta/clock-control-20260917/. Service10272 still runs
+the OLD release; no release/sidecar replacement. User BAT rebuilds after closing old service.
+Physical ceiling cause remains unknown: no claim that software routing fixed driver containment.
+Next bounded manual Clean Run should inspect the new diagnostics, not relax thresholds or repeat
+blind overnight runs. 1% energy margin, DX11 workload and Apply v31 qualification rules unchanged.
+
+## Previous — first DX11 v4 Clean Run analyzed (2026-09-17)
+
+Read docs/clean-run-results-2026-09-17.md and memory.md Current. Run1789633001432 ended incomplete
+after38m34s,54 observations, no new physical faults or failed cleanup, no definitive profiles.
+1890@943 power refusal correctly moved to1875@937. That second pair met numeric active-exposure
+requirements (30.007s/76.524s,39.21%) but exceeded1875 (aggregate max1890), terminating all search.
+Both also exceed198W publication power ceiling. NVML max=target is ALREADY requested by the writer;
+overshoot cause/duration/frequency are not recorded. Instrument effective control and introduce a
+specific bounded decision for out-of-target control without instability attribution or silent pass.
+Keep concurrent energy/coverage causes visible. Then bounded hardware acceptance, not another
+blind overnight campaign. Analysis only; no source edits, restart, authorization or GPU load.
+Evidence snapshots/hashes:target/beta/clean-run-20260917/. Service10272 still open at collection,
+persisted run stopped; do not automatically Resume or change controls.
+
+## Previous — DX11 v4 / exact Apply v31 implemented (2026-09-17)
+
+Read memory.md Current and docs/contracts/ui-backend.md first section. Same total DX11 budget,
+heavy opening/closing and variable middle phases; fenced GPU-work accounting excludes idle and
+CPU checksum time. New active_target proof requires60 s observed active,30 s exact target,35%
+target fraction, all phases, sane voltage <=anchor and no sampled upper work excursion.
+Unexercised target excludes only that pair in the current run and moves to other candidates;
+no voltage repair, physical failure inference or blacklist. Continuous-load power remains screened.
+Publication requires current v31 active proof, negatives remain independent. Old structural repair
+cannot ignore a predominantly asserted power-limit flag just because numeric watts are lower.
+714 workspace tests passed (two hardware tests ignored); separate existing DX11 stock integration
+passed in3.08 s. No tuned run executed. Evidence/before copies/build manifest:
+target/beta/active-residency-20260916/. Next is bounded manual clean-start acceptance of active
+exposure and eventual profiles; no blind overnight test or claim of hardware qualification.
+
+## Previous — bounded load comparison executed (2026-09-16 22:15 local)
+
+Read memory.md Current and the last section of docs/clean-run-results-2026-09-16.md.
+One user-authorized 1830@943 transaction ran five 30 s DX11 duty phases without reapplying.
+Residence at1830 went 1.01 ->42.23 ->63.39 ->78.42 ->0.68% as work duty went100/75/50/25/100.
+All checks matched; stock cleanup confirmed, safety/observation files unchanged, paused checkpoint
+restored exactly. Evidence/scripts/journal/summary: target/beta/load-comparison-20260916/.
+Do not call this profile qualification: samples include idle; active-work exposure is not isolated.
+Readback also caught a temporary15 MHz shift in base/live curve with unchanged offset.
+506 service tests passed; release/sidecar rebuilt C5E5293E...EE9B0F, no service running.
+No need to rerun this comparison automatically. Next implementation should separate heavy-load
+integrity/performance from bounded active target coverage and fix numeric-off-cap interpretation.
+
+## Previous — power fallback corrected after operator's loaded run (2026-09-16)
+
+Read memory.md Current and docs/clean-run-results-2026-09-16.md final section. Run
+f2-forge-1789586811426 is manually paused with confirmed stock cleanup. Collection now yielded
+8 voltage samples in every short Discovery dwell. Seven DX11 dwells at 943 mV consumed 49 min
+because Godforge repeatedly carried an energy-rejected voltage to the next lower clock as a
+priority override. The fast-drop candidate now rejects ExactApplyPowerCeilingExceeded, leaving
+normal synthesis to select independently discovered pairs. Physical-failure fallback is preserved.
+505 service tests passed. Evidence, before source, tests and release-build.log are in
+target/beta/power-routing-20260916/. No service restart, Resume or hardware write by Codex.
+Release rebuild failed with access denied removing the executable held by service PID 20400;
+sidecar unchanged. Close service normally before the next BAT rebuild; updated source is tested.
+DX11 residency and full profile acceptance remain unresolved; do not treat this routing fix as
+proof of the entire algorithm or ask for another blind overnight campaign.
+
+## Previous — telemetry correction implemented, software verified (2026-09-16)
+
+Read the current entry in memory.md and docs/clean-run-results-2026-09-16.md. The dwell now uses
+persistent NVML and voltage attempts every 500 ms instead of every 16 inventory-reader loops.
+The minimum voltage proof remains 3 reads. Specific inconclusive_reason reaches persisted
+observations and both exports; non-power Discovery refusals no longer claim missing power.
+Per-phase sample_count/clock_max record the coverage and excursions p95 can hide.
+
+707 software tests passed; read-only host probe collected 8 voltage reads after the 6 s discard in
+a 10 s window and 39–40 clock/power reads per 1.2 s. This is cadence evidence without GPU load,
+not physical qualification. Evidence/before copies/final build manifest: target/beta/sampler-fix-20260916/.
+No shader, search policy, clock/voltage pass threshold, contract version or safety history changed.
+
+Next: bounded loaded verification of collection and investigate off-cap DX11 residency; do not
+declare clock-ceiling containment or profile discovery solved, or recommend another blind overnight
+run. Manual 1800@875 is a provisional comparator for this GPU only, not a search seed/forced result.
+The operator owns the manual BAT/Full Reset/Clean launch. Old service 19348 remains present and
+unresponsive to bounded Ping; the release file was built but that process was not restarted.
+
+## Previous — overnight Clean Run reviewed; concrete sampling defect (2026-09-16 afternoon)
+
+Read docs/clean-run-results-2026-09-16.md and the top of memory.md. Run
+f2-forge-1789548115932 finished incomplete after 3h08: 103 observations, no profiles,
+21 final DX11 Inconclusive; 17 power-envelope rejections behaved as intended.
+13 Discovery/calibration Inconclusive all have only 1–2 voltage readings, while the
+voltage-authority guard requires 3. Sampler reads voltage every 16 iterations; the 10 s
+windows did not deliver enough evidence. The generic PowerTelemetryInconclusive label
+hides this actual cause. Fix sampling/reason reporting before another long run, retaining
+evidence requirements. Seven Frontier Texture boost_edge_telemetry_low cases also need review.
+1710@868 remains an independent off-cap DX11 residency failure (1695 MHz p95 across 3 dwells).
+
+No new incident, 75 C max, all resets/BootFlags clean, history unchanged. Source untouched
+during this result review. Evidence preserved in target/beta/clean-run-20260916/; no new run
+or authorization sent. Service 19348 is still present but IPC connection timed out twice;
+the result is from final disk snapshots/audit. Do not claim the service exited, or silently
+restart it. User owns the next manual BAT/Full Reset/Clean start. Heartbeat remains paused.
+
+## Previous — operator launches everything with Desktop BAT (2026-09-16 08:35Z)
+
+Do not launch a service/authorize/start on the operator's behalf for this attempt. He wants
+the manual path through Desktop dev.bat → program Full Reset → Clean Run → Forge GPU.
+Desktop dev.bat now delegates to scripts/dev-launch.bat, which opens UI BEFORE its explicit
+authorization prompt. Operator resets in UI, returns to BAT to answer S, then starts Clean
+in UI. The old BAT authorized first, causing exactly the permission-consumed-by-reset trap.
+Original BAT backup/evidence: target/beta/overnight-run-20260916/. Procedure updated in
+docs/development-validation.md. Readiness fragment parses; no live launcher execution yet.
+
+Codex-prepared service 15504 stopped through Ctrl+C at 08:34:20Z, exit 0/clean marker confirmed.
+No service/UI remains, no BootFlag/applied profile, safety hashes unchanged. No run was started.
+The operator will launch and test the algorithm manually. Preserve the mixed tree, avoid builds
+or service changes during his run, and inspect live state first on resumption. Heartbeat paused.
+
+## Previous — overnight session prepared, later stopped for manual BAT launch (2026-09-16 08:28Z)
+
+Operator now requires all new validations to start Full Reset → Clean Run, with zero reuse of
+positive hardware learning. This is the primary acceptance path; Persistent/Resume cannot
+substitute it. Real incident history remains a separate safety restriction on this used GPU.
+
+The screenshot's block came from authorization followed by Full Reset before any Start,
+not a new crash. Export/audit reviewed, hashes unchanged. Completed clean console shutdown
+and restarted release service PID 15504 via wrapper 6140; existing UI stays open. Authorized
+one new development Clean Run at 08:27:32Z (Standard timing). Latest check: running=false,
+start_block_reason=null, idle stock, BootFlag false. Operator will click Forge GPU manually.
+Do not repeat Reset/authorize/restart or rebuild during this session; inspect current state first.
+Release remains 207C1EB6...2963BC. Evidence/logs: target/beta/overnight-run-20260916/.
+No workload started by Codex and no scheduled monitoring enabled. Read the latest memory entry.
+
+## Previous — DX11 v3 correction and bounded comparison complete (2026-09-16)
+
+Read the current memory.md entry and docs/clean-run-investigation-2026-09-14.md first.
+DX11 v3 overlaps one GPU batch with CPU checksum work. Exact Apply is v30, while the
+CandidateCrash budget/cone/startup safety floor remains v29 to preserve negative history.
+The SECOND AND FINAL diagnostic finished September 15 at 22:02:29Z, exit 0: 420 s at
+1830 MHz / 943 mV, 261424 frames/16339 checks, +28.9% throughput, 199.911 W p99, 76 C max.
+It remained Inconclusive (0.052% target residency). Both diagnostic windows are consumed;
+do not relaunch the wrapper, run a third point or start a full Forge automatically.
+
+After this physical comparison, the routing was fixed: complete clean DX11 above existing
+99%-of-board publication headroom stops retries and remaining lanes, preserves its raw
+Inconclusive, and closes same-clock upward-voltage repair. No blacklist/threshold relaxation.
+This routing was tested offline against measured numbers; full-run hardware acceptance is open.
+704 workspace tests passed, 2 hardware tests ignored; the real DX11 stock smoke passed
+separately (bad render/compute goldens and mid-run cancellation included).
+
+Final release: target/release/nidavellir-service.exe, SHA-256
+207C1EB65863218C0088EF48FD8FD1BF13C6F55CB32F2BEAF041ED9DEC2963BC.
+The physical comparison used pipeline build DFE3CBBF...61CC667 before the routing patch.
+Evidence and both copied journals: target/beta/clean-run-20260914/. On September 16 the
+service was absent, Safe Loop idle, pending incident null, BootFlag/applied profile absent,
+and both Safe Loop and condemnation ledger matched their pre-run hashes. Heartbeat paused.
+
+NEXT: operator's manual command-based run, using the current release and the explicit
+development-validation workflow already documented. Verify early power rejection and a
+complete four-lane profile result, or record the explained refusal. The comparison itself
+did not approve any profile or finish product acceptance. Installer was not rebuilt.
+Preserve the mixed worktree; audio is resolved and outside this task.
+
+## Previous — first bounded point diagnostic (2026-09-15)
+
+The September 14 Clean Run was stopped cooperatively; stock/idle verified, evidence
+exported, development authorization consumed and monitoring heartbeat PAUSED. No current
+service/workload after the operator's reboot. Read docs/clean-run-investigation-2026-09-14.md
+and the latest memory.md entry before older run instructions below.
+
+Confirmed: 39 exact-Apply DX11 attempts across 13 pairs were inconclusive due to target
+residency (38 full attempts), with no recorded integrity/crash failure. The one newly
+authorized point diagnostic then completed 120 s stock preheat plus a full 420 s dwell at
+1830 MHz / 943 mV. It returned `Inconclusive: target_residency_low` at 5.253% residency
+(35% required), 1767/1665/1785/1830 MHz avg/p5/p50/p95, and 98.07% power-capped fraction.
+No integrity error, TDR or device loss occurred; reset succeeded and BootFlag cleared.
+Readback showed the writer's +90 MHz anchor and effective 1830 MHz at 943/950 mV for all
+42 dwell snapshots, so the planner's reproduced valley did not appear in the effective
+curve. Working hypothesis is power/boost limitation under this workload; physical cause
+remains unisolated. Production writer, qualification thresholds and negative history are
+unchanged.
+The paired comparison originally proposed here has now finished; use the current entry above.
+The initial power/boost hypothesis based on the cap flag was too strong: p99 was 180.102 W.
+Do not launch a full search or renew authorization automatically. Audio resolved/out of scope.
+
+## START HERE — beta closure, intermittent execution (2026-09-12)
+
+The current plan is `roadmap.md` (D1–D5, J01–J11); `product.md` is the frozen beta
+contract. Resume from the latest `memory.md` entry and recheck files/processes after
+an interruption. Older START-HERE entries below are historical and do not override
+the current plan, Full Reset acknowledgement or the beta product contract.
+No automatic wakeup or usage-reset redemption was requested. Preserve the mixed
+worktree; hardware acceptance follows software gates and live safety eligibility.
+
+Workflow update (2026-09-14): operator prefers command-based development, then a manual run
+and later log analysis across quota windows. Use a release console service and ordinary-user
+Tauri dev UI; freeze the code/processes during the run. Do not use scripts/dev.ps1's optional
+cargo-watch service restart for acceptance. Installer checks resume for packaging changes or
+the frozen release candidate. This discussion started no service/build/run and does not resolve
+the existing 3/2 refusal; that remains the prerequisite for the proposed manual acceptance.
+
+LATEST (2026-09-14 08:21Z): controlled development authorization implemented and verified offline.
+Use docs/development-validation.md: elevated release console with --development-validation,
+then scripts/authorize-validation.ps1 -Authorize -Reason and ordinary-user Tauri dev UI. Authorization
+requires idle/recovered stock/no checkpoint, preserves historical exclusions and covers one fresh
+Standard run only. Synced audit precedes claim/spawn; first new/changed crash or any termination
+consumes permission. No Resume/Long/other GPU workers/Apply. Full Reset and process restart never
+restore it automatically. Normal console/SCM remain on the original 3/2 budget.
+700 Rust (498 service), 17 Node, 3 J12 theme tests, 4 isolated command scenarios, UI build and release
+service passed. Evidence: target/beta/development-validation/. New release hash 4F48C611...828B5,
+built 08:19:15Z; installer/old manifest/sidecar not rebuilt and not equivalent to this service.
+No live authorization/reset/GPU run; safe data unchanged, no service/UI/tuning files. NEXT is the
+operator's manual authorization and Standard run, then export/analysis. Do not auto-start a run.
+
+Previous (2026-09-14 02:10Z): installed safety guidance/export/history PASSED with actual Tauri IPC
+as an ordinary Windows user. Pinned installer 08937E75...80417; installed UI matches its extracted
+payload. Safe Loop Protected, enabled Review safety block, real report with three acknowledged
+incidents and direct Sentinel history navigation all verified. Native state remained idle/stock
+with no pending ACK and the same 3/2 refusal. Normal close and checked uninstall passed.
+Evidence: target/beta/installed-safety-guidance/session.json, ui-result.json, post-verification.json,
+guidance.png/history.png and exported-diagnostic.txt. All 193 original data files retained; critical
+Safe Loop/ledger hashes match backup. No service/process/shortcuts/debug listener/tuning state remains;
+the direct-test uninstall.exe stub remains. No tuning, Reset/ACK or policy/ledger changes ran.
+Source drift: gpu-hero.png and themes/command-gpu.png are deleted under apps/ui/src/lib/assets.
+Preserved these external changes; no source references found; the other 138 manifest entries match.
+This tests the existing installer, not a newly rebuilt source tree. D2.6 now has native evidence.
+NEXT: D3 needs eligible hardware or a separately justified policy decision; clean-Windows and remote
+CI evidence remain pending. Do not repeat completed installer/UI checks or erase safety history.
+
+Previous (2026-09-14 01:54Z): fixed the operator's dead-end Safe Loop warning after Reset. Actual
+Safe Loop is now idle with no pending incident; live PowerSweep read still reported the 3/2 block.
+The UI now separates cleared recovery from automatic tuning refusal. Review safety block opens
+guidance, ExportForgeLog and direct safety-history navigation in all themes. Full Reset explicitly
+reports completed reset / still blocked tuning after refreshing state; saved profile Apply stays
+disabled. No GPU workload, live Reset/ACK, safety-policy change or incident rewrite was performed.
+17 Node tests, 15 existing browser journeys and four final J09 cases passed; screenshots reviewed.
+Browser transport is simulated. An optional final native export probe was unavailable because no
+service/UI process remained; record says unavailable, not pass. We did not restart the service.
+Current installer 08937E759599244469D94B48E9F50BE6E87C115756232E5284E2ACB203780417 was built
+at 2026-09-14T01:54:50Z; all 140 sources match, service binary unchanged, kit/ZIP refreshed. It was
+not reinstalled in this continuation. Details and evidence pointers are in the latest memory.md.
+Safe Loop hash 1898C808...EE30F (operator's reset state); ledger hash remains 490A5B75...98802.
+D3 policy/eligible-hardware decision remains separate. Do not conflate successful Reset with
+automatic tuning eligibility, or repeat previously passed installer tests without a reason.
+
+Previous (2026-09-13 19:25Z): actual published v0.3.1 -> current build upgrade PASSED. Both installers
+report 0.1.0; this is not a numeric-version upgrade. The old package's service-name bug reproduced;
+no old runtime started, and 193 data files stayed identical. Current service start/Ping passed.
+Evidence: target/beta/legacy-package-v0.3.1/upgrade-acceptance.json and upgrade-completion.json.
+Original UI-hash assertion failure was a runner mistake: installed UI matched the extracted package,
+whose Tauri bundle token is NSS versus UNK in the standalone executable. Preserve both reports.
+Actual uninstall exposed six obsolete CPU resources. Only hooks.nsh changed to delete exact paths
+and remove empty directories without recursion. New build and real targeted cleanup test PASSED:
+legacy-cleanup-before.json / legacy-cleanup-after.json. All six removed; unrelated fixture and
+installed PawnIO driver preserved. No service/UI/shortcuts remain; the direct uninstaller stub stays.
+Current installer SHA-256: DFD6D122593DB92BD80033DEDADC8714E531143885BCA0470B692ADF3CCFD63C
+(19:24:15Z). All 140 source entries match, service is byte-identical, software/hardware contracts
+unchanged. Previous package/manifest are retained beside legacy evidence. Do not repeat passed tests.
+Next: operator response about another NVIDIA GPU or a separately justified safety-policy review.
+target/beta/safety-policy-review.json records the existing cross-run 3/2 block and why rehabilitation
+cannot merely adjust its counter. No policy change/ACK/reset/GPU load ran. Clean OS and remote CI pending.
+
+Previous (2026-09-13 07:57Z): all remaining desktop/service checks PASSED and cleanup completed.
+Evidence: target/beta/installed-desktop-remainder/finish-session.json, post-verification.json,
+ui-offline.json/png, ui-reconnected.json/png and MissingBinary-result.json. Real Stop, offline
+action blocking, missing-binary refusal, exact restore/start, reconnect and uninstall passed.
+No service, UI, debug listener, app binaries or shortcuts remain; safety hashes match backup.
+An earlier wrapper misreported child exits; its actual Stop/Uninstall journals passed. Owned
+process handles now read explicit exit 0/1 correctly and the final whole session passed. Production
+sources are unchanged and all 140 manifest hashes match. Do not rerun these completed scenarios.
+Continue D3 eligibility/policy review and legacy upgrade/clean-Windows/CI evidence from roadmap.md.
+
+Previous checkpoint: installed desktop UI evidence passed in the real host, using the same frozen
+package. C:\Program Files\Nidavellir Desktop Acceptance now contains the test installation.
+The UI ran unelevated; NVIDIA detection, actual Tauri/pipe read responses, safety refusal,
+Settings/Forge navigation and Desktop/Start Menu shortcuts passed. Screenshots and 193-file backup:
+target/beta/installed-desktop-acceptance/. See desktop-summary.json and memory.md.
+Windows UAC canceled the requested Stop before control.ps1 ran. Service remains Running/Automatic;
+UI was closed normally and debug port 9226 is closed. No GPU workload, ACK, reset or Apply ran.
+Do not claim offline/reconnect or missing-binary tests passed; they remain pending, as does cleanup.
+No new conversational host permission is needed, but the Windows UAC prompt must be accepted.
+Do not re-run Install or silently retry canceled elevation. Use existing phase controller after
+checking reports. Previous lifecycle acceptance below remains valid for the previous test directory.
+
+Current result: the operator authorized this PC; VM is optional. The real lifecycle PASSED at
+2026-09-13T02:40:51Z: verified 192-file backup, install/Ping, running reinstall, SCM Stop,
+stopped reinstall and uninstall/history retention. Unelevated IPC Ping also passed. Evidence:
+target/beta/installer-host-acceptance/acceptance-report.json and post-lifecycle-verification.json.
+Service/processes and UI/service binaries are absent. Safety hashes are unchanged; only normal
+heartbeat/Sentinel/clean-shutdown files changed. No ACK/reset/Forge/Apply/GPU workload was requested.
+Current build: 2026-09-13T02:39:30Z, installer SHA-256
+7524EFB1DE40464F0356B748E1AD70042F7D7EA3775CDCCFD791466A336A301C; all 140 source hashes match.
+Do not repeat this successful lifecycle. Continue the remaining D5 UI/upgrade/failure evidence
+and D3 eligibility from roadmap.md. Read-only post-install preflight retains the 3/2 crash block.
+
+Previous checkpoint before host authorization: 692 Rust / 16 Node / 16 browser tests passed. Three new Rust regressions reject
+stale/malformed bugcheck attribution: August's old 0x116 must not classify a later interruption.
+The actual cause of September's code-zero reboot remains unconfirmed, and its ledger is preserved.
+The VM kit is in scripts/installer-acceptance.ps1 (Prepare/Inspect/Run), documented in
+docs/installer-acceptance.md. Host refusal and stale-runner refusal passed; actual VM tests need access.
+Session-4 packaging passed at 2026-09-13T01:51:49 UTC; log:
+target/beta/build-full-release-attribution.log. The kit is target/beta/installer-acceptance.zip;
+its runner and installer match the manifest. Preflight refreshed at 01:53:19 remains blocked,
+and host safety hashes are unchanged. The operator was asked whether to use an existing disposable
+VM or prepare one in Hyper-V. No environment answer has arrived yet. Session usage: 63%.
+
+Previous checkpoint: shared console/SCM shutdown,
+worker/Sentinel quiescence, late-cleanup refusal and real isolated process termination are covered
+in software. SCM Running now requires pipe readiness; installer retries reject failed shutdown.
+Packaging passed at 2026-09-12T20:19:50 UTC: target/beta/build-full-release-shutdown.log and
+target/release/release-manifest.json. Read-only preflight with the rebuilt service passed its
+integrity checks at 20:20:39 and still refuses this GPU. Next: isolated installer acceptance and
+eligible hardware; actual SCM/GPU outcomes cannot be inferred from the software tests.
+This GPU is blocked by 3 effective crashes versus limit 2; preserve its pending incident and safety
+evidence. The user was asked whether another Windows/GPU test environment is available.
+
+How to pick this up cold. Current state is the 2026-08-25 fail-closed hardening of the split contract:
+Discovery v7, Frontier v28, Exact Apply v29, with the workload/API matrix still v27. Older dated
+sections remain as history and are superseded where they describe one qualification version for both
+frontier and Apply, exact frontier Texture residency, Clean ignoring durable negatives, or automatic
+post-TDR continuation into a newly selected mode.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## START-HERE (2026-08-25) — release built offline; do not Resume the old-build checkpoint
+
+- Software hardening is complete. CandidateCrash must be `sync_data`-flushed and read back as the
+  exact Rigid v29 event before Forge may persist `interrupted`; failure stays `needs_attention` and is
+  repaired on startup without changing the raw lane or pending incident. F2 observation/condemnation
+  corruption refuses live discovery, synthesis, gate, publication, Apply and Resume.
+- Sentinel startup is transactional: checked Event Log snapshot/reconciliation, durable seed/floor,
+  watcher-ready handshake, then and only then boot reapply. Benchmark routes F2 through the same
+  proof-aware writer as normal Apply. Legacy real/memory workers require checked preflight and an
+  owned BootFlag transaction before every write.
+- Full Reset now means reset reusable positive learning, not negative safety memory. It waits for all
+  mutating workers, removes only validated F2 positives/profile knowledge with cross-file preflight
+  and rollback, and preserves pending incidents, Safe Loop blacklist, Rigid/Quarantine ledger, cone
+  and Sentinel history.
+- Offline gate: 674 workspace tests pass; two explicit hardware smokes remain ignored; workspace
+  check, production UI build, Clippy and diff-check pass. The operator deliberately deferred all
+  service/ACK/hardware activity. At handoff the service must be stopped, `boot_flag.json` and
+  `gpu_applied.json` absent, and the pending `1860@900` incident unacknowledged. Release
+  `target\release\nidavellir-service.exe` and Tauri sidecar
+  `apps\ui\src-tauri\binaries\nidavellir-service-x86_64-pc-windows-msvc.exe` are byte-identical:
+  12,515,840 bytes, SHA-256 `F90E8DF2878422F543656FAAF4551F6941E53586C77E4D3DA58F55F26DC09BCA`.
+- Next-day procedure: deploy/start this exact rebuilt service, verify Ping/Safe Loop/ledger while
+  stock, ACK the pending incident, expect old-build Resume to refuse, then explicitly start a new
+  Standard/Persistent run under monitoring. Do not use Clean and do not delete negative evidence.
+
+## START-HERE (2026-08-14) — rebuild, reboot, acknowledge, then run Standard under the TDR cone
+
+- Do not mutate the GPU in the boot that observed a TDR. After deploying the rebuilt sidecar, restart
+  Windows once, acknowledge the pending Forge incident, and start Standard. A crash checkpoint may
+  Resume only when its run, exact service build, GPU and driver still match; a rebuilt binary therefore
+  correctly starts a new run rather than importing incompatible in-flight state.
+- Contract identity is **Discovery7 / Frontier28 / ExactApply29 / matrix27**. Discovery PowerRender and
+  Frontier Texture accept at most one adjacent physical clock bin; exact Apply is strict. Exact Apply
+  still runs finite DX11 v2 420 s → Vulkan 120/300 s → DX12 120/300 s → Endurance 300/1,200 s.
+- Three homogeneous DX11 structural inconclusives at one exact pair become
+  `DX11StructuralClockDrop`. It authorizes one vertical repair for that target, then closes the target
+  if it repeats. It is not a physical failure, pass, quarantine or rigid event.
+- The two effective v29 CandidateCrash incidents currently known on this GPU are `1920@931` and
+  `1860@900`. Their 1:1 physical-bin cones overlap by taking the highest floor. A candidate at/below
+  the result is censored before Safe Loop arm or GPU write; the first physical bin above it still must
+  pass Frontier28. Censorship writes no pass/fail/ledger evidence.
+- Clean archives/rebuilds positive learning and profiles only. It **must** still apply global Rigid,
+  Quarantine and the TDR cone. Never delete or scope these negatives to the new Clean run.
+- Sentinel owns TDR terminal projection: `phase=interrupted`, `last_outcome=TdrOrCrash`, no profiles;
+  retain the raw lane as originally persisted. After reboot and acknowledgement, the recovery UI may
+  only Resume that same compatible run and may not offer a mode change or silently call Start.
+- The persistent frontier crash budget is two effective CandidateCrash events for the GPU/current
+  exact contract. The existing two events are the intended evidence allowance. If a third is ever
+  recorded despite the cone, subsequent candidate exploration fails closed instead of searching for
+  another detector or retry loop.
+
+## HISTORICAL (2026-08-11, superseded by Frontier28/ExactApply29) — run a new Clean Run under Discovery v7
+
+- Discovery v7 permits one adjacent 15 MHz boost bin only in PowerRender discovery. Texture boundary
+  qualification and all v27 exact-Apply lanes retain exact target residency; do not copy the discovery
+  tolerance into Apply or `F2_APPLY_CLOCK_HOLD_TOL_MHZ`.
+- Boundary state is GPU/run-wide across pruning, the live loop and summary. A good boundary requires
+  current Discovery and Texture at the same target/anchor pair. Same-run/same-GPU qualification may
+  dominate a reset-clean `ClockDrop` at the same target only at a strictly lower voltage, or at a
+  harder target at the same/lower voltage. Silent error, instability, device loss/TDR and reset failure
+  are never relaxed.
+- A dominated drop in the active call may provide only the bounded-writer offset baseline. Continue
+  directly to the next lower physical VF bin; never mark it good, revisit it or climb from it.
+- Synthesis consumes the monotonic qualified projection: ascending targets select the lowest measured
+  qualified anchor not below the prior anchor. Plateaus are valid; omit a target with no compatible
+  measured alternative. Never invent or relabel voltage evidence.
+- Margin is one physical VF bin above the boundary, not fixed `+12 mV`. An unqualified candidate may
+  reach the v27 matrix up to the numeric power cap; after the complete gate, publication requires the
+  worst measured Apply power to be at most 99% of that cap.
+- v7 quarantines every v6 positive Discovery row. Do **not** Resume
+  `f2-forge-1786398122152`; begin a new Clean Run from the rebuilt service. The integrated software
+  checks are green. Hardware acceptance is still pending and no current result should be inferred
+  from older runs.
+
+## HISTORICAL (2026-08-10, superseded by Discovery v7) — Resume reconciliation plan for the inverted frontier
+
+- Do not publish or interpret the paused preview `1755@937 … 1875@975, 1935@906` as a valid curve.
+  The exported log proved that reset-clean `ClockDrop` at 968 mV had been promoted to `first_bad`
+  for easier clocks even after the same run qualified harder `1920@900` and `1935@906` points.
+- Core now treats only this contradicted `ClockDrop` class as non-boundary. It requires same-run,
+  same-GPU current Discovery plus current Qualification at a harder clock and same/lower voltage.
+  Silent errors, instability, device loss/TDR and reset failures retain their original authority.
+- Service Resume supplies the same-run harder-target context, reopening 13 affected clock drops in
+  `f2-forge-1786398122152`. Synthesis also fails closed on any frontier where voltage falls as clock
+  rises. Same-voltage plateaus are allowed because independently measured targets may share a VF bin.
+- Validation at that earlier checkpoint was core 110/110 and service 422/422. Corrected debug service revision was
+  `069af31eb29fde958c15fbb1520b5b3e02f8bf31-dirty-3bdede309982`. The paused checkpoint was copied to
+  `C:\ProgramData\Nidavellir\forge_state.pre-voltage-order-fix-20260810-2252.json`, migrated to that
+  revision and live-loaded with `resume_available=true`. That Resume instruction is now superseded:
+  discovery v7 requires a new Clean Run.
+
+## HISTORICAL EVIDENCE (2026-08-10) — driver 610.62 exact-residency run
+
+- UI commands no longer depend on the elevated service's restrictive default pipe descriptor.
+  `NidavellirCore` uses a protected local ACL: SYSTEM/Administrators have full access, the local
+  interactive user has read/write, and remote clients are rejected. This fixed the observed
+  `Full reset failed: Failed to connect to Core Service: Acesso negado (0x80070005)` without
+  elevating the UI. A live unelevated client reached the rebuilt service and all 420 service tests
+  pass. The failed reset never reached the backend, so it did not erase learning.
+- Full `matrix_v27` at `1815@887` passed DX11 420 s, Vulkan 120 s, DX12 120 s and Endurance
+  300 s with 192,370 frames, 22,434 checks, 100% target residency, fixed 887 mV and no current-boot
+  driver event. Cleanup returned stock; Safe Loop stayed idle with no recovery latch.
+- Raw `1800@875` was workload-stable for 420 s but physically ran at 1785 MHz. It failed closed as
+  `Inconclusive/target_residency_low`; Vulkan, DX12 and Endurance were not needlessly run. Separate
+  60-second probes at 887 mV held 1800 and 1815 MHz exactly.
+- That checkpoint retained a fixed 12 mV post-frontier margin; discovery v7 supersedes it with exactly
+  one physical-bin margin. Its exact-residency evidence remains historical support for v27. Do not
+  reinterpret the 595.97 safe label as an exact-delivery guarantee on 610.62 or relax v27 residency.
+- The only code adjustment from this campaign is observability: matrix progress advances inside a
+  lane and the stock preflight exposes its active API. Qualification behavior is unchanged.
+- Evidence: `C:\ProgramData\Nidavellir\detector-lab-1786388939075.jsonl` (raw boundary) and
+  `C:\ProgramData\Nidavellir\detector-lab-1786389954809.jsonl` (post-margin matrix).
+
+## HISTORICAL CONTRACT (2026-08-04) — v27 is finite, DX11-first and containment-complete
+
+- The production one-click Forge keeps synthetic qualification. An exact candidate now requires
+  current, reset-clean, same-run passes for native DX11 v2, Vulkan Texture Hop, the same Texture Hop
+  through explicit DX12, and Endurance. Qualification contract is 27; all older positives fail
+  closed for Apply.
+- Vulkan/DX12 are no longer chosen implicitly by wgpu. Each backend captures its own stock goldens
+  and runs the same recipe/duration. Stock preflight runs all three APIs before any candidate write.
+- DX11 v2 is a 1536² headless texture/depth/ROP + pixel-ALU + compute/UAV workload. It queues 16
+  frames between synchronization points and requires both framebuffer and compute checksums; the old
+  per-frame Flush/wait bottleneck is gone.
+- Exact execution order is DX11 v2 resident 420 s → Vulkan → DX12 → Endurance. Standard then uses
+  120 s per wgpu API + 300 s Endurance (16 min total); Long uses 300 s + 1,200 s (37 min). ETA and
+  execution share the same finite ladder.
+- Any physical failure rejects the pair. Missing backend/golden/telemetry/checksum or low residency
+  is `Inconclusive` and blocks publication without manufacturing silicon condemnation.
+- Hardware calibration: trusted `1800@875` passed 420.248 s. Rigid `1860@868` previously triggered
+  nvlddmkm-153 around 347 s, practically matching Overwatch, but later passed 420.230 s and 600.247 s.
+  DX11 is therefore the strongest reproducer found, not a deterministic one-pass discriminator.
+- Stop rule: do not extend dwell or create v28/shader variants to chase a guaranteed rejection. Keep
+  the 12 mV margin, physical-bin snap and finite exact gate; report the residual false-negative risk.
+- TDR containment: Sentinel requests cooperative cancellation from active Forge/Detector Lab and
+  preserves attribution. `SafeLoopStatus.gpu_reboot_required` makes Forge show only `Restart Windows`
+  and hides same-boot continuation/reset actions. The failed point and useful learning are retained.
+- Known deliberate limitation: all lanes are offscreen for API comparability; swapchain/Present and
+  a killable worker-process boundary are not implemented in this patch.
+
+## HISTORICAL (2026-08-04, superseded by v27 above) — v26 three-API exact-Apply gate
+
+The v26 matrix established backend equivalence and fail-closed evidence, but used Vulkan first and
+120/300 s for DX11. Its implementation and pre-calibration stop rule are retained in history below.
+
+## HISTORICAL (2026-08-04, superseded by v26 above) — exact Overwatch failure isolated the native DX11 qualification gap
+
+- The manual labels were MSI Afterburner flat-curve settings, not proof of fixed physical pairs.
+  `1815@875` and `1800@869` are therefore indeterminate rather than exact known-bad anchors.
+- The live locked campaign completed 13/13 stable 60-second candidates across `1800@875`,
+  `1815@875`, resolved `1800@868`, one-bin-corrected `1830@875` and `1815@868`, using
+  `control_v25`/`dense_v14`. No current-boot TDR or Safe Loop contamination occurred.
+- Backend-only `curve_v25` removes only the voltage lock to inspect the dynamic VF envelope. A
+  60-second `1815@875` control stayed at 1815/875. The strongest historical bad control,
+  `1860@868`, then passed every workload phase for 300 seconds: p5/p95 1845/1860 MHz, voltage
+  868..1037 mV, 89.01% target residency, 17,971 frames and 2,372 checksums. This is a workload false
+  negative plus an anchor escape, not validation of the setting.
+- Classification now journals workload outcome separately from application fidelity. Curve voltage
+  escape is metadata, not `Inconclusive`; low/missing telemetry stays inconclusive. Curve diagnostics
+  are never publishable and always reset to stock.
+- Candidate execution journals recipe/segment start before GPU work. Startup recovery treats
+  `detector_lab` as non-learning, returns stock and avoids blacklist/crash-streak/Safe Mode learning.
+- The subsequent supervised Overwatch 2 trace confirmed `1860@868` as a physical positive. Across
+  32,525 samples, clock and voltage were exactly 1860/868 with no stretch or voltage escape. The
+  final 83.8 s high-load block ended in nvlddmkm-153; eight 153s, nvlddmkm-14 and bugcheck 0x116
+  followed. WER named nvlddmkm.sys and the game logged its DX11 Lost Device callback.
+- The game used DX11 at 2544x1353, 600-FPS cap and Reflex, with graphics/compute/copy queues. The
+  primary qualifier is Vulkan/wgpu. The legacy DX11 probe is a serialized 768x768 offscreen ALU
+  shader with per-frame Flush/wait and no Present, texture/depth, compute/copy overlap or frame queue;
+  it drew only 99-133 W historically and was retired after never rejecting.
+- Nine TextureRop canaries returned stable; the last ended 11.5 s before the TDR. The monitor saw the
+  first event in about 1.06 s, but no stock reset completed before the TDR cascade. Post-reboot GPU
+  state is physically stock and Safe Loop stayed idle/non-learning; `boot_flag.json` remains armed
+  in `game_trace_curve_diagnostic`, and the service is stopped. Reconcile before another GPU write.
+- This was the pre-v26 stop plan: the only allowed challenger was native DX11 v2 with real
+  Present/frames-in-flight and mixed graphics/texture/depth/compute/copy work, isolated in a worker
+  process. Fixed matrix: stock 2x120 s, safe `1800@875` curve 2x120 s, positive `1860@868` curve
+  1x120 s. If it misses, end synthetic qualification R&D and adopt conservative in-game probation.
+  Full evidence and stop rules: `docs/f2-disqualification-audit-2026-08-04.md`.
 
 ## START-HERE (2026-07-23) — v25 enforces the selected voltage and exact-clock evidence
 

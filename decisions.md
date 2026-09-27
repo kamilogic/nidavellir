@@ -1,6 +1,475 @@
 # Nidavellir — Decision Log
 
+## 2026-09-26 (night) — publish proven pairs after a crash; inconclusive closes only its band
+
+User chose option B so a run that reaches an economic band's stability edge still yields profiles.
+On an attributed in-process CandidateCrash the run still stops (no Resume, BootFlag kept armed),
+but after the condemnation is durable and stock is restored the terminal close publishes profiles
+from pairs that already hold the complete current-run matrix, filtered by the TDR cone recomputed
+from the ledger (`current_f2_condemned_pairs`). Gate: search stop `driver_failure_recovery_required`,
+no terminal integrity error, no clock-control block. Apply stays refused while the incident is
+pending and re-checks the cone at Apply time; `frontier_complete` is set so the UI shows the set.
+A bugcheck kills the process and still publishes nothing (would need startup-time publication).
+Also per user: Inconclusive closes only its band. Before a qualified top this still ends the search
+(`qualified_top_unavailable`), which keeps systematic problems cheap to diagnose; in the economic
+phase the other band continues. Supersedes the 24/09 "no profiles after TDR" behaviour and the 25/09
+"Inconclusive ends the search" rule. Rejected: continuing the run after a TDR, descending a clock
+on a top-phase Inconclusive (a systematic cause would burn the whole 8 h budget).
+
+## 2026-09-26 (night) — power-limited sample = NVML SW power cap without thermal slowdown
+
+Run 1790466472114 (first on Frontier32/ExactApply35/search7) jumped 1075→943→937, passed the 30 s
+screening, then stopped: DX11 `dx11_target_unexercised`, 1.7 s at target and only 0.14 s credited
+as power-limited, although the SW power-cap bit was set on 100% of DX11 samples (p50 1695 MHz, no
+integrity fault). NVML `power_usage` is a 1 s average on Ampere: 100 ms bursts clamped by the
+limiter read 100-190 W in the 75/50/25% duty phases (a 648 ms idle-pulse phase reads 191 W from the
+previous second). The added ">= 97% of limit" per-sample condition was therefore wrong and is
+removed; the cap bit (the driver's own attribution) decides, except when thermal slowdown is set.
+Same contract versions (no positive evidence existed; build_revision distinguishes the builds).
+A TDR at an economic band's stability edge aborting the run without profiles was resolved by the
+entry above (option B).
+
+## 2026-09-26 — representative-load power contract; jump to measured power equilibrium
+
+User reversed the 25/09 worst-load rule: the top is the highest clock the representative load
+(PowerRender) holds at target strictly below the board limit. Heavier matrix loads may reach the
+limit and fall onto the elastic stock points below the anchor; that is not a failure. Evidence:
+worst-load math put DX11 heavy's 200 W ceiling at ~824 mV@1905 / ~848@1800, below the user's manual
+1800@875 stability, so that contract could not yield realistic profiles on this card.
+Frontier32/ExactApply35/search7: a qualification sample below target is held when NVML sets the SW
+power-cap bit (corrected the same night: no sampled-power threshold, see entry above). DX11 reports
+power-limited time apart from real target exposure. Selection uses PowerRender p99 < limit.
+Search7 jumps from a power-bound PowerRender result to the lowest bin above the mean voltage the
+limiter settled at (upper bound on the power-free voltage, since power does not fall as clock
+rises): run 1790448315552 spent 24/24 admissions stepping 1081→937 one bin at a time and its first
+capped sample averaged 934. Heavy phases under 20 samples are skipped, not refused; that rule had
+made every 30 s screening inconclusive. Rejected: a V²·f power model (PowerRender power is
+clock-independent: 1740@937 and 1920@937 drew 198.4/199.2 W with equal frames, so V²·f would jump
+to ~885 mV at 1920), capped 25 mV jumps, midpoint re-probes after integrity errors. Tradeoff:
+heavy games may run power-limited below nominal clock, and DX11 target exposure can be under 30 s
+when the rest was power-limited. Integrity, containment and cleanup requirements are unchanged.
+
+## 2026-09-26 — qualify nominal clock with explicit +15 MHz envelope
+
+User accepted bounded GPU clock variation instead of endless zero-tolerance control refusal.
+Run1790446614161 measured repeated1905->1920 while voltage stayed within1043, with no faults.
+Discovery9/Frontier31/ExactApply34/search5 use target..target+15 for exposure/containment;
+NVML request stays nominal. Keep voltage/power/integrity requirements and all workload gates.
+Persist sampled max distinct from p95, require it for current positive evidence and never promote
+upper transient visits to another profile. Alternatives rejected: repeated abort/retry on+15,
+unbounded tolerance, voltage tolerance, and pretending software locks guarantee zero overshoot.
+The margin is a product contract backed by observed excursion size, not universal hardware proof.
+
+## 2026-09-26 — one clean discovery control reapplication, explicit peak diagnostics
+
+Run1790445480585 stopped on its first neutral control excursion after8 power-bound candidates.
+Search4 allows one same-pair discovery reapplication only with current persisted neutral evidence,
+verified stock cleanup and cleared BootFlag. The retry consumes admission and persists across
+Resume; repeated excursions stop. Integrity, qualification, driver and reset failures retain their
+stops. Reject unlimited retries, approving out-of-pair telemetry, or raising voltage from an
+excursion. Report absolute peaks alongside requested bounds; the old record omitted peak clock,
+so the underlying clock-control cause and exact overshoot remain unproven.
+
+## 2026-09-26 — start from the GPU's stock VF top, not heavy-load p5
+
+The prior seed incorrectly capped discovery at sustained stock p5. Search3 takes the maximum
+real bin of the sanitized post-preheat VF domain and stock-derived plannable voltage. No model
+specific clock is embedded. Upper curve frequency is a test hypothesis, not a qualified result.
+Power-bound still lowers voltage; voltage-floor exhaustion or the first attributed integrity
+failure before finding a top can descend one physical clock. After a power/integrity bracket,
+back up one voltage bin at that lower clock. Lower the search ceiling to avoid loops. Preserve
+two-error/TDR stops and24/8h budgets; complete proof is required at each new pair. This bounded
+search yields best qualified evidence, not exhaustive proof that all higher pairs are impossible.
+Rejected alternatives: hardcoded1905@940, using stock p5 as the discovery ceiling, and treating
+inconclusive residency as permission to increase voltage. Search2 Resume is incompatible.
+
+## 2026-09-25 — qualify the top under every heavy load before economic refinement
+
+Implemented Discovery8 / Frontier30 / ExactApply33 / search2. Whole-dwell p95 cannot enforce
+an upper clock bound; use sampled max, and separate heavy-phase target proof from idle downclock.
+Reject power at the real board limit in every lane; remove the5% power-bound residency exception.
+Prioritize clock ascent after full qualification. Only attributed integrity failure can justify
+bounded voltage ascent; insufficient residency cannot. Economic candidates derive from qualified
+top, not stock percent profiles. Keep finite24/8h admission and2 integrity-error budget, stock
+oracles, recovery and explicit Apply. We retained existing workloads rather than adding unvalidated
+shader complexity. Alternatives rejected: representative-load-only power eligibility, relaxing
+clock/voltage excursions, and treating telemetry/cancel as silicon instability. Physical acceptance
+is still pending; independent TDR/reboot recovery remains conservative. Full thresholds and limits:
+docs/qualification-rules-2026-09-25.md.
+
+
 Durable technical decisions and their rationale. Newest first.
+
+## Restore top-first discovery with worst-load power/clock qualification (2026-09-25)
+- User reaffirmed top qualified sustainable clock below the GPU power limit FIRST, then profile
+  exploration within10% below that top. Current stock-derived3-band scheduler fails that priority.
+- User explicitly chose ALL loads including heaviest stress sustaining the clock without reaching
+  board power limit, rejecting representative-load-only eligibility.200W is this card's limit.
+- The old active-exposure window after reducing duty cannot alone certify this stronger contract;
+ 1740@937 passed but initial100%-duty DX11 max active1680MHz. Target/stability/power must be
+  established per mandatory active workload. Idle pauses are not performance evidence.
+- Keep stock oracle, integrity checks, containment, recovery and finite exploration. Change
+  scheduling and proof contract together; separate energy limit, missing evidence and instability.
+  Don't encode198W/manual1800@875 or treat untested neighbors as failures.
+- Tradeoff explicitly follows user's chosen workload: worst-load sustainable top may be below
+  gaming-stable clocks. No guarantee to recover1800 or boost1920. No code change/GPU run in review.
+- Evidence/next acceptance cases:docs/clean-run-results-2026-09-25.md. Manual cancellation
+  misclassified as Inconclusive is a separate confirmed defect to fix.
+
+## Complete qualification before bounded refinement (2026-09-24)
+- User accepted longer tests after the September18 reboot. Keep existing ordered Standard/
+  Long matrices; short Discovery/Texture can reject but never authorize voltage descent.
+- Replace exhaustive first-failure frontier hunting with three stock-derived bands and
+ 24 durable admissions /8h Standard, Long scaled by matrix time.12/4h was rejected after
+  arithmetic reach replay showed too few conservative refinements across three bands.
+  No manual1800@875 seed or fabricated historical matrix. The budget survives Resume.
+- Require proof for every actual published pair, with no post-test voltage margin. Economic
+  bands follow a rising qualified performance floor one proven clock bin at a time, never
+  reopening closed bands. One power-bound preparation per band; no hidden phase retries.
+- Integrity error closes its band; two close the search. Driver/operational failure stops
+  the run. TDR cannot Resume this scheduler. Known pair exclusion does not close unrelated
+  bands; global safety failures still do. Explicit Full Reset forget-all stays unchanged.
+- Secondary checker uses stock TextureRop golden and same adapter; peer failures request
+  stop immediately, preserve strongest verdict, and join before reset. Frontier29/Apply32
+  invalidate older qualification evidence. Native driver waits can still block.
+- Tradeoff: fewer extreme points and longer proof per candidate, no guarantee of global
+  optimum/zero TDR/game equivalence. UI/export distinguish stage pass, qualified pair and
+  limited coverage. Physical acceptance remains a user-started BAT/Full Reset/Clean Run.
+
+## Separate stress qualification from comparable profile ranking (2026-09-18)
+- September17's run rejected12 higher pairs at198W on a200W board;9 had clean DX11 passes.
+  Remove the arbitrary1% common publication headroom, rather than raising198 to200 and
+  repeating the same sensor-threshold problem. Board limit programming is unchanged.
+- Every pair still needs the complete v31 exact-Apply matrix and active-clock/integrity/
+  cleanup evidence. Energy telemetry cannot approve missing lanes or excuse exposure failures.
+- Use confirmed PowerRender p99 at each exact anchor for ranking and comparison with the
+  same stock workload; retain worst-case Apply p99/peak separately. Tradeoff: this ranks a
+  standardized clock/W proxy, not efficiency in every game or even every stress workload.
+  Display both bases and label the proxy. Do not compare qualified candidates' worst-lane
+  power with unqualified candidates' lighter calibration as if workloads were identical.
+- Once a qualified maximum is known, allow one additional economic-domain pass down to90%
+  of its sustained clock. Persist allowance across Resume; if the maximum falls again, expose
+  remaining coverage gaps. Prefer this finite budget to unbounded recursive exploration.
+- Persist per-clock stop reasons/policy floors outside the truncated log. UI groups the same
+  exact pair across objectives and separates point qualification from search completeness.
+- Full Reset's already implemented forget-all policy remains authoritative, superseding the
+  historical analysis's proposal to preserve negatives. No live reset or GPU run was performed.
+
+
+## Full Reset forgets all GPU learning; Soft Reset preserves failures (2026-09-17)
+- Explicit user decision supersedes the earlier Full Reset retention policy: first-use testing
+  must not inherit the GPU's blacklist, incident history, condemnation cone or learned profiles.
+- Full Reset clears those stores and generated learning archives only after worker/Sentinel
+  quiescence and verified stock recovery. In-memory legacy results are invalidated too.
+- Soft Reset retains the old negative-preserving behavior and clears last_validated as well.
+  Clean Run and ordinary stock recovery retain their independent meanings.
+- A persistent pending marker makes interrupted erasure retryable and blocks tuning/reapply;
+  a partially deleted history is never silently accepted as a completed reset.
+- Confirmation explains that previously rejected points may be tested again. Live reboot guards,
+  stock verification and separate developer authorization are retained. Watchdog cursors and
+  diagnostic exports/audit are not search inputs and are not reset.
+- Alternative rejected: retaining hidden negative exclusions behind the Full Reset label, which
+  prevents the operator's requested discovery-from-zero workflow. No automatic reset is performed.
+
+## Single-run development authorization without erasing safety evidence (2026-09-14)
+- Operator approved a controlled path after the full-history 3/2 block proved impossible to
+  reset through the ordinary recovery flow. Scope: prepare command-based manual validation,
+  then review logs; no automatic run or qualification-contract change.
+- Only `console --development-validation` enables the authorization IPC. Ordinary console/SCM
+  retains the original budget. Authorization requires idle workers, no reboot/recovery/BootFlag,
+  no applied descriptor/validated point/checkpoint, checked safety reads and a verified stock reset.
+- Separate the temporary run permission from historical CandidateCrash events. Every old event
+  still feeds the unchanged exclusion cone. Permission covers one fresh Standard run in one
+  process; claim is durably audited before worker spawn. Any new/changed crash evidence latches
+  it closed, and completion/Stop/Reset/process exit consumes it. No Resume, Long, other GPU
+  workers or profile Apply is covered. An audit file never reloads permission after a restart.
+- Keep a synced audit containing reason, exact build/GPU/driver identity and original Safe Loop/
+  condemnation snapshots; append claim/finish events. Audit failure refuses work. Show runtime
+  status in every theme and include the audit path in exported diagnostics.
+- Chose process-scoped permission over a persistent reusable override or resettable incident
+  counter. It limits accidental reuse and avoids retroactively rehabilitating failed points.
+  Tradeoff: interrupted validation needs separate review instead of consuming a resumed run.
+- Hardware run remains operator-initiated. The implementation is verified offline, not a claim
+  of GPU stability. Instructions: docs/development-validation.md.
+
+## A cleared Safe Loop incident is separate from a persistent tuning refusal (2026-09-13)
+- The operator reported an attention warning with no remedy after manual Reset. Live persisted
+  state was idle with no pending incident; read-only IPC was idle/non-running with the same 3/2
+  refusal. The UI incorrectly folded start_block_reason into Safe Loop recovery attention.
+- Keep the backend refusal intact, show its own automatic-tuning warning, and make the primary
+  action open a local explanation instead of remaining a disabled dead end. All themes offer the
+  existing diagnostic export and navigate directly to the safety-history tab. No report is sent.
+- Full Reset must refresh readiness before claiming another run is prepared. A persistent block
+  gets explicit completed-reset/blocked-tuning feedback. Existing profile Apply remains disabled;
+  review cannot become Start, Resume or Apply. Hardware safety policy and incidents are unchanged.
+- Verified 17 Node tests; 15 existing browser journeys and four final J09 regressions covering
+  all themes, persistent reset, report, history navigation and blocked profile Apply. The first
+  navigation check found the history link landed on Live Log; fixed the target tab and rechecked.
+
+## Remove only known retired resources after legacy upgrade (2026-09-13)
+- The real published v0.3.1 package installs six CPU resource files that the current NVIDIA bundle
+  no longer declares. Upgrade succeeds, but its generated uninstaller consequently left those
+  files behind. Reproduction: target/beta/legacy-package-v0.3.1/legacy-cleanup-before.json.
+- Add the six exact paths to NSIS POSTUNINSTALL, followed only by non-recursive empty-directory
+  removal. Do not remove arbitrary resource trees or uninstall the independently installed PawnIO
+  driver. Actual install/uninstall over the leftovers removed all six while preserving an unrelated
+  file and the driver's state/path; legacy-cleanup-after.json passed at 2026-09-13T19:25:50Z.
+- The legacy package and current build both advertise version 0.1.0. Release tags do not establish
+  installer version ordering. Also compare installed UI with the actual installer payload: Tauri
+  patches the bundle token (UNK -> NSS) and restores the standalone executable after bundling.
+
+## Safety-budget review leaves the current policy unchanged (2026-09-13)
+- Read-only review confirms a per-GPU, contract >=29, cross-run count without expiry or a distinct
+  campaign identifier. The guard blocks >2, so exactly two passes this guard subject to all others.
+  Current history has two explicit August TDRs and September's armed restart of uncertain cause.
+- Existing rehabilitation cancels prior condemnation at the exact GPU/pair and removes its cone
+  source. It cannot be used as a counter-only correction or evidence that an untested pair is stable.
+  ACK/Full Reset also cannot provide physical qualification. The old bugcheck timestamp fix supplies
+  no proof of the September cause and does not itself justify a historical rewrite.
+- No policy, counter, ledger or qualification contract was changed. An operator question about
+  another NVIDIA GPU versus a separate policy review is pending; D3 remains blocked. Evidence:
+  target/beta/safety-policy-review.json. Preserve this distinction when resuming the beta plan.
+
+## Installer acceptance may use the authorized existing PC (2026-09-12)
+- The operator explicitly authorized using this PC after the VM isolation tradeoff was explained.
+  VM is optional; it is not a dependency of the product or evidence of real GPU qualification.
+- ExistingPc mode uses the ordinary installer against the real retained ProgramData, after a full
+  SHA-256-verified backup. It refuses existing installations and active/reapply state, adds no
+  synthetic ledger rows, and checks real incidents/blacklist/ledger after each lifecycle step.
+- The original VM mode remains useful for pristine-Windows and destructive failure scenarios.
+  ExistingPc proves installation with retained history; it must not be reported as clean-OS evidence.
+  Recovery after failure is reviewed from the journal, never an automatic old-data restore.
+
+## Correlate startup BSOD evidence without rewriting interruption history (2026-09-12)
+- **Evidence:** read-only Windows events show the latest WER/1001 bugcheck 0x116 at
+  2026-08-04T23:29:22Z (record 42397), while the September 10 unclean restart has Kernel-Power/41
+  BugcheckCode=0 (record 52958). The previous reader discarded timestamps and reused the August
+  classification whenever any BootFlag was armed. target/beta/restart-attribution-audit.json
+  captures the source events, current ledger and hashes.
+- **Decision:** timestamped WER evidence must fall between BootFlag arming and the current time.
+  Missing/invalid/out-of-window evidence classifies as Unknown. This changes future diagnostic
+  attribution, not the conservative armed-candidate recovery rule or the qualification contracts.
+- **Boundary:** code zero in Event 41 does not prove power loss or rule out a hard hang; see
+  [Microsoft's Event 41 guidance](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/event-id-41-restart).
+  The old pending incident and three effective v29 interruptions remain intact. Changing their
+  policy/attribution would be a separate reviewed decision, not fabricated stability rehabilitation.
+- **Validation:** three regressions cover old/current/future/malformed/missing evidence and time
+  zone conversion; all 692 workspace Rust tests pass. No service startup or live recovery ran.
+
+## Full Reset acknowledges recovery without forgetting failures (2026-09-10)
+- **Problem:** Full Reset discarded the run checkpoint but left its incident pending. The UI still
+  showed `Recovery ready` and offered Resume for a run that no longer existed.
+- **Decision:** the explicit Full Reset confirmation includes acknowledgement. After worker
+  quiescence and checked stock/BootFlag reset, reuse the existing acknowledgement transaction before
+  deleting the checkpoint. Keep incident history, blacklist, Rigid/Quarantine and Sentinel evidence.
+  CandidateCrash must still have durable exact-event ledger proof; failures retain the pending latch
+  and checkpoint. Backend reboot guards cover Full Reset and are checked again before acknowledgement.
+- **Alternative:** a separate acknowledgement would preserve the old contract but leave “start over”
+  incomplete. Silently deleting the incident or safety ledger would lose negative evidence. Ordinary
+  stock reset still preserves the pending incident and checkpoint for explicit same-run recovery.
+
+## Make every GPU mutation and CandidateCrash transition transactional (2026-08-25)
+- **Startup decision:** checked Event Log reconciliation is followed by durable seed/floor persistence
+  and a watcher-ready handshake. Boot reapply is forbidden until all three succeed; a thread spawn by
+  itself is not proof that the Sentinel is protecting the write window.
+- **Failure-memory decision:** CandidateCrash append uses `sync_data` and strict readback of the exact
+  Rigid v29 event. Forge may persist `interrupted/TdrOrCrash` only after that proof. Any failure keeps
+  the raw lane and pending incident, records `needs_attention`, and lets startup retry the same
+  transaction. Observation or condemnation corruption fails closed throughout live F2, not only at
+  run start.
+- **Writer-unification decision:** F2 Benchmark uses the proof-aware F2 Apply path; it may never
+  reinterpret F2 metadata as an F1 core profile. All legacy workers require checked state, a uniquely
+  owned BootFlag and an owner-matched clear. Arming failure is terminal before hardware.
+- **Reset decision:** Full Reset clears only reusable positive learning after every mutating worker is
+  quiescent. Blacklist, Rigid/Quarantine, TDR cone and Sentinel history remain. The 2026-09-10 decision
+  supersedes retention of the pending latch: Full Reset acknowledges it while keeping incident history.
+  Cross-file learning updates use strict preflight and rollback rather than partial deletion.
+- **Rationale:** the four gaps were found by independent adversarial review after unit tests were
+  already green. They were low-probability I/O/scheduling paths but each could erase safety evidence
+  or bypass the validated F2 writer, so release and hardware work remained blocked until corrected.
+
+## Separate frontier and Apply contracts; preserve finite negative safety across Clean (2026-08-14)
+- **Contract decision:** retain `F2_DISCOVERY_CONTRACT_VERSION = 7`, introduce Frontier qualification
+  v28 and Exact Apply qualification v29, and retain the v27 workload/matrix identity. Discovery and
+  Frontier Texture may accept one adjacent physical clock bin; Exact Apply remains strict at the
+  labeled clock/voltage pair.
+- **Structural DX11 decision:** three homogeneous structural DX11 inconclusives at one exact pair
+  aggregate into `DX11StructuralClockDrop`. The token permits exactly one run-local vertical repair
+  for that target. A repeat closes the target; neither occurrence is promoted to pass or written as
+  Rigid/Quarantine evidence.
+- **Clean decision:** Clean is a reset of positive measurements and profile synthesis, not amnesia.
+  Effective Rigid and Quarantine ledger entries and the TDR cone always remain active. This supersedes
+  every older rule or UI string saying Clean ignores durable condemnations/boundaries.
+- **TDR cone decision:** project each effective v29 Rigid CandidateCrash downward over real physical
+  bins, relaxing at most one voltage bin per lower clock bin. Overlap takes the highest floor. Refuse
+  candidates at/below the cone before arm/write/dwell as `TdrRiskGuard/CensoredBoundary`; do not call
+  them stable/unstable and do not append observation or condemnation evidence. The first physical bin
+  above the floor must still pass Frontier28, and every published Apply point still needs Exact29.
+- **Finite crash-budget decision:** persist a maximum intended allowance of two effective frontier
+  CandidateCrash incidents per GPU/current exact-contract campaign. If the durable count exceeds two,
+  fail closed before further candidate exploration. The policy is deliberately finite: it does not
+  add longer dwell variants or repeat until another TDR appears.
+- **Terminal/recovery decision:** a Sentinel-attributed TDR projects terminal progress as
+  `interrupted/TdrOrCrash` and blocks profiles while leaving the raw workload observation untouched.
+  Explicit Resume is allowed only after reboot plus acknowledgement and only for the same run, exact
+  build, GPU and driver. Recovery cannot change Forge mode or silently fall back to a new Start.
+- **Evidence/rationale:** real v29 runs produced CandidateCrash at `1920@931` and `1860@900`, both
+  roughly 29 seconds into Frontier Texture after the short Discovery passed. The absence of a reliable
+  pre-TDR checksum/telemetry precursor makes a physical-bin exclusion cone safer and more bounded than
+  adding another synthetic detector or extending every descent dwell.
+
+## Historical: split Discovery v7 elasticity from exact v27 publication (2026-08-11; superseded by Frontier28/ExactApply29)
+- **Decision:** discovery contract v7 accepts a one-bin (15 MHz) lower-clock residence as PowerRender
+  elasticity. This tolerance is discovery-only. Texture boundary qualification, the DX11/Vulkan/DX12
+  lanes, Endurance and Apply remain qualification v27 and require exact target residence.
+- **Coherent boundary:** use one GPU/run-wide evidence context throughout pruning, live descent and
+  summary. `last_good` requires current Discovery and current Texture at the same target/anchor pair.
+  A reset-clean `ClockDrop` is dominated only by same-run/same-GPU current Discovery+Texture for the
+  same target at a strictly lower voltage, or a harder target at the same/lower voltage. No other
+  outcome is relaxed.
+- **Same-call progress:** when such a drop is dominated during the active call, retain its offset only
+  as the bounded-writer baseline and continue at the next strictly lower physical bin. Never label the
+  drop stable, revisit it or climb from it.
+- **Publication projection:** for ascending targets, select the lowest actually measured and currently
+  qualified anchor that is greater than or equal to the previous selected anchor. Plateaus are valid.
+  Omit a target with no compatible candidate; never interpolate, relabel or synthesize a point.
+- **Margin and power:** replace fixed `+12 mV` with exactly the next valid physical VF bin above the
+  boundary. Let an unqualified candidate reach the v27 gate up to the numeric power cap, then require
+  its worst measured complete-gate power to retain 1% headroom before publication.
+- **Compatibility/operation:** v7 positive discovery evidence is incompatible with v6. The next
+  acceptance attempt must be a new Clean Run; Resume of the paused v6 run is prohibited.
+- **Rationale/tradeoff:** separate harmless discovery clock elasticity from exact deployability proof,
+  close each boundary with coherent evidence and repair voltage ordering only from points the GPU
+  actually measured. This avoids both prematurely blocking the discriminator and manufacturing a
+  smooth curve. Integrated validation passed 604 workspace tests (two hardware smokes ignored), the
+  production UI build and workspace Clippy with baseline warnings only. Hardware validation remains
+  pending.
+
+## Reopen contradicted ClockDrop boundaries and reject voltage-order inversions (2026-08-10)
+- **Decision:** a reset-clean `ClockDrop` is not an unconditional low-voltage silicon failure. It
+  stops acting as `first_bad` only when the same GPU/run later records both current Discovery and
+  current Qualification for a harder target at the same or a lower voltage. All physical error
+  classes (`SilentError`, `Unstable`, TDR/device loss, reset failure) remain authoritative.
+- **Publication invariant:** the qualified boundary voltage must be non-decreasing with target
+  clock. An inversion blocks all synthesis rather than trimming, interpolating or rewriting
+  evidence. Equal-voltage plateaus remain permitted; their usefulness is decided by measured power
+  and profile selection, not by inventing a distinct voltage bin.
+- **Evidence:** the paused Clean Run published a preview containing `1875@975 → 1935@906`. Its raw
+  JSONL contains 13 reset-clean clock drops contradicted by same-run Texture qualification at
+  `1920@900` or `1935@906`. Resume had converted those drops into `KnownBoundaryResumed` and planned
+  zero/one dwell for most intermediate targets.
+- **Rationale/tradeoff:** preserve direct failure safety and append-only history while reopening only
+  a logically impossible performance boundary. A second global fail-closed gate prevents any future
+  scheduler/provenance bug from leaking an inverted curve into profile generation.
+
+## Keep the Core elevated and authorize only the local interactive UI on its pipe (2026-08-10)
+- **Decision:** create `NidavellirCore` with an explicit protected DACL. SYSTEM and Administrators
+  have full access; the local Interactive Users principal has pipe read/write; remote clients are
+  rejected with `PIPE_REJECT_REMOTE_CLIENTS`. The Tauri UI remains unelevated.
+- **Evidence:** the default security descriptor created by the elevated service produced the exact
+  UI failure `Acesso negado (0x80070005)`. After rebuilding with the explicit descriptor, an
+  unelevated live client successfully completed Ping, Safe Loop status, sweep-progress and
+  applied-profile requests. The service suite passes 420/420.
+- **Rationale:** GPU mutation still runs inside the privileged Core, but normal desktop users can
+  control it through the intended local IPC boundary. Granting access to Everyone, accepting remote
+  named-pipe clients or requiring the whole UI to run as administrator would unnecessarily widen
+  authority.
+
+## Historical: retain fixed margin and exact residency after driver-610.62 validation (2026-08-10; margin superseded by v7)
+- **Decision:** retain the 12 mV post-frontier margin, upward physical-bin snap, exact target
+  residency and finite DX11-first v27 matrix. Do not add clock tolerance to convert a lower delivered
+  clock into positive evidence.
+- **Evidence:** raw `1800@875` ran stably but only at 1785 MHz for the complete 420-second DX11 lane,
+  so the gate stopped `Inconclusive/target_residency_low`. The post-margin `1815@887` candidate then
+  passed DX11, Vulkan, DX12 and Endurance with 100% target residency, 192,370 frames and 22,434
+  checks, followed by clean stock recovery and no nvlddmkm event.
+- **Rationale:** the margin demonstrably changes physical point delivery on driver 610.62. Removing
+  it or loosening residency would optimize runtime/voltage by accepting evidence for a point that was
+  not actually exercised. Driver version remains part of the qualification provenance.
+- **Operational improvement:** expose continuous matrix progress and the active stock API without
+  changing workloads, lane duration, classification or publication semantics.
+
+## Qualification v27 is finite, DX11-first and TDR-contained (2026-08-04; fixed margin superseded by v7)
+- **Decision:** keep descent single-lane and provisional. Only deduplicated final Apply pairs run the
+  complete matrix: native DX11 v2 resident 420 s → Vulkan 120/300 s → DX12 120/300 s → Endurance
+  300/1,200 s. The 12 mV post-frontier margin and upward physical-bin snap remain mandatory.
+- **Evidence:** trusted `1800@875` passed DX11 for 420.248 s. The rigid `1860@868` positive caused
+  nvlddmkm-153 at about 347 s in the first resident DX11 run, matching the Overwatch horizon, but
+  later passed both 420.230 s and 600.247 s at exact voltage/clock residency. DX11 is relevant but
+  stochastic; more duration alone does not eliminate false negatives.
+- **Claim boundary:** qualification is stronger, not infallible. There is no repeat-until-failure or
+  new shader/challenger sequence after v27. A clean finite gate is evidence for publication under the
+  safety margin, not proof that every possible game schedule is stable.
+- **Failure containment:** Sentinel hands a new TDR to the active Forge/Detector Lab owner for
+  cooperative cancellation and persisted attribution. GPU mutation remains blocked for the rest of
+  the Windows boot. `SafeLoopStatus` exposes the reboot latch, and novice UI offers only `Restart
+  Windows`; same-boot recover/reset/continue actions are hidden.
+- **Rationale:** this bounds time and algorithm development while addressing both failure modes: an
+  overly permissive descent is separated from expensive final qualification, and a stochastic miss
+  is contained without making the user diagnose driver state.
+
+## Historical v26: mandatory three-API exact-Apply matrix (2026-08-04)
+- **Decision:** preserve one-click synthetic qualification. A profile candidate is publishable only
+  after same-run, reset-clean passes through Vulkan, native DX11 v2 and DX12, followed by Endurance.
+  Discovery remains single-lane; only the final exact candidate pays the API matrix.
+- **Contract:** qualification v26 adds `Dx12Game` and centralizes the complete gate as
+  `[Texture, Dx11Game, Dx12Game, Endurance]`. Any `Fail` rejects, any `Inconclusive` blocks, and old
+  or partial evidence cannot unlock Apply.
+- **Equivalence:** Vulkan and DX12 use explicit wgpu backend selection, independent stock goldens and
+  the identical `V8Texture` plan/duration. DX11 v2 matches the same functional domains with native
+  sampled texture, depth/ROP, pixel ALU, compute/UAV, copy/readback and periodic known-good checks.
+- **DX11 scheduling correction:** the old 768² path synchronized after every frame. V2 uses a 1536²
+  target and queues 16 render+compute frames before a paired framebuffer/UAV readback, removing the
+  artificial CPU serialization while retaining a two-second GPU completion timeout.
+- **Time policy:** Standard = 3×120 s API lanes + 300 s Endurance; Long = 3×300 s + 1,200 s.
+  Execution and ETA consume the same finite four-entry ladder. Stock preflight proves all three APIs
+  before candidate writes.
+- **Scope:** no IPC/UI shape changed. The one-click Forge invokes the stronger gate automatically.
+  All three lanes are deliberately headless/offscreen for comparability; Present and process
+  isolation remain separate limitations, not hidden claims.
+- **Stop rule:** `1860@868` remains the rigid positive for hardware calibration. If v26 passes it,
+  do not create another contract/shader permutation; close synthetic precision as unproven and use
+  conservative field probation.
+
+## Historical pre-v26: one native DX11 challenger after the exact Overwatch false negative (2026-08-04)
+- **Evidence:** the operator's historical labels came from MSI Afterburner flat curves, not fixed
+  physical pairs. Live v25 testing produced 13/13 clean 60-second locked candidates across
+  `1800@875`, `1815@875`, `1800@868`, `1830@875` and `1815@868`. The diagnostic curve replay of the
+  strongest historical bad control, `1860@868`, also completed 300 seconds without a detector error,
+  while clock moved between 1845/1860 MHz and voltage escaped the anchor up to 1037 mV. The current
+  workload therefore missed the available positive control.
+- **Field evidence:** Overwatch 2 failed at `1860@868` after Game Trace observed that exact pair in
+  100% of 32,525 samples. The final high-load block lasted 83.8 s; the last 60 s averaged 98.83%
+  utilization and 155.37 W. The first TDR became eight nvlddmkm-153 events, nvlddmkm-14 and bugcheck
+  0x116. The game log proves the render API was DX11 and records the Lost Device callback.
+- **Decision:** `1815@875` and `1800@869` remain indeterminate historical curve labels, but
+  `1860@868` is now a rigid positive for this GPU. Do not repeat it in Overwatch merely to obtain a
+  statistical 2/3. Do not mutate the Vulkan recipe or escalate dwell; those hypotheses are closed.
+- **Single challenger:** the only next detector experiment is native DX11 v2. It must use a real
+  swapchain/Present, multiple frames in flight, texture/depth/ROP, pixel ALU, compute/UAV and
+  streaming/copy in the same cycle, with checksum/timeout in an isolated worker process. The legacy
+  DX11 v1 probe is not reusable unchanged because it is a 768x768 offscreen ALU loop that serializes
+  every frame with Flush/wait and historically drew only 99-133 W.
+- **Diagnostic application:** backend-only `curve_v25` uses the existing v25 workload with an
+  anchored curve and max-clock ceiling but no voltage lock. It is non-publishable and always resets
+  to stock. It is an envelope diagnostic, not a claim of byte-identical Afterburner behavior.
+- **Classification:** workload outcome and application fidelity are separate. Voltage above the
+  anchor is expected metadata for a curve and cannot manufacture `Fail` or `Inconclusive`; missing
+  voltage telemetry remains inconclusive. Voltage escape remains inconclusive for locked recipes.
+- **Promotion/stop gate:** run stock 2x120 s, safe `1800@875` curve 2x120 s and positive
+  `1860@868` curve 1x120 s. Promotion is experimental only if the four controls are clean and the
+  positive is rejected. If DX11 v2 misses, stop synthetic qualification work and use conservative
+  field probation; no v27 or mid-matrix shader variant.
+- **Diagnostic recovery:** an interrupted Detector Lab point returns to stock without blacklist,
+  crash-log or Safe Mode learning. Candidate segment checkpoints are flushed for attribution. A
+  true wall-clock timeout remains a separate process-isolation project; Rust threads cannot safely
+  terminate a driver call that does not return.
+- **Observed recovery limit:** nine live TextureRop canaries passed and the last ended 11.5 s before
+  the TDR. The monitor saw the event in about 1.06 s, but stock reset did not complete before the
+  cascade. Recovery after nvlddmkm-153 is a final net, not prevention; journal reset start before the
+  hardware call and keep the boot flag armed until a real reset or reboot reconciliation completes.
+- **Rationale and limits:** this gate selects whether a challenger deserves broader validation; it is
+  not a 95% statistical claim. Full audit: `docs/f2-disqualification-audit-2026-08-04.md`.
 
 ## F2 voltage is authoritative; clock remains a max-only ceiling (2026-07-23)
 - **Evidence:** Game Trace requested at `1815@875` spent about 92% of loaded samples at 1800 MHz and

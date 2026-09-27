@@ -1,0 +1,25 @@
+name: Validate
+on:
+  push:
+    branches: [master]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - run: npm.cmd ci
+        working-directory: apps/ui
+      - run: npx.cmd playwright install chromium
+        working-directory: apps/ui
+      - name: Offline and browser journeys
+        shell: powershell
+        run: ./scripts/validate-offline.ps1 -Browser

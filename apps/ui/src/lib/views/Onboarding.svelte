@@ -1,22 +1,22 @@
 ﻿<script>
-  import { serviceCall, formatDriverStatus, driverStatusHint, serviceUnavailableHint } from "../service.js";
+  import { serviceCall } from "../service.js";
+  import { nvidiaGpu, requireServiceData } from "../forge-workflow.js";
 
   let { step = $bindable(1), onComplete } = $props();
   let loading = $state(false);
   let error = $state(null);
-  let driverStatus = $state(null);
   let hardware = $state(null);
 
-  const primaryGpu = $derived(hardware?.gpu?.[0] ?? null);
+  const primaryGpu = $derived(nvidiaGpu(hardware));
 
   async function probe() {
+    if (loading) return;
     loading = true;
     error = null;
     try {
       const hw = await serviceCall("DetectHardware");
-      hardware = hw?.data?.type === "Hardware" ? hw.data : null;
-      const drv = await serviceCall("GetDriverStatus");
-      driverStatus = drv?.data?.type === "DriverStatus" ? drv.data : null;
+      hardware = requireServiceData(hw, "Hardware", "GPU detection");
+      if (!nvidiaGpu(hardware)) throw new Error("No NVIDIA GPU was detected. This beta requires an NVIDIA GPU and its Windows driver. Check the driver installation before trying again.");
       step = 2;
     } catch (e) {
       error = String(e);
@@ -26,6 +26,7 @@
   }
 
   function acceptRisk() {
+    if (!primaryGpu || loading) return;
     onComplete?.("gpu");
   }
 </script>
@@ -46,7 +47,6 @@
       <p>We check the local GPU service and confirm the current NVIDIA target before the Forge screen opens.</p>
       {#if error}
         <p class="error">{error}</p>
-        <p class="hint">{serviceUnavailableHint()}</p>
       {/if}
       <button onclick={probe} disabled={loading}>
         {loading ? "Checking GPU..." : "Check GPU readiness"}
@@ -63,13 +63,7 @@
       {#if primaryGpu}
         <p class="meta gpu-ok">GPU target: {primaryGpu.model}</p>
       {/if}
-      {#if driverStatus}
-        <p class="meta driver-ok">{formatDriverStatus(driverStatus)}</p>
-        {#if driverStatusHint(driverStatus)}
-          <p class="hint">{driverStatusHint(driverStatus)}</p>
-        {/if}
-      {/if}
-      <button class="go" onclick={acceptRisk}>Open GPU Forge</button>
+      <button class="go" onclick={acceptRisk} disabled={!primaryGpu || loading}>Open GPU Forge</button>
     </section>
   {/if}
 </div>
@@ -136,10 +130,6 @@
     cursor: wait;
   }
   .error { color: var(--nord-danger); }
-  .hint {
-    color: var(--forge-blue);
-    font-size: 0.9rem;
-  }
   .meta {
     border: 1px solid rgba(255, 255, 255, 0.055);
     border-radius: 8px;
@@ -149,5 +139,4 @@
     padding: 0.52rem 0.65rem;
   }
   .gpu-ok { color: var(--forge-gold); }
-  .driver-ok { color: var(--nord-mist); }
 </style>

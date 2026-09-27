@@ -54,7 +54,11 @@ is load-only.
 
 The live F2 Forge asks two separate questions: homogeneous `PowerRender` characterizes power and
 the voltage boundary; the failure-seeking qualifier tries to reject a point before it can become a
-deployable profile. The current contracts are discovery v5 and qualification **v17**.
+deployable profile. Evidence identity is split by responsibility: discovery **v7**, frontier Texture
+**v28** and exact Apply **v30**. The finite DX11/Vulkan/DX12/Endurance matrix retains its four
+lanes and durations. DX11 v3 overlaps one GPU batch with CPU checksum work instead of leaving
+the GPU idle during each checksum. Pre-v30 positive evidence cannot approve the new cadence;
+CandidateCrash history from v29 onward still constrains the crash budget and physical cone.
 
 **Deterministic stock normalization and clock domain.** Before any candidate write, Forge resets to
 stock and runs up to six 10 s preheat windows. It requires two consecutive usable windows with no
@@ -83,51 +87,59 @@ No positive phase is reusable before step 3 proves both `reset_to_stock_ok` and
 device loss retains the boot flag for recovery. A p99-consensus retry closes its current transaction
 cleanly before a new attempt is armed.
 
-**Power-cap hysteresis.** A valid numeric board limit outranks the sampled cap flag. Sustained p99 is
-`NearCap` at **≥99%**, `OffCap` at **≤98%**, and `Ambiguous` strictly between those thresholds;
-missing/invalid p99 is also ambiguous. If the numeric limit is unavailable, the sampled cap flag is
-the compatibility fallback. The ambiguous band receives bounded exact-candidate retries; persistent
-ambiguity stays inconclusive and cannot define the frontier. `ClockDrop` classification remains
-exclusive to homogeneous `PowerRender`, not the qualifier's light/heavy mix.
+**Power-cap hysteresis and discovery residency.** A valid numeric board limit outranks the sampled
+cap flag. Sustained p99 is `NearCap` at **≥99%** and `OffCap` at **≤98%**. A validated point in the
+numeric 98–99% band may still run Texture instead of losing its last stable bin merely because it
+inherited `NearCap`; at or above 99% it remains power-bound. Discovery v7 accepts p5 one adjacent
+physical clock bin below the requested target as runtime elasticity. Frontier v28 gives the same
+one-bin allowance to Texture during descent so the physical boundary is not rejected for normal
+boost-bin motion. Exact Apply v30 retains zero clock-drop tolerance, so neither descent allowance can
+certify the labeled profile pair.
 
-**Qualification v17 provenance and integrity.** Every current dwell records the service build
-version/revision, semantic workload fingerprint, actual selected wgpu backend, adapter and driver
-identity/details, checksum method, and the stock-golden capture configuration/values. Older JSONL
-lines remain readable, but pre-v17 positive evidence cannot unlock Apply. Current positive discovery,
-frontier qualification and exact-Apply qualification additionally require proven transaction cleanup.
+**Coherent boundary and monotonic projection.** Resume pruning, the live decision and the final
+summary consume the same GPU/run-wide context. A sustainable boundary requires current Discovery and
+current Texture qualification at the same target and voltage. Only a reset-clean `ClockDrop` may be
+dominated by a qualified same-target pair at strictly lower voltage or a harder target at the same or
+lower voltage; direct integrity, device-loss and cleanup failures remain authoritative. A dominated
+drop continues only to the next lower physical bin and is never promoted to positive evidence.
+Publication then processes the Cmax→90% domain in ascending clock order and chooses only measured,
+currently qualified anchors that do not decrease in voltage. Plateaus are valid; a target with no
+compatible measured alternative is omitted rather than interpolated or relabeled.
 
-`MixedGame` is now genuinely interleaved: every frame records BoostEdge, TextureRop and PowerRender
-as three render passes in one encoder/frame/submit instead of time-slicing whole workload blocks.
-BoostEdge and MixedGame use a GPU reduction/compare every 16 frames. The check is sparse to keep the
-render workload dominant, but mismatch state is cumulative: every sampled mismatch contributes to
-the final verdict and `checksum_count` reports the checks actually performed.
+**Split qualification provenance and integrity.** Every current dwell records the service build
+version/revision, semantic workload fingerprint, selected backend, adapter and driver identity,
+checksum method, stock-golden configuration and checked cleanup. Older JSONL remains readable, but
+pre-v7 Discovery, pre-v28 Frontier and pre-v30 Exact Apply positives cannot unlock their respective
+stages. The matrix-v27 qualifier is an orthogonal finite rejection test, not a replacement for power
+characterization or proof over every future game/driver schedule.
 
-The qualifier remains an orthogonal rejection test, not a replacement for power characterization.
-Stock goldens are session-scoped; no old `prior_good` can become current without current-run evidence.
-No finite synthetic suite is a proof over every future game/driver path.
+**Applied-bin power and electrical reconciliation.** Apply selects exactly the next valid physical
+V/F-table bin above the learned boundary; there is no fixed millivolt addition. The effective delta is
+kept in `apply_margin_mv` because real bin spacing is non-uniform. Profile synthesis requires current,
+thermally valid p99/p5 calibration at that exact Apply bin. An unqualified candidate may reach the
+finite discriminator up to the numeric board cap. After Exact Apply v30/matrix v27 completes,
+publication requires the worst measured Apply power to remain at or below 99% of the cap; missing
+power fails closed.
 
-**Applied-bin power and electrical reconciliation.** The learned boundary and applied point differ:
-the policy adds +12 mV and snaps upward to a physical V/F bin. Profile synthesis therefore requires
-current, thermally valid `PowerRender` p99/p5 calibration at that exact apply bin. A calibrated point
-whose measured p95 reaches a higher electrical regime must use that regime's measured Apply anchor
-and current qualification; no power or voltage is interpolated.
+A complete, reset-clean DX11 lane with numeric p99 already above that publication ceiling
+can reject the pair immediately, even if residency alone is Inconclusive. Later lanes cannot
+reduce the worst measured power. The raw observation remains Inconclusive, while the routing
+result is `ExactApplyPowerCeilingExceeded`: no identical retries, remaining lanes, voltage
+increase at that clock or blacklist. A cap flag alone, a peak, incomplete coverage or a hardware
+failure does not qualify for this screen. Lower-clock synthesis still requires fresh qualification.
 
-**Exact-Apply stability closure.** Standard/Long remain provisional until every unique selected
-`(target, Apply VF bin)` completes, in order, **Texture for 5 minutes**, **native Direct3D 11 for
-5 minutes**, **TransitionShock for 8 minutes**, and **Endurance for 20 minutes**. The DX11 stage
-renders offscreen on an explicitly selected NVIDIA DXGI adapter, compares periodic readbacks with a
-stock-session golden, requires the same adapter LUID, and bounds completion polling at 750 ms. Adding
-voltage can expose a higher sustained boost
-regime, so this gate is not inherited from the lower boundary. A reset-clean rejection removes the
-candidate and triggers re-synthesis; inconclusive evidence remains debt; hard recovery failures abort.
-The published profile power remains the conservative maximum confirmed across homogeneous
-PowerRender calibration and the approved exact-Apply dwells.
-
-The field-failed **1845 MHz @ 862 mV** point is the calibration discriminator for the next physical
-A/B against known-safe bins. **DX11 coverage is now implemented, but the final gate is not shortened**
-until that A/B shows that the added stage distinguishes the failed point without losing safe-bin
-specificity. The long Endurance stage remains necessary because the latest field failure appeared
-well after the shorter Texture and TransitionShock stages had passed.
+**Exact-Apply stability closure.** Every unique selected `(target, Apply VF bin)` runs, in order,
+**native DX11 v3 for 420 seconds**, **Vulkan Texture Hop**, **DX12 Texture Hop**, and **Endurance**.
+Standard uses 120 seconds for each wgpu API and 300 seconds for Endurance (960 seconds total per
+pair); Long uses 300, 300 and 1,200 seconds respectively (2,220 seconds total). Each API uses its own
+stock-session golden and explicit backend/adapter provenance. Exact Apply v30 remains strict. Three
+homogeneous structural DX11 inconclusives at one exact pair aggregate to
+`DX11StructuralClockDrop`; this permits at most one vertical repair for that target, then closes it if
+the token repeats. The token is not a pass, physical failure or ledger event. Other `Inconclusive`
+outcomes block publication; a reset-clean physical rejection removes or vertically repairs the
+candidate and triggers re-synthesis. Device loss/TDR requires a Windows restart. The timings and
+workloads remain frozen as matrix v27: this is bounded qualification with containment, not
+repeat-until-failure certification.
 
 **Cooperative cancellation and UI headroom.** Every live discovery/qualification render receives
 the Forge cancellation token and checks it between bounded GPU frames/dispatches. Stop enters
@@ -135,6 +147,27 @@ the Forge cancellation token and checks it between bounded GPU frames/dispatches
 cleanup. Cancellation is recorded as inconclusive/cancelled, never as bad or validated evidence. The
 UI reads structured progress fields rather than parsing logs; completed evidence remains durable in
 `f2_observations.jsonl`.
+
+**Clean and finite TDR exclusion.** Clean archives/rebuilds positive discovery and profile state but
+always loads effective global `Rigid`, `Quarantine` and TDR-cone safety evidence. Each effective rigid
+v29-or-later `CandidateCrash` projects downward over the real physical tables with one voltage-bin of relief
+per lower clock bin; overlapping cones take the highest floor. A point at or below that floor is
+refused before Safe Loop arm, GPU write or dwell as `TdrRiskGuard/CensoredBoundary`. This censorship
+does not claim stability or instability and appends no observation/condemnation row. The first bin
+strictly above the floor still must pass Frontier v28, while final Apply remains Exact v30. The
+persistent intended exploration allowance is two CandidateCrash incidents for the GPU since the
+v29 safety floor; a positive-contract bump does not reset it. A durable count greater than two
+fails closed before more candidate exploration.
+
+**Transactional safety I/O (2026-08-25).** Safety evidence is authoritative only when it is durable
+and readable. Sentinel persists and verifies its Event Log seed/floor, then completes a synchronous
+watcher-ready handshake before boot reapply. A CandidateCrash append is flushed with `sync_data` and
+must be found by the strict reader before Forge can store `interrupted`; failure leaves
+`needs_attention`, the raw lane and pending incident intact for startup reconciliation. Live F2
+discovery, synthesis, calibration, repair, exact gate and publication all use strict observation and
+condemnation reads. F2 Benchmark routes through the same proof-aware writer as profile Apply; legacy
+workers use checked preflight plus owned BootFlag arm/revalidation/clear. Full Reset quiesces those
+workers and removes only reusable positive evidence, preserving every negative safety source.
 
 ## Problems hit → solutions
 
@@ -235,13 +268,18 @@ re-applied. "Reset to stock" clears it.
 
 If a forged profile repeatedly fails under real use, **Mark unstable** resolves that profile's exact
 hardware-derived clock/voltage pair, records durable local failure evidence and invalidates the
-published set. The coordinates are not product constants. A normal recovery reset preserves this
-learning; the explicit full reset removes it when evaluating a new Forge method from zero.
+published set. The coordinates are not product constants. Normal recovery and Full Reset may clear
+active/positive Forge state, but effective Rigid, Quarantine and TDR-cone safety evidence remains
+authoritative even for the next Clean run.
 
 An interrupted run never resumes silently. A surviving running checkpoint enters **Needs Attention**,
 keeps the GPU at stock and requires explicit acknowledgement. When the active boot flag identifies an
 exact candidate, only that candidate is blacklisted; otherwise the incident is retained as
-unattributed rather than guessing from adjacent observations.
+unattributed rather than guessing from adjacent observations. A Sentinel-attributed TDR projects the
+run terminal as `interrupted/TdrOrCrash` without relabeling the raw workload row, and closes the boot
+to GPU mutation. After Windows restarts and the incident is acknowledged, the UI may request only
+same-run Resume; the checkpoint must match the exact build, GPU and driver, and recovery never falls
+back to Start under a newly selected mode.
 
 ## Honest limits
 
@@ -262,11 +300,17 @@ unattributed rather than guessing from adjacent observations.
   Descent 60 s boundary failures stay in `safe_loop.json` (operational). Every confirmed hardware
   preflight, the descent boundary check, profile restore and the IPC Apply guard consult the UNION
   of the field floor and the ledger.
+- **TDR cone (2026-08-14):** effective rigid v29-or-later CandidateCrash rows additionally generate the finite
+  1:1 physical-bin cone described above. It applies to descent, calibration and exact Apply in every
+  mode, including Clean. Cone-only censorship produces no pass/fail/ledger evidence. More than two
+  persistent CandidateCrash rows closes further crash-seeking starts fail-closed.
 - **Vertical repair**: a failed exact-Apply pair condemns the *bin*, not the clock. The same clock
-  climbs the real VF curve (+1 bin on SilentError, +2 on TDR/device-lost, skipping condemned bins),
-  bounded by the publication power ceiling (94% of the cap, using the worst honest measurement at
-  the bin — PowerRender calibration fills unmeasured bins) and a budget of 2 repairs per clock per
-  run. The repaired pair always re-runs the full gate; descent evidence only orients power/order.
+  may climb the real VF curve after a reset-clean repairable failure (skipping condemned bins),
+  bounded by the candidate board cap and the profile voltage ceiling; PowerRender calibration
+  fills unmeasured bins. A measured Apply energy-envelope refusal closes vertical repair outright.
+  The repaired pair always re-runs the full gate; descent evidence only orients power/order.
+  `DX11StructuralClockDrop` is narrower: only one repair is allowed for that target. TDR/device loss
+  never performs a same-boot repair; it interrupts the run and becomes cone input after reboot.
   A candidate is skipped without a ladder only when an already gate-approved point dominates it
   (≥ sustained clock, ≤ selection power).
 

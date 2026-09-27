@@ -1,12 +1,13 @@
 //! Durable condemnation ledger — the append-only memory of REAL failures that must survive every
 //! operational reset.
 //!
-//! `safe_loop.json` is operational state: it is legitimately replaced by the "forget everything"
-//! reset, experimental cleanups, and startup recovery. The 2026-07-15 reset proved the gap: the
+//! `safe_loop.json` is operational state and older reset implementations replaced it wholesale. The
+//! 2026-07-15 reset proved the gap: the
 //! 1890@900 Endurance failure learned on 2026-07-10 was wiped with it, and the pair was re-attempted
 //! and PASSED a single ladder the next day — a coin-flip point one interruption away from being
 //! published. This ledger is the fix: hard failures are appended here and NEVER removed by any
-//! reset path (`clear_all_learning` deliberately excludes this file). Only an explicit manual
+//! reset path (current positive-learning reset deliberately preserves this file and Safe Loop
+//! negatives). Only an explicit manual
 //! rehabilitation entry (itself an append) can lift one.
 //!
 //! Severity model (agreed 2026-07-16):
@@ -66,8 +67,10 @@ pub struct CondemnationEvent {
     pub rehabilitated: bool,
 }
 
-/// Filesystem-backed append-only ledger. Same conventions as `F2ObservationStore`: best-effort,
-/// no fsync, malformed lines skipped on load (a truncated final line never invalidates the log).
+/// Filesystem-backed append-only ledger. Same JSONL conventions as `F2ObservationStore`, but an
+/// append is flushed to stable storage before success is reported because this ledger is recovery
+/// authority after a reboot. The best-effort reader skips malformed lines; safety paths use the
+/// checked reader below.
 #[derive(Debug, Clone)]
 pub struct CondemnationLedger {
     base: PathBuf,
@@ -76,7 +79,9 @@ pub struct CondemnationLedger {
 impl CondemnationLedger {
     /// The machine-wide ledger under `default_data_dir()` (`%ProgramData%/Nidavellir`).
     pub fn system() -> Self {
-        Self { base: default_data_dir() }
+        Self {
+            base: default_data_dir(),
+        }
     }
 
     pub fn new(base: impl Into<PathBuf>) -> Self {
@@ -92,9 +97,12 @@ impl CondemnationLedger {
         let line = serde_json::to_string(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         use std::io::Write as _;
-        let mut f =
-            std::fs::OpenOptions::new().create(true).append(true).open(self.path())?;
-        writeln!(f, "{line}")
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path())?;
+        writeln!(f, "{line}")?;
+        f.sync_data()
     }
 
     pub fn load_all(&self) -> Vec<CondemnationEvent> {
@@ -105,6 +113,39 @@ impl CondemnationLedger {
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// Strict safety-path loader. A missing ledger is an empty ledger; every other read error or
+    /// malformed non-empty JSONL line is returned so callers can fail closed instead of treating
+    /// unavailable condemnation evidence as safe.
+    pub fn load_all_checked(&self) -> std::io::Result<Vec<CondemnationEvent>> {
+        let path = self.path();
+        let data = match std::fs::read_to_string(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("read condemnation ledger {}: {error}", path.display()),
+                ))
+            }
+        };
+        data.lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str(line.trim_start_matches('\u{feff}')).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid condemnation ledger {} line {}: {error}",
+                            path.display(),
+                            index + 1
+                        ),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// The effective condemned pairs for one GPU — the only thing refusal logic needs.
@@ -153,7 +194,7 @@ pub fn condemned_pairs(events: &[CondemnationEvent], gpu_key: &str) -> Condemned
             r.rehabilitated
                 && r.target_mhz == e.target_mhz
                 && r.vf_bin_mv == e.vf_bin_mv
-                && !r.gpu_key.as_deref().is_some_and(|k| k != gpu_key)
+                && r.gpu_key.as_deref().is_none_or(|k| k == gpu_key)
         });
         if cancelled {
             continue;
@@ -194,13 +235,79 @@ pub fn effective_condemnation_events(events: &[CondemnationEvent]) -> Vec<Condem
         .collect()
 }
 
+/// Conservative downward safety cone derived from current-contract Rigid failures.
+///
+/// `targets_descending` and `voltage_bins_ascending` describe physical bins. Starting at each
+/// effective condemned pair, every lower clock may relieve at most one physical voltage bin per
+/// physical clock bin. Overlapping cones retain the highest (safest) floor. Events outside either
+/// supplied bin set cannot define a physical cone and are ignored.
+pub fn rigid_tdr_safety_cone_floors(
+    events: &[CondemnationEvent],
+    gpu_key: &str,
+    min_contract: u32,
+    targets_descending: &[u32],
+    voltage_bins_ascending: &[u32],
+) -> Vec<(u32, u32)> {
+    let mut floors = std::collections::BTreeMap::<u32, u32>::new();
+
+    for (event_index, event) in events.iter().enumerate() {
+        if event.rehabilitated
+            || event.severity != CondemnationSeverity::Rigid
+            || event.gpu_key.as_deref().is_some_and(|key| key != gpu_key)
+            || event
+                .qualification_contract_version
+                .is_none_or(|contract| contract < min_contract)
+        {
+            continue;
+        }
+
+        let rehabilitated = events[event_index + 1..].iter().any(|later| {
+            later.rehabilitated
+                && later.target_mhz == event.target_mhz
+                && later.vf_bin_mv == event.vf_bin_mv
+                && later
+                    .gpu_key
+                    .as_deref()
+                    .is_none_or(|key| key == gpu_key)
+        });
+        if rehabilitated {
+            continue;
+        }
+
+        let Some(clock_index) = targets_descending
+            .iter()
+            .position(|&clock| clock == event.target_mhz)
+        else {
+            continue;
+        };
+        let Some(voltage_index) = voltage_bins_ascending
+            .iter()
+            .position(|&mv| mv == event.vf_bin_mv)
+        else {
+            continue;
+        };
+
+        for (clock_relief, &target_mhz) in targets_descending[clock_index..].iter().enumerate() {
+            let floor_mv = voltage_bins_ascending[voltage_index.saturating_sub(clock_relief)];
+            floors
+                .entry(target_mhz)
+                .and_modify(|current| *current = (*current).max(floor_mv))
+                .or_insert(floor_mv);
+        }
+    }
+
+    floors.into_iter().rev().collect()
+}
+
 /// Monotone V/F floor envelope over condemned (clock, mv) pairs — the same math as the field
 /// floor: running-max condemned voltage by clock, ceil-interpolated between condemned clocks
 /// (conservative chord above the convex true boundary), held flat beyond the highest clock.
 /// `None` below the lowest condemned clock or with no pairs.
 pub fn vf_floor_envelope(pairs: &[(u32, u32)], clock_mhz: u32) -> Option<u32> {
-    let mut pts: Vec<(i64, i64)> =
-        pairs.iter().map(|&(c, v)| (i64::from(c), i64::from(v))).collect();
+    let mut pts: Vec<(i64, i64)> = pairs
+        .iter()
+        .map(|&(c, v)| (i64::from(c), i64::from(v)))
+        .collect();
     pts.sort_unstable();
     let mut env: Vec<(i64, i64)> = Vec::new();
     let mut worst = i64::MIN;
@@ -236,8 +343,7 @@ impl CondemnedPairs {
     /// STRICTLY below the Quarantine floor (the quarantined pair itself stays attemptable).
     pub fn refuses(&self, clock_mhz: u32, anchor_mv: u32) -> bool {
         vf_floor_envelope(&self.rigid, clock_mhz).is_some_and(|floor| anchor_mv <= floor)
-            || vf_floor_envelope(&self.quarantine, clock_mhz)
-                .is_some_and(|floor| anchor_mv < floor)
+            || vf_floor_envelope(&self.quarantine, clock_mhz).is_some_and(|floor| anchor_mv < floor)
     }
 
     /// Full-gate passes required to PUBLISH this exact pair: 2 when an effective quarantine
@@ -255,7 +361,11 @@ impl CondemnedPairs {
                 && v == anchor_mv
                 && contract.is_none_or(|condemned_under| condemned_under >= current_contract)
         });
-        if quarantined { 2 } else { 1 }
+        if quarantined {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -288,15 +398,96 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nida-ledger-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let ledger = CondemnationLedger::new(&dir);
-        ledger.append(&event(CondemnationSeverity::Rigid, 1845, 856, Some(17))).unwrap();
-        ledger.append(&event(CondemnationSeverity::Quarantine, 1890, 900, Some(16))).unwrap();
+        ledger
+            .append(&event(CondemnationSeverity::Rigid, 1845, 856, Some(17)))
+            .unwrap();
+        ledger
+            .append(&event(
+                CondemnationSeverity::Quarantine,
+                1890,
+                900,
+                Some(16),
+            ))
+            .unwrap();
         use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new().append(true).open(ledger.path()).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(ledger.path())
+            .unwrap();
         writeln!(f, "{{ truncated garbage").unwrap();
         assert_eq!(ledger.load_all().len(), 2);
         let pairs = ledger.condemned_pairs("gpu-a");
         assert_eq!(pairs.rigid, vec![(1845, 856)]);
         assert_eq!(pairs.quarantine, vec![(1890, 900)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checked_ledger_load_treats_missing_file_as_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "nida-ledger-checked-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ledger = CondemnationLedger::new(&dir);
+
+        assert_eq!(ledger.load_all_checked().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn checked_ledger_load_rejects_invalid_non_empty_line_with_context() {
+        let dir = std::env::temp_dir().join(format!(
+            "nida-ledger-checked-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ledger = CondemnationLedger::new(&dir);
+        ledger
+            .append(&event(CondemnationSeverity::Rigid, 1845, 856, Some(29)))
+            .unwrap();
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(ledger.path())
+            .unwrap();
+        writeln!(file, "{{ truncated garbage").unwrap();
+
+        let error = ledger.load_all_checked().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 2"), "{error}");
+        assert!(
+            error.to_string().contains(CONDEMNATION_LEDGER_FILE),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checked_ledger_load_propagates_non_not_found_io_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "nida-ledger-checked-io-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ledger = CondemnationLedger::new(&dir);
+        std::fs::create_dir_all(ledger.path()).unwrap();
+
+        let error = ledger.load_all_checked().unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains(CONDEMNATION_LEDGER_FILE),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -316,7 +507,7 @@ mod tests {
         assert!(!pairs.refuses(1890, 900));
         // Monotone hold above the highest condemned clock (higher clock needs >= voltage).
         assert!(pairs.refuses(1920, 850)); // rigid floor held flat at 856
-        // Below the lowest condemned clock there is no evidence.
+                                           // Below the lowest condemned clock there is no evidence.
         assert!(!pairs.refuses(1740, 793));
     }
 
@@ -353,6 +544,107 @@ mod tests {
         rehab.kind = KIND_REHABILITATED.into();
         let effective = effective_condemnation_events(&[old, kept.clone(), rehab]);
         assert_eq!(effective, vec![kept]);
+    }
+
+    #[test]
+    fn rigid_tdr_cone_relaxes_one_physical_voltage_bin_per_lower_clock_bin() {
+        let targets = [1935, 1920, 1905, 1890, 1875, 1860, 1845, 1830, 1815, 1800];
+        let voltage_bins = [
+            800, 806, 812, 818, 825, 831, 837, 843, 850, 856, 862, 868, 875, 881, 887, 893, 900,
+            906, 912, 918, 925, 931, 937,
+        ];
+        let events = [event(CondemnationSeverity::Rigid, 1920, 931, Some(29))];
+
+        assert_eq!(
+            rigid_tdr_safety_cone_floors(&events, "gpu-a", 29, &targets, &voltage_bins),
+            vec![
+                (1920, 931),
+                (1905, 925),
+                (1890, 918),
+                (1875, 912),
+                (1860, 906),
+                (1845, 900),
+                (1830, 893),
+                (1815, 887),
+                (1800, 881),
+            ]
+        );
+    }
+
+    #[test]
+    fn rigid_tdr_cone_combines_overlaps_by_the_highest_floor() {
+        let targets = [1920, 1905, 1890, 1875, 1860];
+        let voltage_bins = [881, 887, 893, 900, 906, 912, 918, 925, 931, 937];
+        let first = event(CondemnationSeverity::Rigid, 1920, 931, Some(29));
+        let second = event(CondemnationSeverity::Rigid, 1890, 937, Some(30));
+
+        assert_eq!(
+            rigid_tdr_safety_cone_floors(
+                &[first, second.clone(), second],
+                "gpu-a",
+                29,
+                &targets,
+                &voltage_bins,
+            ),
+            vec![
+                (1920, 931),
+                (1905, 925),
+                (1890, 937),
+                (1875, 931),
+                (1860, 925),
+            ]
+        );
+    }
+
+    #[test]
+    fn rigid_tdr_cone_ignores_old_other_gpu_rehabilitated_and_non_rigid_events() {
+        let targets = [1920, 1905, 1890, 1875];
+        let voltage_bins = [900, 906, 912, 918, 925, 931];
+        let old_contract = event(CondemnationSeverity::Rigid, 1920, 931, Some(28));
+        let mut other_gpu = event(CondemnationSeverity::Rigid, 1905, 925, Some(29));
+        other_gpu.gpu_key = Some("gpu-b".into());
+        let active_then_rehabilitated = event(CondemnationSeverity::Rigid, 1890, 918, Some(29));
+        let mut rehabilitation = active_then_rehabilitated.clone();
+        rehabilitation.rehabilitated = true;
+        rehabilitation.kind = KIND_REHABILITATED.into();
+        let legacy = event(CondemnationSeverity::Rigid, 1875, 912, None);
+        let quarantine = event(CondemnationSeverity::Quarantine, 1920, 931, Some(29));
+
+        assert!(rigid_tdr_safety_cone_floors(
+            &[
+                old_contract,
+                other_gpu,
+                active_then_rehabilitated,
+                rehabilitation,
+                legacy,
+                quarantine,
+            ],
+            "gpu-a",
+            29,
+            &targets,
+            &voltage_bins,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn rigid_tdr_cone_uses_positions_for_irregular_physical_bins() {
+        let targets = [1980, 1920, 1875, 1800];
+        let voltage_bins = [800, 807, 819, 844, 870, 905, 931];
+        let valid = event(CondemnationSeverity::Rigid, 1920, 931, Some(29));
+        let absent_clock = event(CondemnationSeverity::Rigid, 1905, 931, Some(29));
+        let absent_voltage = event(CondemnationSeverity::Rigid, 1920, 925, Some(29));
+
+        assert_eq!(
+            rigid_tdr_safety_cone_floors(
+                &[valid, absent_clock, absent_voltage],
+                "gpu-a",
+                29,
+                &targets,
+                &voltage_bins,
+            ),
+            vec![(1920, 931), (1875, 905), (1800, 870)]
+        );
     }
 
     #[test]
@@ -402,8 +694,11 @@ mod tests {
         assert_eq!(pairs.required_apply_passes(1890, 900, 17), 2);
         assert_eq!(pairs.required_apply_passes(1890, 900, 18), 1); // stronger contract re-proves
         assert_eq!(pairs.required_apply_passes(1890, 906, 17), 1); // different pair
-        // A legacy entry without a contract version is conservative: always double proof.
+                                                                   // A legacy entry without a contract version is conservative: always double proof.
         let legacy = [event(CondemnationSeverity::Quarantine, 1890, 900, None)];
-        assert_eq!(condemned_pairs(&legacy, "gpu-a").required_apply_passes(1890, 900, 18), 2);
+        assert_eq!(
+            condemned_pairs(&legacy, "gpu-a").required_apply_passes(1890, 900, 18),
+            2
+        );
     }
 }

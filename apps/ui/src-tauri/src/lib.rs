@@ -3,13 +3,13 @@ mod ipc_client;
 use serde_json::Value;
 
 #[tauri::command]
-fn service_request(method: String, params: Option<Value>) -> Result<Value, String> {
-    ipc_client::call_service_with_params(&method, params)
+async fn service_request(method: String, params: Option<Value>) -> Result<Value, String> {
+    ipc_client::call_service_with_params(&method, params).await
 }
 
 #[tauri::command]
-fn service_ping() -> Result<Value, String> {
-    ipc_client::call_service("Ping")
+async fn service_ping() -> Result<Value, String> {
+    ipc_client::call_service_with_params("Ping", None).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

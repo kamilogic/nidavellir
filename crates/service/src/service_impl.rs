@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use tracing::info;
 use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-    ServiceType,
+    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 
@@ -15,11 +14,13 @@ use nidavellir_driver_pawnio::DriverManager;
 
 pub fn run_service() -> windows_service::Result<()> {
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let pipe_failure_tx = shutdown_tx.clone();
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                let _ = shutdown_tx.send(());
+                crate::shutdown::begin();
+                let _ = shutdown_tx.send(Ok(()));
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -27,20 +28,19 @@ pub fn run_service() -> windows_service::Result<()> {
         }
     };
 
-    let status_handle =
-        service_control_handler::register(SERVICE_NAME, event_handler)?;
+    let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        current_state: ServiceState::StartPending,
+        controls_accepted: ServiceControlAccept::empty(),
         exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::default(),
+        checkpoint: 1,
+        wait_hint: Duration::from_secs(30),
         process_id: None,
     })?;
 
-    info!("Nidavellir Core Service started");
+    info!("Nidavellir Core Service initializing");
 
     // Parachute first: the service boots before login, so it reads the
     // boot-flag and recovers from any prior crash before touching hardware.
@@ -50,10 +50,49 @@ pub fn run_service() -> windows_service::Result<()> {
     crate::safe_loop_runtime::spawn_heartbeat(safe_store.clone());
     // The installed Windows service is the product runtime. It must own the same boot and live TDR
     // reconciliation as console mode before any persisted profile can be reapplied.
-    crate::tdr_sentinel::initialize_reboot_guard();
-    crate::tdr_sentinel::startup_reconcile(&safe_store);
-    crate::gpu_apply::reapply_on_boot(&safe_store);
-    crate::tdr_sentinel::spawn(safe_store.clone());
+    let sentinel_ready = match crate::tdr_sentinel::initialize_reboot_guard() {
+        Ok(snapshot) => {
+            let baseline = snapshot.watcher_baseline();
+            match crate::tdr_sentinel::startup_reconcile(&safe_store, &snapshot) {
+                Ok(_) => {
+                    // The synchronous handshake proves the watcher thread is active and its
+                    // seed/floor are durable before this branch may authorize reapply.
+                    match crate::tdr_sentinel::spawn(safe_store.clone(), baseline) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            crate::tdr_sentinel::mark_gpu_reboot_required(
+                                "sentinel-watcher-startup-error",
+                            );
+                            tracing::error!(
+                                "sentinel watcher startup failed closed ({error}); service remains stock"
+                            );
+                            false
+                        }
+                    }
+                }
+                Err(error) => {
+                    crate::tdr_sentinel::mark_gpu_reboot_required(
+                        "sentinel-startup-reconcile-error",
+                    );
+                    tracing::error!(
+                        "sentinel startup reconciliation failed closed ({error}); service remains stock and the uncommitted cursor will be retried"
+                    );
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                "sentinel Event Log initialization failed closed ({error}); service remains stock"
+            );
+            false
+        }
+    };
+    if sentinel_ready && crate::tdr_sentinel::reboot_required_event().is_none() {
+        crate::gpu_apply::reapply_on_boot(&safe_store);
+    } else {
+        tracing::warn!("persisted GPU profile reapply skipped by the Sentinel startup guard");
+    }
 
     let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {
@@ -75,37 +114,70 @@ pub fn run_service() -> windows_service::Result<()> {
     }));
 
     let pipe_state = Arc::clone(&state);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        if let Err(e) = ipc_server::run_pipe_server(pipe_state) {
+        if let Err(e) = ipc_server::run_pipe_server(pipe_state, Some(ready_tx)) {
             tracing::error!("Pipe server error: {e}");
+            crate::shutdown::begin();
+            let _ = pipe_failure_tx.send(Err(e));
         }
     });
 
-    let _ = shutdown_rx.recv();
-
-    if let Ok(mut state) = state.lock() {
-        state.detector_lab.stop();
-        let store = state.safe_store.clone();
-        if let Err(error) = state.manual_point.reset(&store) {
-            tracing::warn!("service stop: manual point stock reset failed: {error}");
+    let startup = ready_rx.recv_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("IPC listener readiness was not confirmed: {error}"))
+        .and_then(|result| result)
+        .and_then(|()| {
+            status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Running,
+                controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            }).map_err(|error| format!("Cannot report Running: {error}"))
+        });
+    let stop_reason = match startup {
+        Ok(()) => {
+            info!("Nidavellir Core Service ready");
+            shutdown_rx.recv().unwrap_or_else(|error| Err(format!("Service control channel closed: {error}")))
         }
+        Err(error) => Err(error),
+    };
+    crate::shutdown::begin();
+    if let Err(error) = &stop_reason { tracing::error!("service failed; shutting down: {error}"); }
+
+    let stop_status = status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::StopPending,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 1,
+        wait_hint: Duration::from_secs(20),
+        process_id: None,
+    });
+    if let Err(error) = &stop_status {
+        tracing::error!("cannot report StopPending; still performing shutdown cleanup: {error}");
+    }
+    let result = crate::shutdown::complete(state, Duration::from_secs(20));
+    let failed = result.is_err() || stop_status.is_err() || stop_reason.is_err();
+    match result {
+        Ok(()) => info!("service shutdown complete: workers released and required stock recovery confirmed"),
+        Err(error) => tracing::error!("service shutdown incomplete; recovery evidence preserved: {error}"),
     }
 
-    // This stop is graceful (Windows sent Stop/Shutdown — e.g. a user-initiated restart). Record a
-    // one-shot marker so startup recovery does not mistake an armed boot-flag for a crash.
-    if let Err(e) = safe_store.write_clean_shutdown() {
-        tracing::warn!("Safe Loop: failed to record clean shutdown: {e}");
-    }
-
-    status_handle.set_service_status(ServiceStatus {
+    if let Err(error) = status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
+        exit_code: if failed { ServiceExitCode::ServiceSpecific(1) } else { ServiceExitCode::Win32(0) },
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,
-    })?;
+    }) {
+        tracing::error!("cannot report final service status: {error}");
+        crate::shutdown::exit_process(1);
+    }
 
-    Ok(())
+    crate::shutdown::exit_process(if failed { 1 } else { 0 });
 }

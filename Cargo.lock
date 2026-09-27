@@ -2323,6 +2323,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-shell",
+ "tokio",
  "windows 0.58.0",
 ]
 

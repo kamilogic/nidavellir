@@ -46,6 +46,22 @@ pub struct NvmlSample {
     pub throttle_bits: Option<u64>,
 }
 
+impl NvmlSample {
+    pub fn power_capped(&self) -> Option<bool> {
+        use nvml_wrapper::bitmasks::device::ThrottleReasons;
+        self.throttle_bits
+            .map(|bits| bits & ThrottleReasons::SW_POWER_CAP.bits() != 0)
+    }
+
+    pub fn thermal_throttled(&self) -> Option<bool> {
+        use nvml_wrapper::bitmasks::device::ThrottleReasons;
+        self.throttle_bits.map(|bits| {
+            bits & (ThrottleReasons::SW_THERMAL_SLOWDOWN
+                | ThrottleReasons::HW_THERMAL_SLOWDOWN).bits() != 0
+        })
+    }
+}
+
 /// A persistent NVML handle for high-rate polling. `Nvml::init()` is the expensive call, so it is
 /// paid ONCE here; each [`Self::sample`] only does cheap per-field reads. Windows game-trace tool.
 pub struct NvmlSampler {
@@ -111,11 +127,9 @@ impl NvmlSampler {
     }
 }
 
-/// Hard-cap the GPU core (graphics) clock at `max_mhz` via NVML locked clocks,
-/// so the boost curve is **flat after the validated limit**: the GPU can never
-/// clock above the point we proved stable, regardless of how much voltage is
-/// available. `min` is left low so it still downclocks at idle. Driver-level and
-/// independent of the V/F curve — the reliable way to flatten the top end.
+/// Request a GPU core ceiling via NVML locked clocks, keeping the minimum low for idle.
+/// API success confirms the request, not continuous physical containment. Qualification
+/// must independently check measured work clocks (a +15 MHz excursion was seen on 2026-09-17).
 pub fn lock_core_clock_max_mhz(max_mhz: u32) -> Result<(), String> {
     use nvml_wrapper::enums::device::GpuLockedClocksSetting;
     let nvml = nvml_wrapper::Nvml::init().map_err(|e| format!("NVML init: {e}"))?;

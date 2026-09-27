@@ -1,32 +1,52 @@
-# Texture Hop e Endurance — especificação do teste atual
+# Matriz Vulkan, DX11 v3, DX12 e Endurance — especificação do teste atual
 
-> Estado documentado: árvore de trabalho local em 2026-07-23
-> Contrato de qualificação: `F2_QUALIFICATION_CONTRACT_VERSION = 25`
-> Escopo: Forge F2 ativo no Windows; caminhos legados F1, FSGL1/2/3, DX11 e
-> `TransitionShock` são citados apenas quando necessário para deixar claro que não fazem parte do
-> gate obrigatório atual.
+> Estado documentado: árvore de trabalho local em 2026-09-24
+> Contratos: Discovery `v7` · Frontier Texture `v29` · Exact Apply `v32` · workload/matriz `v27`
+> Escopo: Forge F2 ativo no Windows. `TransitionShock` e DX11 v1 são históricos; DX11 v3 e DX12
+> fazem parte do gate obrigatório atual.
 
 ## 1. Resumo executivo
 
-O Forge atual usa dois testes complementares no caminho de publicação de perfis:
+A busca atual qualifica cada candidato elegível pela matriz inteira antes de testar uma
+redução de tensão/aumento de clock. Três bandas derivadas de stock dividem um orçamento
+de24 admissões/8h Standard. O passe da etapa curta significa apenas elegível. Detalhes e
+limites: [descoberta com qualificação completa](undervolt-discovery-proposal-2026-09-18.md).
+O verificador secundário agora usa a referência stock TextureRop do mesmo adapter/backend
+e sinaliza falha ao primário imediatamente; ambos encerram antes do reset. Isso não
+garante que o driver responda após um TDR. A aceitação física da nova versão está pendente.
 
-- **Texture Hop v13-r3** é o detector obrigatório e relativamente rápido. Ele procura corrupção
+O Forge atual usa uma matriz de três APIs mais o soak final no caminho de publicação:
+
+- **A versão do contrato não é a versão da carga.** Discovery7 identifica o PowerRender curto;
+  Frontier29 identifica a triagem Texture; ExactApply32 identifica a qualificação completa. A
+  matriz mantém as quatro APIs/etapas e as durações. O fingerprint DX11 v3 registra a nova
+  cadência: a CPU verifica o staging anterior enquanto a GPU processa no máximo um lote adiante.
+
+- **Texture Hop v13-r4** é o detector obrigatório e relativamente rápido. Ele procura corrupção
   silenciosa, perda de dispositivo, instabilidade e fragilidade de scheduling enquanto combina
   textura/ROP, pressão de VRAM, render de potência e concorrência entre contextos GPU. Ele é usado
   tanto durante a descida da fronteira quanto no par exato de Apply.
 - **Endurance** é o soak contínuo do par final. Ele reutiliza as mesmas cargas determinísticas, mas
-  organiza uma sequência mais longa, pesada e termicamente acumulativa. Ele roda somente no par
-  exato de Apply, depois de Texture, e é obrigatório para publicação.
+  organiza uma sequência mais longa, pesada e termicamente acumulativa. Ele roda no mesmo par exato, depois das outras lanes, antes de
+  autorizar refinamento ou publicação.
+- **DX11 v3** cobre, por API nativa, textura, depth/ROP, pixel ALU, compute/UAV e copy/readback.
+  A v2 esvaziava a fila da GPU a cada checksum de 9 MiB na CPU. A v3 mantém o lote seguinte
+  em execução durante essa verificação, sem reduzir conteúdo ou frequência dos checks.
+  No encerramento/cancelamento o lote final é verificado; em falha, o trabalho já enfileirado
+  termina antes do reset. Nenhum positivo anterior a ExactApply32 aprova essa cadência.
+- **DX12** executa o mesmo plano `V8Texture` de Vulkan, com backend e goldens stock próprios.
 
 Um ponto só pode ser publicado quando, na mesma execução e no mesmo par exato
 `(target_mhz, apply_mv)`:
 
-1. Texture retorna evidência `Pass` do contrato v25;
-2. Endurance também termina validado;
-3. o ponto sustenta telemetria de clock, tensão e potência utilizável;
-4. a transação retorna a GPU ao stock e limpa o boot flag;
-5. a evidência possui proveniência reproduzível;
-6. os gates de potência, regime, confiança e condenação também aceitam o ponto.
+1. DX11 v3 retorna render e compute válidos;
+2. Texture retorna evidência `Pass` pelo backend Vulkan explícito;
+3. o mesmo Texture Hop retorna `Pass` pelo backend DX12 explícito;
+4. Endurance também termina validado;
+5. o ponto sustenta telemetria de clock, tensão e potência utilizável;
+6. cada transação retorna a GPU ao stock e limpa o boot flag;
+7. a evidência possui proveniência reproduzível;
+8. os gates de potência, regime, confiança e condenação também aceitam o ponto.
 
 `Inconclusive` não aprova e não reprova eletricamente: mantém o sistema fail-closed, sem inventar
 instabilidade. `SilentError`, `Unstable` e `DeviceLost` são falhas físicas, mas possuem efeitos de
@@ -42,7 +62,7 @@ Na tela Forge, os modos ativos são:
 |---|---|---|
 | Standard | `StartPowerSweep` | prova compacta recomendada |
 | Long | `StartPowerSweepLong` | prova exaustiva |
-| Clean Run | `StartPowerSweepClean` | mesma duração do Standard, ignorando aprendizado positivo anterior |
+| Clean Run | `StartPowerSweepClean` | mesma duração do Standard; refaz positivos e preserva toda barreira de segurança negativa |
 
 O método legado `StartPowerSweepFast` continua aceito no wire protocol, mas hoje é apenas alias de
 Standard. Não existe mais um modo Fast sem qualificação.
@@ -55,10 +75,10 @@ Referências: `apps/ui/src/lib/views/Forge.svelte`, `crates/service/src/ipc_serv
 Depois do preheat e da leitura da curva V/F, mas antes da primeira escrita de candidato, o Forge:
 
 1. captura por 2 s cada golden stock de `PowerRender`, `BoostEdge`, `TextureRop`,
-   `FrameCadence`, `GeometryDepth` e `TextureStream`;
+   `FrameCadence`, `GeometryDepth` e `TextureStream`, separadamente em Vulkan e DX12, além do
+   golden render+compute DX11 v3;
 2. exige pelo menos quatro frames e checksum determinístico durante cada captura;
-3. executa o **Texture Hop completo por 60 s em stock**, incluindo a concorrência persistente
-   entre o Texture Stack primário e o canary TextureRop secundário;
+3. executa controles de 60 s em stock para Vulkan, DX11 v3 e DX12;
 4. aborta a forja antes de qualquer candidato se o backend/driver não sustentar os goldens ou a
    sequência completa.
 
@@ -71,7 +91,7 @@ Para cada clock alvo e bin de tensão elegível:
 
 1. o motor arma a recuperação, escreve a curva ancorada e verifica o write;
 2. executa 10 s de `PowerRender` para descoberta/potência;
-3. se o ponto é sustentado e está fora do regime de power cap, executa **Texture Hop**;
+3. se o ponto é sustentado e está fora do regime de power cap, executa **Texture Hop/Frontier29**;
 4. se Texture passa, a descida tenta o próximo bin físico de tensão abaixo;
 5. se Texture reprova, o clock para naquele limite ou realiza recuperação para cima quando veio de
    um salto;
@@ -85,7 +105,8 @@ Duração de Texture na fronteira:
 | Standard / Clean | 30 s | 1 |
 | Long | 60 s | 1 |
 
-O contrato v25 mantém duas fronteiras:
+O contrato Frontier29 mantém duas fronteiras e aceita no máximo um bin físico de clock abaixo do
+alvo durante Texture, a mesma elasticidade de runtime da Discovery7:
 
 - **fronteira física**: ponto de descoberta mais profundo, útil para aprendizado;
 - **fronteira publicável**: ponto mais profundo que também possui Texture atual completo.
@@ -94,8 +115,9 @@ Assim, um ponto mais profundo porém inconclusivo não apaga um ponto mais raso 
 
 ### 2.4 Uso no gate exato de Apply
 
-Depois de sintetizar Godforge, Brokkr's Best e Deep Calm, o programa deduplica os pares exatos
-selecionados. Cada par ainda não aprovado na execução atual passa por:
+Depois de sintetizar Godforge, Brokkr's Best e Deep Calm, o programa deduplica os pares exatos.
+ExactApply32 volta a exigir residência estrita no alvo; a tolerância de Discovery7/Frontier29 não é
+transportada para o perfil. Cada par selecionado ainda não aprovado na execução atual passa por:
 
 ```text
 planejar par exato
@@ -103,9 +125,13 @@ planejar par exato
   -> armar boot flag
   -> aplicar curva ancorada
   -> verificar write, ceiling de clock e lock da tensão física selecionada
-  -> Texture Hop no par exato
+  -> DX11 v3 residente por 420 s no par exato
+  -> reset stock confirmado
+  -> Texture Hop/Vulkan no par exato
   -> reset stock confirmado
   -> checar envelope de publicação
+  -> DX12 no mesmo par e mesma duração
+  -> reset stock confirmado
   -> Endurance no mesmo par exato
   -> reset stock confirmado
   -> reconciliar clock, potência, regime e confiança
@@ -114,21 +140,44 @@ planejar par exato
 
 Durações por par exato único:
 
-| Modo | Texture exato | Endurance | Total nominal do gate |
-|---|---:|---:|---:|
-| Standard / Clean | 120 s | 300 s | 7 min |
-| Long | 300 s | 1.200 s | 25 min |
+| Modo | DX11 v3 | Vulkan | DX12 | Endurance | Total nominal do gate |
+|---|---:|---:|---:|---:|---:|
+| Standard / Clean | 420 s | 120 s | 120 s | 300 s | 16 min |
+| Long | 420 s | 300 s | 300 s | 1.200 s | 37 min |
 
 Não existe mais watchdog global de 59/60 minutos. A execução termina o plano derivado do hardware,
 a menos que haja Stop manual, falha terminal ou recuperação pendente.
 
-Texture sempre roda antes de Endurance. Se Texture já mede potência acima do teto de publicação
-(`94%` do board power limit), o par é classificado como power-bound e Endurance é evitado. Isso não
-gera blacklist: o par sai da seleção da execução e o Forge tenta ressintetizar/reparar.
+DX11 v3 roda primeiro para concentrar a reprodução de campo antes dos demais custos. Um dwell
+DX11 completo e reset-clean cujo p99 já exceda o teto de publicação (`99%` do board power limit)
+encerra o par como power-bound, mesmo se a residência ficou inconclusiva. A observação original
+continua Inconclusive; o resultado de roteamento é `ExactApplyPowerCeilingExceeded`. Não há
+blacklist, repetição idêntica, etapas restantes ou aumento de tensão no mesmo clock. O Forge
+pode ressintetizar um clock inferior, que ainda precisa passar a matriz inteira. A flag do driver
+ou um pico isolado não acionam esse atalho; cancelamento, telemetria insuficiente e falhas físicas
+mantêm seu tratamento. Após a matriz completa, o gate de potência final continua obrigatório.
+
+### 2.5 Clean, cone de TDR e orçamento finito
+
+Clean refaz evidência positiva e perfis; não apaga a memória de perigo. `Rigid`, `Quarantine` e o
+cone de TDR efetivos são consultados em Clean, Standard e Long, inclusive antes de descida,
+calibração e Exact Apply.
+
+Cada `CandidateCrash` Rigid sob contrato v29 ou posterior projeta um piso sobre os bins físicos: ao
+descer um bin de clock, o piso pode aliviar no máximo um bin de tensão. A união de vários cones usa o
+piso mais alto. Um par no piso ou abaixo dele termina como `TdrRiskGuard/CensoredBoundary` antes de
+armar Safe Loop, escrever a GPU ou iniciar dwell. Esse par não recebe `Pass`, `Fail`, observação nem
+entrada no ledger; o primeiro bin estritamente acima do piso ainda precisa passar Frontier29.
+
+O orçamento persistente pretendido é de dois `CandidateCrash` efetivos por GPU desde o piso de
+segurança v29; mudar a versão da evidência positiva não o zera. Se o total durável ultrapassar dois,
+novas execuções que buscariam outro crash falham
+fechadas. O sistema não prolonga o dwell e não repete pontos indefinidamente para tentar fabricar um
+terceiro TDR.
 
 ## 3. Motor comum e segurança transacional
 
-Texture e Endurance usam o mesmo motor confirmado de candidato. A ordem real em
+Todos os quatro lanes usam o mesmo motor confirmado de candidato. A ordem real em
 `run_confirmed_f2_step` é:
 
 ```rust
@@ -153,10 +202,10 @@ Propriedades importantes:
   `ResetFailed`.
 
 Durante a descida, descoberta e Texture podem compartilhar uma única escrita ativa e realizar um
-único cleanup ao final da transação. No gate de Apply, Texture e Endurance são passos confirmados
-separados, cada um com seu próprio ciclo arm/apply/verify/dwell/reset.
+único cleanup ao final da transação. No gate de Apply, Vulkan, DX11 v3, DX12 e Endurance são passos
+confirmados separados, cada um com seu próprio ciclo arm/apply/verify/dwell/reset.
 
-## 4. Texture Hop v13-r3
+## 4. Texture Hop v13-r4
 
 ### 4.1 Identidade e objetivo
 
@@ -429,7 +478,7 @@ Em ordem de avaliação da cobertura:
 | `phase_not_completed` | nem todas as fases únicas do plano terminaram estáveis |
 | `checksum_coverage_low` | soma de checks menor que o número de fases esperadas |
 | `telemetry_missing` | nenhuma amostra válida associada a fase |
-| `target_residency_low` | menos de 35% das amostras ficaram no clock alvo exato ou acima |
+| `target_residency_low` | cobertura base abaixo do alvo; Frontier29 pode reconciliar somente um bin físico adjacente, ExactApply32 não |
 | `boost_edge_telemetry_low` | Texture/Endurance tiveram menos de 20 amostras BoostEdge |
 | `boost_edge_power_bound` | p95 de potência em BoostEdge atingiu pelo menos 99% do power limit |
 | `phase_contrast_low` | contraste heavy-light ficou abaixo de 3 W |
@@ -459,7 +508,7 @@ Além da cobertura, o classificador geral retorna `Inconclusive` quando:
 
 - Stop/cancel foi solicitado;
 - p95 de clock ficou mais de 15 MHz **acima** do alvo, indicando que o ceiling não valeu;
-- na descoberta, p5 ficou abaixo do clock alvo exato;
+- na descoberta, p5 ficou mais de um bin físico abaixo do alvo permitido por Discovery7;
 - a telemetria de tensão não comprovou pelo menos três amostras no bin selecionado ou abaixo;
 - no exact-Apply há `thermal_throttled` e o p5 caiu abaixo do alvo;
 - a cobertura retornou qualquer reason inconclusivo.
@@ -490,7 +539,8 @@ fase individual.
 Uma observação positiva só conta como evidência atual quando:
 
 - kind correto (`Qualification` na fronteira, `ApplyQualification` no par final);
-- `qualification_contract_version == 25`;
+- Frontier usa `qualification_contract_version == 28`; Apply usa
+  `qualification_contract_version == 30`;
 - outcome validado;
 - strength `Fsgl4`;
 - pattern correto;
@@ -502,8 +552,7 @@ Uma observação positiva só conta como evidência atual quando:
 
 Para um perfil final, ainda são exigidos:
 
-- Texture exato atual;
-- Endurance atual, no mesmo `run_id`, target, Apply mV e GPU;
+- Vulkan/Texture, DX11 v3, DX12 e Endurance atuais, no mesmo `run_id`, target, Apply mV e GPU;
 - p95 sustentado mensurável;
 - potência completa do gate mensurável;
 - confiança/validation count suficientes;
@@ -533,7 +582,16 @@ Somente então `profiles_qualified` pode ficar `true` e o Apply é destravado.
 - se a dívida não for quitada dentro do orçamento, o gate termina inconclusivo e a run fica
   incompleta sem inferir reparo elétrico.
 
-### 7.3 Endurance
+### 7.3 DX11 estrutural no exact-Apply
+
+- inconclusões estruturais permanecem inconclusivas individualmente e não entram no ledger;
+- três ocorrências homogêneas no mesmo par exato agregam o token
+  `DX11StructuralClockDrop`;
+- o token autoriza no máximo um reparo vertical run-local para aquele target;
+- se o mesmo token reaparece depois do reparo, o target fecha sem novo reparo;
+- o agregado nunca vira `Pass`, `SilentError`, Rigid ou Quarantine.
+
+### 7.4 Endurance
 
 - executa uma única transação contínua por passagem completa do gate;
 - não possui retry local específico;
@@ -543,10 +601,10 @@ Somente então `profiles_qualified` pode ficar `true` e o Apply é destravado.
 - `DeviceLost`, reset/apply/verify/arm failure abortam conforme a segurança transacional.
 
 Se o ledger marcou o par em quarentena sob contrato atual ou mais forte, o par pode exigir duas
-passagens completas do gate — cada passagem contém Texture + Endurance. A segunda só roda se a
+passagens completas do gate — cada passagem contém Vulkan + DX11 v3 + DX12 + Endurance. A segunda só roda se a
 primeira aprovar.
 
-### 7.4 Depois de uma reprovação no exact-Apply
+### 7.5 Depois de uma reprovação no exact-Apply
 
 - power-bound: exclui o par desta seleção sem blacklist e evita Endurance;
 - SilentError reset-clean: pode gerar quarentena durável no condemnation ledger;
@@ -555,6 +613,19 @@ primeira aprovar.
 - o reparo vertical tenta o próximo bin V/F viável **acima**, no mesmo clock;
 - cada ponto reparado deve repetir o gate completo;
 - resultados apenas inconclusivos não autorizam reparo vertical e deixam a execução incompleta.
+
+A única exceção controlada à última regra é o agregado homogêneo DX11 descrito em 7.3: ele autoriza
+um reparo estrutural, sem reclassificar qualquer tentativa individual como falha física.
+
+### 7.6 TDR e retomada
+
+Um TDR atribuído pelo Sentinel encerra a projeção terminal como `phase=interrupted` e
+`last_outcome=TdrOrCrash`, mantém publicação bloqueada e preserva a linha bruta do workload com o
+resultado que ela realmente conseguiu registrar. O boot atual fica fechado para nova mutação da GPU.
+
+Depois de reiniciar Windows e reconhecer o incidente, a interface pode pedir somente
+`ResumePowerSweep` da mesma execução. Build/revision, GPU e driver precisam coincidir exatamente; a
+recuperação não oferece troca de modo e não cai silenciosamente em `StartPowerSweep*`.
 
 ## 8. Limitações e observações do comportamento atual
 
@@ -596,13 +667,13 @@ condemnation ledger e feedback de falha em campo.
 | execução sequencial dos segmentos | `crates/gpu-stress/src/lib.rs` — `run_vf_qualifier_stress_with_phase_pattern_goldens_and_cancel` |
 | render/checksum e cargas | `crates/gpu-stress/src/lib.rs` — `run_render_profile` |
 | concorrência entre contextos | `crates/gpu-stress/src/lib.rs` — `run_field_canary_worker`, `run_field_concurrency_profile` |
-| captura stock e preflight | `crates/service/src/gpu_power_sweep.rs` — `capture_fsgl3_render_goldens`, `validate_v24_texture_hop_stock` |
+| captura stock e preflight | `crates/service/src/gpu_power_sweep.rs` — `capture_fsgl3_render_goldens`, `validate_v27_api_matrix_stock` |
 | sampler e cobertura | `crates/service/src/gpu_power_sweep.rs` — `load_and_measure_for`, `qualification_coverage_from_run` |
 | classificação final do dwell | `crates/service/src/gpu_undervolt.rs` — `classify_f2_stress_dwell` |
 | motor arm/apply/verify/reset | `crates/service/src/gpu_undervolt.rs` — `run_confirmed_f2_step` |
 | Texture na fronteira | `crates/service/src/gpu_undervolt.rs` — `qualify_active_anchored_candidate`, `run_confirmed_f2_clock_discovery` |
-| Texture + Endurance exact-Apply | `crates/service/src/gpu_undervolt.rs` — `gate_anchored_candidate_fsgl3`, `run_confirmed_f2_apply_qualification` |
-| validade de evidência/publicação | `crates/core/src/f2_observation.rs` — `is_current_qualification_pass`, `is_current_apply_qualification_pass`, `point_has_current_endurance_qualification` |
+| matriz de APIs + Endurance exact-Apply | `crates/service/src/gpu_undervolt.rs` — `gate_anchored_candidate_fsgl3`, `run_confirmed_f2_apply_qualification` |
+| validade de evidência/publicação | `crates/core/src/f2_observation.rs` — `is_current_qualification_pass`, `is_current_apply_qualification_pass`, `point_has_current_exact_apply_qualification` |
 | síntese, reparo e publicação | `crates/service/src/gpu_power_sweep.rs` — fluxo `apply-qualify` em `measure_multiclock_undervolt_forge` |
 
 ## 10. Fluxo resumido de decisão
@@ -612,7 +683,7 @@ START FORGE
   |
   +-- preheat + curva V/F
   |
-  +-- goldens stock + Texture Hop completo 60 s
+  +-- goldens por API + controles stock Vulkan/DX11 v3/DX12 de 60 s
   |     \-- falhou: aborta antes de candidatos
   |
   +-- para cada clock/bin elegível
@@ -625,8 +696,18 @@ START FORGE
   +-- sintetiza os três perfis usando fronteira publicável
   |
   +-- para cada par Apply único
-  |     +-- Texture 120/300 s
-  |     |     +-- potência > 94% do cap: exclui sem Endurance/blacklist
+  |     +-- DX11 v3 residente 420 s
+  |     |     +-- Pass: segue para Vulkan
+  |     |     +-- Fail: rejeita/repara
+  |     |     \-- Inconclusive: run incompleta
+  |     |
+  |     +-- Vulkan/Texture 120/300 s
+  |     |     +-- pior potência do gate > 99% do cap: exclui sem blacklist
+  |     |     +-- Fail: rejeita/repara
+  |     |     \-- Inconclusive: run incompleta
+  |     |
+  |     +-- DX12/Texture 120/300 s
+  |     |     +-- Pass: segue para Endurance
   |     |     +-- Fail: rejeita/repara
   |     |     \-- Inconclusive: run incompleta
   |     |

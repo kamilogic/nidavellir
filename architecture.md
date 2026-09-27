@@ -6,12 +6,15 @@ over a named pipe; the service does all hardware access (NVAPI, NVML, PawnIO).
 ## Components
 - **apps/ui** (Svelte 5 runes, Tauri): the front end. `Forge.svelte` is the main
   tuning view; `VfChart.svelte` draws the V/F curve. i18n en/pt in `lib/i18n.js`.
-- **apps/ui/src-tauri**: Tauri shell; bundles the PawnIO driver resources.
+- **apps/ui/src-tauri**: Tauri shell; bundles the Core Service sidecar. The NVIDIA beta installer
+  has no CPU/PawnIO driver setup requirement.
 - **crates/core**: hardware detection, sensors, V/F sweep types, the **Safe Loop**,
   and all IPC request/response types (`ipc.rs`). No HW writes here.
 - **crates/service**: the Windows service + IPC server (`ipc_server.rs`). Owns the
   background runners: `gpu_power_sweep.rs` (the Brokkr's/Godforge engine),
   `gpu_apply.rs`, `gpu_benchmark.rs`, `gpu_sweep_real.rs`, `gpu_real.rs`.
+  `shutdown.rs` owns the shared bounded console/SCM cleanup and clean-marker commit; IPC admission
+  closes before cleanup, and SCM Running requires listener readiness.
 - **crates/gpu-nvapi**: NVAPI access — read the V/F curve, set offsets, and the
   modern **ClkVfPoints** FFI (the VF ceiling). Most `unsafe` lives here.
 - **crates/gpu-stress**: wgpu (Vulkan/DX12) loads — `run_render_stress` (steady
@@ -33,35 +36,35 @@ headless client used for sweeps/benchmarks. Requests/responses are the
 ## Key subsystems
 - **Safe Loop** (`core/src/safe_loop.rs`): reboot-surviving crash recovery. Arms a
   boot-flag (the tuning point) before a risky apply/measure; on reboot a still-armed
-  flag means the last op crashed → don't re-apply; blacklist the region; after 3
-  consecutive crashes → Safe Mode (stock, hands-off). Persists to ProgramData.
-- **Live F2 Forge** (`gpu_power_sweep.rs` + `gpu_undervolt.rs`, current
-  2026-07-15): first proves a deterministic stock preheat, then keeps three clock
-  facts separate: **Ctable** is the ceiling/count of sane physical base-table bins,
-  **Cboost** is the maximum live boost observed after preheat, and **Cmax** is the
-  first reset-clean sustainable clock proved by discovery. Preheat uses up to six
-  10 s stock windows and requires two consecutive usable windows with no throttle,
-  temperature convergence within 2 °C and p5 convergence within 30 MHz; an
-  inconclusive preheat aborts before tuning. The frontier remains Cmax→90% Cmax.
-  Each discovery attempt is a **Candidate Transaction**: arm Safe Loop and
-  apply/verify the curve once, run PowerRender plus any active qualifier phases
-  under that same curve, then perform one checked reset/boot-flag cleanup.
-  Qualification observations are persisted before their discovery observation;
-  positive evidence is reusable only after both reset-to-stock and flag clear are
-  proven. Power-cap classification is hysteretic: NearCap at p99 ≥99% of the
-  numeric limit, OffCap at ≤98%, and the interval between them is Ambiguous and
-  must retry or end inconclusive. Qualification contract **v16** records build
-  version/revision, workload fingerprint, selected backend/adapter/driver,
-  checksum method and golden configuration. Pre-v16 positives remain readable
-  but cannot unlock Apply. `MixedGame` is truly interleaved per frame, with sparse
-  GPU-side checks whose mismatch total is cumulative. Standard/Long keep the
-  exact-Apply gate at every selected pair: Texture 5 min, TransitionShock 8 min,
-  then Endurance 20 min. DX11 coverage and any reduction of that final gate remain
-  gated on physical A/B calibration of 1845 MHz @ 862 mV against known-safe bins.
+  flag means the last op crashed → don't re-apply and retain the attributed point.
+  Sentinel TDRs project the owning Forge terminal as `interrupted/TdrOrCrash` without
+  rewriting the raw workload row. The current boot is mutation-closed; after reboot and
+  acknowledgement, legacy Resume checks the same run/build/GPU/driver. The current bounded
+  discovery does not Resume after TDR; manual clean pauses retain their budget. Persists to ProgramData.
+- **Mutation transaction boundary** (`tdr_sentinel.rs` + `gpu_apply.rs`): startup persists and reads
+  back the Event Log seed/floor and waits for a watcher-ready handshake before reapply. Every GPU
+  writer must pass checked Safe Loop/BootFlag/condemnation reads, own the exact BootFlag transaction,
+  revalidate immediately before the write and clear only that owner. F2 Apply/Benchmark also require
+  exact GPU/run/contract32 plus the complete ordered matrix proof. Corruption is never absence.
+- **Live F2 Forge** (`gpu_power_sweep.rs`, `gpu_undervolt.rs`, `qualified_search.rs`,
+  current2026-09-26): stock-VF-top-first search7 (not heavy stock p5; power-bound jumps to the measured
+  equilibrium voltage), then economic candidates within90–100% of qualified top.24 admissions/8h
+  Standard, persistent admission readback before hardware. Discovery9/Frontier32/ExactApply35 require
+  clock in nominal..nominal+15, contained voltage, heavy-phase target held (or at the board power
+  limit) and the representative PowerRender load strictly below the board limit. Missing evidence is not
+  instability; generic inconclusive does not establish a hardware boundary. Full same-pair/run/GPU
+  matrix and confirmed stock cleanup precede refinement/publication; no hidden lane retries.
+  Detailed transitions, thresholds and remaining measurement limits:
+  docs/qualification-rules-2026-09-25.md. No global-optimum or universal game-stability claim.
+- **Concurrent integrity oracle** (`gpu-stress`): secondary TextureRop canary uses stock golden
+  and an independent device on the same adapter/backend. First peer failure stops further
+  submissions and strongest verdict wins; both workers join before returning to stock cleanup.
+  Texture/Endurance r4 fingerprints invalidate earlier proof. Native driver waits can still hang.
 - **Anchored VF undervolt** (`gpu-nvapi`): raises exactly one real lower-voltage
   anchor and caps higher-voltage bins to the target via per-point ClkVfPoints
-  offsets — no voltage lock / no NVML clock pin, so lower bins retain elasticity.
-  The clock ceiling is the stock VF top, and reset is write/readback checked.
+  offsets, applies a max-only NVML clock ceiling, then sets and verifies the exact
+  NVAPI voltage rail. Clock may step down; voltage may not escape above the selected
+  physical bin. Reset releases both locks and is write/readback checked.
 - **Legacy F1 sweep/ceiling** (`gpu_power_sweep.rs`): retained for legacy
   `is_undervolt == false` payloads; no longer backs the live Forge button.
 - **Continuous knowledge** (`gpu_power_sweep.rs`): `GpuKnowledge` per GPU — a
@@ -73,12 +76,15 @@ headless client used for sweeps/benchmarks. Requests/responses are the
 - `gpu_applied.json` — the currently applied profile (re-applied on boot).
 - `gpu_knowledge.json` — per-GPU stability knowledge (frontier + per-point stats).
 - `f2_observations.jsonl` — append-only, GPU-UUID-scoped F2 discovery/qualification evidence,
-  contract versions, full v16 provenance, cleanup proof, coverage summaries and
+  split v7/v29/v32 contract versions, full matrix-v27 provenance, cleanup proof, coverage summaries and
   crash-safe resume checkpoints.
-- `forge_state.json` — last complete usable forged profile snapshot; partial F2 runs
-  never overwrite it.
+- `forge_state.json` — current run checkpoint, qualified points, candidate bands, spent
+  admission/time counters and stop reasons; partial runs carry explicit readiness state.
 - `boot_flag.json` / `heartbeat.txt` — Safe Loop liveness/boot detection.
+- `condemnation_ledger.jsonl` — append-only Rigid/Quarantine hardware truth. CandidateCrash appends
+  are flushed and strictly read back before terminal state can advance.
+- `sentinel_baseline.txt` — durable Event Log seed/floor proven before any boot reapply.
 
 ## Platform constraints
 NVIDIA-only (NVAPI). Modern VF curve needs desktop Pascal+ on a current driver
-(verified 595.97). Falls back to global offset + NVML clock cap where unavailable.
+(verified 595.97 and 610.62). Falls back to global offset + NVML clock cap where unavailable.

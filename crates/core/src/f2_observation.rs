@@ -37,7 +37,21 @@ pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 /// its physical VF bin, and stable discovery requires p5 to reach the exact target instead of
 /// accepting the adjacent lower boost bin. Pre-v6 evidence did not prove the labeled clock/voltage
 /// pair was exercised authoritatively.
-pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 6;
+///
+/// v7 (2026-08-11): discovery permits one adjacent physical boost bin of clock elasticity while
+/// retaining authoritative voltage-lock/readback at the labeled anchor. A miss larger than one bin
+/// remains `ClockDrop`; pre-v7 positives used the stricter clock-residency interpretation.
+pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 9;
+
+/// Explicit nominal-clock envelope, not permission to increase voltage or infer a higher profile.
+/// Keep requesting the nominal NVML cap; qualify measured operation through nominal + 15 MHz.
+pub const F2_CLOCK_UPPER_MARGIN_MHZ: u32 = 15;
+pub fn f2_clock_ceiling_mhz(target: u32) -> u32 {
+    target.saturating_add(F2_CLOCK_UPPER_MARGIN_MHZ)
+}
+pub fn f2_clock_in_target_band(clock: u32, target: u32) -> bool {
+    (target..=f2_clock_ceiling_mhz(target)).contains(&clock)
+}
 /// Current FailureSeekingGameLoop qualification contract.
 ///
 /// v7 requires the High-FPS, Texture and Transitions qualification set and reconciles the exact
@@ -112,7 +126,38 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 6;
 /// v25 (2026-07-23): qualification runs under a verified voltage lock and only samples at the exact
 /// target clock count as target residency. Missing voltage authority, an observed voltage above the
 /// selected bin, or insufficient exact-clock residency is Inconclusive and cannot unlock Apply.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 25;
+/// v26 (2026-08-04): exact Apply additionally requires same-run Vulkan, native DX11 v2 and DX12
+/// API lanes before Endurance. Discovery remains Texture-only and is not multiplied by API count.
+/// v27 (2026-08-04): the field-calibrated native DX11 v2 residency gate runs first for 420 seconds;
+/// Vulkan and DX12 retain mode-specific durations, followed by continuous Endurance. This rejects a
+/// late DX11 failure before spending time on the remaining exact-Apply proof.
+/// v28 (2026-08-11): frontier Texture qualification accepts one adjacent physical boost bin of
+/// runtime elasticity before declaring a margin ClockDrop. Exact-Apply keeps its zero-bin held-clock
+/// rule and the same DX11/Vulkan/DX12/Endurance matrix. Pre-v28 frontier positives cannot unlock Apply.
+/// v29: stock-checked secondary context and immediate peer-failure cancellation.
+/// v32 (2026-09-26): representative-load contract. Only PowerRender must stay below the board
+/// limit; qualification samples below target while at the limit count as held. Heavy phases too
+/// short to evaluate are skipped, not refused.
+pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 32;
+
+/// v29 (2026-08-11): three consecutive, provenance-identical native DX11 v2 exact-Apply dwells that
+/// finish reset-clean and off-cap with at least 95% of clocks below the requested target are a
+/// structural clock drop. Their raw observations remain Inconclusive, while the aggregate gate
+/// rejects the candidate without blacklisting it so the caller may perform a bounded voltage repair.
+/// v30 (2026-09-15): native DX11 v3 queues one render/compute batch while hashing the previous
+/// staging copy. This removes the CPU checksum gap from the load. Every completed batch still
+/// has both checks; duration, exact target residency and the remaining matrix are unchanged.
+/// v31 (2026-09-16): DX11 separates heavy integrity from bounded, fenced active target exposure.
+/// Pre-v31 exact-Apply positives cannot qualify this different coverage contract.
+/// v32: stock-checked secondary context and immediate peer-failure cancellation.
+/// v35 (2026-09-26): representative-load contract, same rules as Frontier v32; DX11 exposure
+/// counts power-limited active time separately (`power_limited_active_ms`).
+pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 35;
+
+/// Backward-compatible alias for callers that expose one latest profile-publication contract.
+/// Frontier qualification has an independent version because exact-Apply policy changes must not
+/// invalidate already-proven descent boundaries.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -166,9 +211,11 @@ impl F2EvidenceProvenance {
     /// stack and integrity oracle can all be identified. Driver APIs occasionally omit either the
     /// short driver name or the detailed version string, so one non-empty driver identifier is
     /// sufficient; every other identity component is mandatory.
-    fn is_reproducible(&self) -> bool {
+    pub fn is_reproducible(&self) -> bool {
         fn present(value: &Option<String>) -> bool {
-            value.as_deref().is_some_and(|value| !value.trim().is_empty())
+            value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
         }
 
         present(&self.build_version)
@@ -203,8 +250,9 @@ pub enum F2QualificationStrength {
     Fsgl4,
 }
 
-/// Deterministic workload pattern. A/B remain readable for legacy observations; current (v9)
-/// deployability requires the complete [`REQUIRED_QUALIFICATION_PATTERNS`] set.
+/// Deterministic workload pattern. A/B remain readable for legacy observations; current boundary
+/// deployability requires [`REQUIRED_QUALIFICATION_PATTERNS`], while exact Apply additionally uses
+/// [`REQUIRED_EXACT_APPLY_PATTERNS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum F2QualificationPattern {
@@ -217,33 +265,52 @@ pub enum F2QualificationPattern {
     /// v14 candidate-only endurance soak: one CONTINUOUS ~15-min mixed dwell run ONLY at the exact
     /// Apply pair (never in the frontier descent). Deliberately kept OUT of
     /// [`REQUIRED_QUALIFICATION_PATTERNS`] so it tightens Apply without altering the descent /
-    /// completeness gates or forcing a contract-version bump; publishing is gated on run_id-scoped
-    /// endurance evidence instead ([`point_has_current_endurance_qualification`]).
+    /// completeness gates; publishing is gated on the run-scoped exact-Apply matrix instead
+    /// ([`point_has_current_exact_apply_qualification`]).
     Endurance,
     /// Legacy v15 candidate-only transition shock. Contract v19 no longer executes or requires it,
     /// but the variant remains so persisted evidence is backward-readable.
     TransitionShock,
-    /// Legacy v17 candidate-only native Direct3D 11 render/integrity gate. Contract v19 no longer
-    /// executes or requires it, but the variant remains so persisted evidence is backward-readable.
+    /// Candidate-only native Direct3D 11 v2 render/integrity gate.
     Dx11Game,
+    /// Candidate-only Direct3D 12 mirror of the Vulkan Texture Hop recipe.
+    Dx12Game,
 }
 
-/// The complete pattern set the current qualification contract requires at a boundary and at the
-/// exact Apply pair. Completeness checks index into this array — extending it automatically
-/// tightens every gate.
+/// The complete pattern set the current qualification contract requires at a discovery boundary.
+/// Exact Apply starts with this set and adds the candidate-only API/Endurance lanes in
+/// [`REQUIRED_EXACT_APPLY_PATTERNS`].
 /// v13: Texture FIRST (the empirically-binding graceful silent-error detector — a failing bin fails
 /// after one dwell), Memory LAST (VRAM-dominant, hang-prone). HighFps was removed (never binding).
 pub const REQUIRED_QUALIFICATION_PATTERNS: [F2QualificationPattern; 1] =
     [F2QualificationPattern::Texture];
 
+/// Complete exact-Apply proof. Texture is the explicitly selected Vulkan path; DX11 v3 and DX12
+/// add independent driver/API coverage, and Endurance retains the long thermal/transient proof.
+/// These candidate-only additions do not multiply the frontier descent.
+pub const REQUIRED_EXACT_APPLY_PATTERNS: [F2QualificationPattern; 4] = [
+    F2QualificationPattern::Dx11Game,
+    F2QualificationPattern::Texture,
+    F2QualificationPattern::Dx12Game,
+    F2QualificationPattern::Endurance,
+];
+
 fn required_pattern_index(pattern: F2QualificationPattern) -> Option<usize> {
-    REQUIRED_QUALIFICATION_PATTERNS.iter().position(|required| *required == pattern)
+    REQUIRED_QUALIFICATION_PATTERNS
+        .iter()
+        .position(|required| *required == pattern)
 }
 
 /// Per-phase telemetry captured during a qualification dwell. Optional values remain absent when a
 /// driver/sample path could not provide them; they are never fabricated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct F2QualificationPhaseMetric {
+    /// Actual retained sensor reads; absent in older records, never inferred from phase duration.
+    #[serde(default)]
+    pub sample_count: Option<u32>,
+    /// Highest sampled clock, including excursions hidden by p95; not an instantaneous HW bound.
+    #[serde(default)]
+    pub clock_max: Option<u32>,
     pub phase_name: String,
     pub phase_pattern: String,
     pub duration_ms: u64,
@@ -277,6 +344,9 @@ pub struct F2QualificationPhaseMetric {
 /// carries the durable facts needed to decide whether a validation may qualify Apply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct F2QualificationCoverage {
+    /// DX11 v4 sampled exposure inside fenced GPU-work intervals, excluding idle/CPU checksums.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_target: Option<F2ActiveTargetCoverage>,
     #[serde(default)]
     pub strength: F2QualificationStrength,
     #[serde(default)]
@@ -302,6 +372,92 @@ pub struct F2QualificationCoverage {
     pub reason: Option<String>,
     #[serde(default)]
     pub phase_metrics: Vec<F2QualificationPhaseMetric>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct F2ActiveTargetCoverage {
+    pub observed_active_ms: u64,
+    pub target_active_ms: u64,
+    /// Active time below the target band while at the board power limit (Frontier32/Apply35):
+    /// held under the representative-load contract, reported apart from real target exposure.
+    #[serde(default)]
+    pub power_limited_active_ms: u64,
+    pub required_target_ms: u64,
+    pub sample_count: u32,
+    pub phases_completed: u32,
+    pub upper_clock_exceeded: bool,
+    /// Both full-duty phases supplied >=30 s sampled work and >=95% target-envelope exposure.
+    #[serde(default)]
+    pub heavy_target_proven: bool,
+    /// Diagnostic detail only; old v31 evidence remains readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<F2ActiveTargetDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct F2ActiveTargetDiagnostics {
+    pub requested_max_mhz: u32,
+    pub anchor_mv: u32,
+    /// Independent refusal reasons, including power when the complete lane is evaluated.
+    pub reasons: Vec<String>,
+    pub publication_power_ceiling_w: Option<f32>,
+    pub phases: Vec<F2ActiveClockPhase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct F2ActiveClockPhase {
+    pub phase_index: u32,
+    pub requested_duty_pct: u32,
+    pub active_sample_count: u32,
+    pub active_clock_max_mhz: Option<u32>,
+    #[serde(default)]
+    pub observed_active_us: u64,
+    #[serde(default)]
+    pub target_active_us: u64,
+    #[serde(default)]
+    pub power_limited_active_us: u64,
+    pub upper_sample_count: u32,
+    // Upper samples describe excursions above the nominal request, including allowed +15 MHz.
+    /// Bounded sampled time support, NOT the continuous duration of an excursion.
+    pub upper_observed_us: u64,
+    pub first_upper: Option<F2ClockExcursion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct F2ClockExcursion {
+    pub at_ms: u64,
+    pub clock_mhz: u32,
+    pub voltage_mv: Option<u32>,
+    pub temperature_c: Option<u32>,
+    /// Optional read after the telemetry query, not an atomic snapshot of the event.
+    pub curve: Option<F2ClockCurveSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct F2ClockCurveSnapshot {
+    pub captured_at_ms: u64,
+    pub base_mhz: u32,
+    pub base_mv: u32,
+    pub effective_mhz: u32,
+    pub effective_mv: u32,
+    pub offset_khz: Option<i32>,
+}
+
+impl F2ActiveTargetCoverage {
+    pub fn proves_target(&self) -> bool {
+        self.heavy_target_proven && self.phases_completed == 5 && !self.upper_clock_exceeded && self.sample_count > 0
+            && self.diagnostics.as_ref().is_none_or(|d| d.phases.iter().all(|p|
+                p.active_clock_max_mhz.map_or(p.upper_sample_count == 0, |clock| clock <= f2_clock_ceiling_mhz(d.requested_max_mhz))))
+            && self.observed_active_ms >= 60_000 && self.required_target_ms == 30_000
+            && self.held_active_ms() >= self.required_target_ms
+            && self.held_active_ms() <= self.observed_active_ms
+            && self.held_active_ms() as f64 / self.observed_active_ms as f64 >= 0.35
+    }
+
+    /// Target exposure plus power-limited time (representative-load contract).
+    pub fn held_active_ms(&self) -> u64 {
+        self.target_active_ms.saturating_add(self.power_limited_active_ms)
+    }
 }
 
 /// Which F2 path produced an observation.
@@ -345,6 +501,8 @@ pub enum F2ObsDwell {
     /// Discovery completed reset-clean, but repeated PowerRender measurements did not establish a
     /// consistent sustained-p99 value for this bin.
     PowerTelemetryInconclusive,
+    /// Discovery could not establish the intended operating point; see `inconclusive_reason`.
+    DiscoveryInconclusive,
     /// Dwell completed reset-clean, but the qualification did not collect enough current-contract
     /// coverage to prove the point.
     QualificationInconclusive,
@@ -377,6 +535,8 @@ pub enum F2ObsOutcome {
     /// Discovery power telemetry could not be confirmed after the bounded repeat budget. This is
     /// neither stability evidence nor a voltage failure.
     PowerTelemetryInconclusive,
+    /// Discovery lacks operating-point evidence (e.g. voltage samples); never a bad boundary.
+    DiscoveryInconclusive,
     /// The qualification workload ran reset-clean, but coverage was too weak to qualify or reject the
     /// point. This is not a voltage failure and must not become a bad-boundary veto.
     QualificationInconclusive,
@@ -472,6 +632,9 @@ pub struct F2Observation {
     /// an exact Apply pair without conflating it with the configured target.
     #[serde(default)]
     pub sustained_upper_clock_mhz: Option<u32>,
+    /// Absolute sampled maximum, including ramps; distinct from sustained p95.
+    #[serde(default)]
+    pub max_clock_mhz: Option<u32>,
     #[serde(default)]
     pub watts: Option<u32>,
     /// Highest post-ramp power sample captured by the discovery dwell.
@@ -534,6 +697,10 @@ pub struct F2Observation {
     #[serde(default)]
     pub blacklisted: bool,
     pub outcome: F2ObsOutcome,
+    /// Specific measurement/coverage refusal, preserved from the executed dwell or power gate.
+    /// Absent in historical records; those records must not acquire an inferred reason on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inconclusive_reason: Option<String>,
     /// Per-attempt confidence basis (0–1) when known; the frontier recomputes an aggregate confidence.
     #[serde(default)]
     pub confidence: Option<f64>,
@@ -682,6 +849,7 @@ fn has_reproducible_provenance(o: &F2Observation) -> bool {
 pub fn is_current_discovery_evidence(o: &F2Observation) -> bool {
     o.evidence_kind == F2EvidenceKind::Discovery
         && o.discovery_contract_version == Some(F2_DISCOVERY_CONTRACT_VERSION)
+        && o.max_clock_mhz.is_some_and(|clock| clock > 0 && clock <= f2_clock_ceiling_mhz(o.target_mhz))
         && o.power_p99_confirmed
         && has_proven_cleanup(o)
         && has_reproducible_provenance(o)
@@ -692,17 +860,18 @@ pub fn is_current_discovery_evidence(o: &F2Observation) -> bool {
 /// unlock Apply.
 pub fn is_current_qualification_pass(o: &F2Observation) -> bool {
     o.evidence_kind == F2EvidenceKind::Qualification
-        && o.qualification_contract_version == Some(F2_QUALIFICATION_CONTRACT_VERSION)
+        && o.qualification_contract_version == Some(F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION)
+        && o.max_clock_mhz.is_some_and(|clock| clock > 0 && clock <= f2_clock_ceiling_mhz(o.target_mhz))
         && o.outcome.is_validated()
         && has_proven_cleanup(o)
         && has_reproducible_provenance(o)
-        && o.qualification_coverage
-            .as_ref()
-            .is_some_and(|coverage| {
-                coverage.strength == F2QualificationStrength::Fsgl4
-                    && coverage.pattern.is_some_and(is_required_qualification_pattern)
-                    && coverage.verdict == F2QualificationVerdict::Pass
-            })
+        && o.qualification_coverage.as_ref().is_some_and(|coverage| {
+            coverage.strength == F2QualificationStrength::Fsgl4
+                && coverage
+                    .pattern
+                    .is_some_and(is_required_qualification_pattern)
+                && coverage.verdict == F2QualificationVerdict::Pass
+        })
 }
 
 /// True only for a fully-covered pass at the exact post-margin Apply pair under the current
@@ -718,17 +887,18 @@ pub fn is_current_apply_qualification_pass(o: &F2Observation) -> bool {
 
 fn is_current_apply_qualification_evidence(o: &F2Observation) -> bool {
     o.evidence_kind == F2EvidenceKind::ApplyQualification
-        && o.qualification_contract_version == Some(F2_QUALIFICATION_CONTRACT_VERSION)
+        && o.qualification_contract_version == Some(F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION)
+        && o.max_clock_mhz.is_some_and(|clock| clock > 0 && clock <= f2_clock_ceiling_mhz(o.target_mhz))
         && o.outcome.is_validated()
         && has_proven_cleanup(o)
         && has_reproducible_provenance(o)
-        && o.qualification_coverage
-            .as_ref()
-            .is_some_and(|coverage| {
-                coverage.strength == F2QualificationStrength::Fsgl4
-                    && coverage.pattern.is_some()
-                    && coverage.verdict == F2QualificationVerdict::Pass
-            })
+        && o.qualification_coverage.as_ref().is_some_and(|coverage| {
+            coverage.strength == F2QualificationStrength::Fsgl4
+                && coverage.pattern.is_some()
+                && (coverage.pattern != Some(F2QualificationPattern::Dx11Game)
+                    || coverage.active_target.as_ref().is_some_and(F2ActiveTargetCoverage::proves_target))
+                && coverage.verdict == F2QualificationVerdict::Pass
+        })
 }
 
 fn is_required_qualification_pattern(pattern: F2QualificationPattern) -> bool {
@@ -752,14 +922,51 @@ pub fn last_discovery_good_for_target(
         .min_by_key(|o| o.anchor_mv)
 }
 
-/// The first bad anchor for a target: the HIGHEST-voltage real-failure observation — the shallowest
-/// undervolt that already failed (the closest failure below the validated region). `None` if none bad.
+fn same_run_and_gpu(a: &F2Observation, b: &F2Observation) -> bool {
+    a.run_id == b.run_id && a.gpu_key == b.gpu_key
+}
+
+/// A reset-clean `ClockDrop` is performance evidence, not an unconditional silicon failure. If the
+/// same run later qualifies either the same target at a strictly lower voltage or a harder clock at
+/// the same/lower voltage, that stronger physical observation contradicts the drop as a
+/// downward-voltage boundary. Require the dominating pair to have both current Discovery and current
+/// Qualification evidence so an orphan/stale pass cannot reopen a descent.
+fn clock_drop_is_dominated_by_qualified_pair(obs: &[F2Observation], drop: &F2Observation) -> bool {
+    matches!(drop.outcome, F2ObsOutcome::ClockDrop)
+        && obs.iter().any(|qualification| {
+            ((qualification.target_mhz == drop.target_mhz
+                && qualification.anchor_mv < drop.anchor_mv)
+                || (qualification.target_mhz > drop.target_mhz
+                    && qualification.anchor_mv <= drop.anchor_mv))
+                && same_run_and_gpu(qualification, drop)
+                && is_current_qualification_pass(qualification)
+                && obs.iter().any(|discovery| {
+                    discovery.target_mhz == qualification.target_mhz
+                        && discovery.anchor_mv == qualification.anchor_mv
+                        && same_run_and_gpu(discovery, qualification)
+                        && discovery.outcome.is_validated()
+                        && is_current_discovery_evidence(discovery)
+                })
+        })
+}
+
+fn is_voltage_boundary_failure(obs: &[F2Observation], candidate: &F2Observation) -> bool {
+    candidate.outcome.is_bad()
+        && !(candidate.outcome == F2ObsOutcome::ClockDrop && candidate.discovery_contract_version == Some(F2_DISCOVERY_CONTRACT_VERSION))
+        && !candidate.inconclusive_reason.as_deref().is_some_and(|r| r.starts_with("control_failure"))
+        && !clock_drop_is_dominated_by_qualified_pair(obs, candidate)
+}
+
+/// The first effective bad anchor for a target: the HIGHEST-voltage real-failure observation — the
+/// shallowest undervolt that already failed (the closest failure below the validated region).
+/// Reset-clean `ClockDrop` evidence contradicted by a harder qualified pair in the same run is not a
+/// voltage boundary. `None` if no effective bad observation remains.
 pub fn first_bad_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<&F2Observation> {
     obs.iter()
         .filter(|o| {
             o.target_mhz == target_mhz
                 && o.evidence_kind != F2EvidenceKind::ApplyQualification
-                && o.outcome.is_bad()
+                && is_voltage_boundary_failure(obs, o)
         })
         .max_by_key(|o| o.anchor_mv)
 }
@@ -786,13 +993,12 @@ pub fn bracket_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<Volt
 /// that voltage OR ANY HIGHER voltage for the target. Conservative — a failure at voltage `V` (too low
 /// to hold the clock) implies `V` and everything LOWER is at least as risky.
 pub fn is_known_bad(obs: &[F2Observation], target_mhz: u32, anchor_mv: u32) -> bool {
-    obs.iter()
-        .any(|o| {
-            o.target_mhz == target_mhz
-                && o.evidence_kind != F2EvidenceKind::ApplyQualification
-                && o.outcome.is_bad()
-                && o.anchor_mv >= anchor_mv
-        })
+    obs.iter().any(|o| {
+        o.target_mhz == target_mhz
+            && o.evidence_kind != F2EvidenceKind::ApplyQualification
+            && is_voltage_boundary_failure(obs, o)
+            && o.anchor_mv >= anchor_mv
+    })
 }
 
 /// The validated descent baseline for chained same-target descent: the DEEPEST (lowest-voltage,
@@ -861,8 +1067,7 @@ fn frontier_entry_from_best(
         .filter(|pattern| {
             evidence_at_best.iter().any(|o| {
                 is_current_qualification_pass(o)
-                    && o.qualification_coverage.as_ref().and_then(|c| c.pattern)
-                        == Some(*pattern)
+                    && o.qualification_coverage.as_ref().and_then(|c| c.pattern) == Some(*pattern)
             })
         })
         .count();
@@ -893,6 +1098,12 @@ fn frontier_entry_from_best(
     }
 }
 
+fn required_exact_apply_pattern_index(pattern: F2QualificationPattern) -> Option<usize> {
+    REQUIRED_EXACT_APPLY_PATTERNS
+        .iter()
+        .position(|required| *required == pattern)
+}
+
 fn discovery_frontier_candidates(
     obs: &[F2Observation],
     target_mhz: u32,
@@ -913,7 +1124,10 @@ fn discovery_frontier_candidates(
 /// Build one physical discovery frontier entry for a target. This deliberately preserves the
 /// deepest current Discovery pass even when its qualification is still inconclusive; callers that
 /// publish profiles must use [`qualified_frontier_entry_for_target`] instead.
-pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<F2FrontierEntry> {
+pub fn frontier_entry_for_target(
+    obs: &[F2Observation],
+    target_mhz: u32,
+) -> Option<F2FrontierEntry> {
     let best = discovery_frontier_candidates(obs, target_mhz).min_by_key(|o| o.anchor_mv)?;
     Some(frontier_entry_from_best(obs, target_mhz, best))
 }
@@ -932,7 +1146,10 @@ pub fn qualified_frontier_entry_for_target(
                     qualification.target_mhz == target_mhz
                         && qualification.anchor_mv == candidate.anchor_mv
                         && is_current_qualification_pass(qualification)
-                        && qualification.qualification_coverage.as_ref().and_then(|c| c.pattern)
+                        && qualification
+                            .qualification_coverage
+                            .as_ref()
+                            .and_then(|c| c.pattern)
                             == Some(pattern)
                 })
             })
@@ -965,10 +1182,7 @@ pub fn learned_frontier_for_gpu(obs: &[F2Observation], gpu_key: &str) -> Vec<F2F
 
 /// Build the profile-publication projection for one exact physical GPU. The physical discovery
 /// frontier remains available through [`learned_frontier_for_gpu`].
-pub fn qualified_frontier_for_gpu(
-    obs: &[F2Observation],
-    gpu_key: &str,
-) -> Vec<F2FrontierEntry> {
+pub fn qualified_frontier_for_gpu(obs: &[F2Observation], gpu_key: &str) -> Vec<F2FrontierEntry> {
     let scoped: Vec<F2Observation> = obs
         .iter()
         .filter(|o| o.gpu_key.as_deref() == Some(gpu_key))
@@ -983,6 +1197,74 @@ pub fn qualified_frontier_for_gpu(
         .collect()
 }
 
+/// Project a measured, qualified frontier whose voltage never decreases as target clock rises.
+/// For each target, selects the lowest-voltage current Discovery candidate that has current
+/// qualification at that exact pair and is not below the previously selected anchor. Equal-voltage
+/// plateaus are valid. If no measured candidate satisfies the monotonic floor, the target is omitted;
+/// this projection never fabricates or relabels a voltage point.
+pub fn monotonic_qualified_frontier_for_gpu(
+    obs: &[F2Observation],
+    gpu_key: &str,
+) -> Vec<F2FrontierEntry> {
+    let scoped: Vec<F2Observation> = obs
+        .iter()
+        .filter(|o| o.gpu_key.as_deref() == Some(gpu_key))
+        .cloned()
+        .collect();
+    let mut targets: Vec<u32> = scoped.iter().map(|o| o.target_mhz).collect();
+    targets.sort_unstable();
+    targets.dedup();
+
+    let mut minimum_anchor_mv = None;
+    let mut frontier = Vec::new();
+    for target_mhz in targets {
+        let best = discovery_frontier_candidates(&scoped, target_mhz)
+            .filter(|candidate| {
+                minimum_anchor_mv.is_none_or(|minimum| candidate.anchor_mv >= minimum)
+            })
+            .filter(|candidate| {
+                REQUIRED_QUALIFICATION_PATTERNS.into_iter().all(|pattern| {
+                    scoped.iter().any(|qualification| {
+                        qualification.target_mhz == target_mhz
+                            && qualification.anchor_mv == candidate.anchor_mv
+                            && is_current_qualification_pass(qualification)
+                            && qualification
+                                .qualification_coverage
+                                .as_ref()
+                                .and_then(|coverage| coverage.pattern)
+                                == Some(pattern)
+                    })
+                })
+            })
+            .min_by_key(|candidate| candidate.anchor_mv);
+        if let Some(best) = best {
+            minimum_anchor_mv = Some(best.anchor_mv);
+            frontier.push(frontier_entry_from_best(&scoped, target_mhz, best));
+        }
+    }
+    frontier
+}
+
+/// Return the first physical voltage-order inversion in a frontier. As target clock rises, the
+/// minimum qualified voltage may stay flat or rise, but it must never fall. Equal-voltage plateaus
+/// remain valid measured evidence; a higher clock at a lower voltage means at least one target is
+/// stale/contradictory and profile synthesis must fail closed until discovery reconciles it.
+pub fn frontier_voltage_order_violation(
+    frontier: &[F2FrontierEntry],
+) -> Option<(u32, u32, u32, u32)> {
+    frontier.iter().find_map(|lower| {
+        frontier.iter().find_map(|higher| {
+            (higher.target_mhz > lower.target_mhz && higher.best_anchor_mv < lower.best_anchor_mv)
+                .then_some((
+                    lower.target_mhz,
+                    lower.best_anchor_mv,
+                    higher.target_mhz,
+                    higher.best_anchor_mv,
+                ))
+        })
+    })
+}
+
 /// Bridge ONE learned frontier entry to the canonical telemetry point the existing GPU profile
 /// classifiers (`synthesize_forge_profiles`) consume, paired with its confidence. F2 RAISES a
 /// lower-voltage bin (true undervolt), so the apply axis `vf_table_voltage_mv` is that LOWER anchor bin
@@ -993,7 +1275,9 @@ pub fn to_power_sweep_point(entry: &F2FrontierEntry) -> (PowerSweepPoint, f64) {
     let clock = entry.avg_clock_mhz.unwrap_or(entry.target_mhz);
     let power = entry.watts.unwrap_or(0) as f32;
     let max_power = entry.max_watts.unwrap_or(entry.watts.unwrap_or(0)) as f32;
-    let power_p99 = entry.power_p99_w.filter(|power| power.is_finite() && *power > 0.0);
+    let power_p99 = entry
+        .power_p99_w
+        .filter(|power| power.is_finite() && *power > 0.0);
     let sustained_clock = entry.sustained_clock_mhz.unwrap_or(clock);
     let perf_per_watt = if let Some(power_p99) = power_p99 {
         sustained_clock as f64 / power_p99 as f64
@@ -1079,12 +1363,10 @@ pub const F2_APPLY_CLOCK_HOLD_TOL_MHZ: u32 = 0;
 /// the point ran at its real operating clock/power, so the reading stands. Fails closed when the
 /// sustained clock is unknown. Mirrors the held-clock rule in `classify_f2_stress_dwell`; power
 /// discovery/calibration keep the stricter unconditional `!thermal_throttled`.
-fn apply_qual_reading_trustworthy(o: &F2Observation, target_mhz: u32) -> bool {
-    if !o.thermal_throttled {
-        return true;
-    }
-    o.sustained_clock_mhz
-        .is_some_and(|held| held + F2_APPLY_CLOCK_HOLD_TOL_MHZ >= target_mhz)
+fn apply_qual_reading_trustworthy(o: &F2Observation, _target_mhz: u32) -> bool {
+    // v33 qualification already verifies heavy phases individually. Aggregate p5 includes idle
+    // and cannot diagnose thermal clock loss independently of those phase measurements.
+    is_current_apply_qualification_evidence(o)
 }
 
 /// Highest sustained p99 measured by the complete, reset-clean current required set at one exact Apply
@@ -1148,10 +1430,8 @@ pub fn current_apply_qualification_p99_at_anchor(
     apply_qualification_p99_at_anchor(obs, Some(run_id), target_mhz, anchor_mv, gpu_key)
 }
 
-/// Highest sustained p99 from a complete exact-Apply gate: every required detector plus the
-/// continuous Endurance proof must have passed reset-clean in the same run. Unlike the legacy
-/// required-set helper above, this intentionally lets Endurance raise the power used for profile
-/// selection and publication.
+/// Highest sustained p99 from a complete exact-Apply gate: Vulkan, DX11 v3, DX12 and continuous
+/// Endurance must have passed reset-clean in the same run.
 fn complete_apply_gate_p99_at_anchor(
     obs: &[F2Observation],
     run_id: Option<&str>,
@@ -1161,7 +1441,7 @@ fn complete_apply_gate_p99_at_anchor(
 ) -> Option<f32> {
     let mut runs = std::collections::BTreeMap::<
         &str,
-        ([bool; REQUIRED_QUALIFICATION_PATTERNS.len()], bool, f32),
+        ([bool; REQUIRED_EXACT_APPLY_PATTERNS.len()], f32),
     >::new();
     for observation in obs.iter().filter(|o| {
         run_id.is_none_or(|expected| o.run_id == expected)
@@ -1182,23 +1462,19 @@ fn complete_apply_gate_p99_at_anchor(
         else {
             continue;
         };
-        let entry = runs.entry(observation.run_id.as_str()).or_insert((
-            [false; REQUIRED_QUALIFICATION_PATTERNS.len()],
-            false,
-            0.0,
-        ));
-        if let Some(index) = required_pattern_index(pattern) {
+        let entry = runs
+            .entry(observation.run_id.as_str())
+            .or_insert(([false; REQUIRED_EXACT_APPLY_PATTERNS.len()], 0.0));
+        if let Some(index) = required_exact_apply_pattern_index(pattern) {
             entry.0[index] = true;
-        } else if pattern == F2QualificationPattern::Endurance {
-            entry.1 = true;
         } else {
             continue;
         }
-        entry.2 = entry.2.max(observation.power_p99_w.unwrap_or(0.0));
+        entry.1 = entry.1.max(observation.power_p99_w.unwrap_or(0.0));
     }
     runs.into_values()
-        .filter(|(seen, endurance, _)| seen.iter().all(|present| *present) && *endurance)
-        .map(|(_, _, power)| power)
+        .filter(|(seen, _)| seen.iter().all(|present| *present))
+        .map(|(_, power)| power)
         .max_by(f32::total_cmp)
 }
 
@@ -1259,35 +1535,70 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
     (seen.iter().all(|present| *present) && highest > 0).then_some(highest)
 }
 
-/// True when the CURRENT run's candidate-only stress gate validated cleanly at this exact
-/// `(target_mhz, apply_mv)` pair on this GPU — v24 requires the continuous Endurance soak after the
-/// required exact-Apply Texture Hop v13 pattern. DX11 and TransitionShock remain readable legacy
-/// evidence but no longer gate publication because they never rejected a collected candidate.
+/// True when the CURRENT run's complete candidate-only stress gate validated cleanly at this exact
+/// `(target_mhz, apply_mv)` pair on this GPU: Vulkan Texture Hop, DX11 v3, DX12 and Endurance.
 /// These gates only TIGHTEN Apply — they are not part of [`REQUIRED_QUALIFICATION_PATTERNS`] and
 /// never touch the frontier descent. They still share the current qualification contract and full
 /// reproducibility/cleanup requirements; the publish gate is also run_id-scoped. Fail closed:
 /// legacy, incomplete or absent evidence reads `false` and can never publish.
-pub fn point_has_current_endurance_qualification(
+pub fn point_has_current_exact_apply_qualification(
     obs: &[F2Observation],
     run_id: &str,
     target_mhz: u32,
     apply_mv: u32,
     gpu_key: &str,
 ) -> bool {
-    [F2QualificationPattern::Endurance]
-        .iter()
-        .all(|required| {
-            obs.iter().any(|o| {
-                o.run_id == run_id
-                    && o.target_mhz == target_mhz
-                    && o.anchor_mv == apply_mv
-                    && o.gpu_key.as_deref() == Some(gpu_key)
-                    && is_current_apply_qualification_evidence(o)
-                    && o.qualification_coverage.as_ref().is_some_and(|coverage| {
-                        coverage.pattern == Some(*required)
-                    })
-            })
-        })
+    point_has_n_current_exact_apply_qualifications(obs, run_id, target_mhz, apply_mv, gpu_key, 1)
+}
+
+/// True when at least `required_matrices` complete exact-Apply matrices were persisted by the
+/// CURRENT run at this exact pair/GPU. Evidence is consumed in append order and must complete the
+/// declared DX11 → Vulkan → DX12 → Endurance sequence; duplicated/retried lanes inside one ladder
+/// cannot masquerade as another matrix. Zero is rejected because every publish/re-proof path must
+/// require positive evidence.
+pub fn point_has_n_current_exact_apply_qualifications(
+    obs: &[F2Observation],
+    run_id: &str,
+    target_mhz: u32,
+    apply_mv: u32,
+    gpu_key: &str,
+    required_matrices: u32,
+) -> bool {
+    if required_matrices == 0 {
+        return false;
+    }
+    let mut next_pattern = 0usize;
+    let mut complete_matrices = 0u32;
+    for o in obs.iter().filter(|o| {
+        o.run_id == run_id
+            && o.target_mhz == target_mhz
+            && o.anchor_mv == apply_mv
+            && o.gpu_key.as_deref() == Some(gpu_key)
+            && is_current_apply_qualification_evidence(o)
+    }) {
+        let Some(pattern) = o
+            .qualification_coverage
+            .as_ref()
+            .and_then(|coverage| coverage.pattern)
+        else {
+            continue;
+        };
+        if pattern == REQUIRED_EXACT_APPLY_PATTERNS[next_pattern] {
+            next_pattern += 1;
+            if next_pattern == REQUIRED_EXACT_APPLY_PATTERNS.len() {
+                complete_matrices = complete_matrices.saturating_add(1);
+                if complete_matrices >= required_matrices {
+                    return true;
+                }
+                next_pattern = 0;
+            }
+        } else if pattern == REQUIRED_EXACT_APPLY_PATTERNS[0] {
+            // A new DX11 lane starts a new matrix; abandon any incomplete prior ladder. Repeated
+            // DX11 retries simply keep the cursor at the first completed lane.
+            next_pattern = 1;
+        }
+    }
+    false
 }
 
 /// WORST-CASE measured power (max of p99 and peak) across ALL of the CURRENT run's validated
@@ -1342,15 +1653,24 @@ pub fn qualification_failure_histogram(
 ) -> std::collections::BTreeMap<(u32, u32, String, String), u32> {
     let mut histogram = std::collections::BTreeMap::new();
     for observation in obs {
-        let Some(coverage) = observation.qualification_coverage.as_ref() else { continue };
+        let Some(coverage) = observation.qualification_coverage.as_ref() else {
+            continue;
+        };
         // `failure_phase` is recorded only when a phase actually failed.
-        let Some(phase) = coverage.failure_phase.clone() else { continue };
+        let Some(phase) = coverage.failure_phase.clone() else {
+            continue;
+        };
         let pattern = coverage
             .pattern
             .map(|pattern| format!("{pattern:?}"))
             .unwrap_or_else(|| "legacy".to_string());
         *histogram
-            .entry((observation.target_mhz, observation.anchor_mv, pattern, phase))
+            .entry((
+                observation.target_mhz,
+                observation.anchor_mv,
+                pattern,
+                phase,
+            ))
             .or_insert(0u32) += 1;
     }
     histogram
@@ -1374,7 +1694,9 @@ pub struct F2ObservationStore {
 impl F2ObservationStore {
     /// The machine-wide store under `default_data_dir()` (`%ProgramData%/Nidavellir`).
     pub fn system() -> Self {
-        Self { base: default_data_dir() }
+        Self {
+            base: default_data_dir(),
+        }
     }
 
     /// A store rooted at an explicit base directory (used by tests).
@@ -1398,7 +1720,10 @@ impl F2ObservationStore {
         let line = serde_json::to_string(obs)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.path())?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path())?;
         writeln!(f, "{line}")
     }
 
@@ -1410,9 +1735,52 @@ impl F2ObservationStore {
         }
     }
 
+    /// Strict load for safety-critical decisions. A missing log is an empty history, but every
+    /// other read error and every malformed non-empty JSONL line is returned to the caller.
+    pub fn load_all_checked(&self) -> std::io::Result<Vec<F2Observation>> {
+        let path = self.path();
+        let data = match std::fs::read_to_string(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to read F2 observation log {}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+
+        let mut observations = Vec::new();
+        for (line_index, line) in data.lines().enumerate() {
+            let line = line.trim_start_matches('\u{feff}').trim();
+            if line.is_empty() {
+                continue;
+            }
+            observations.push(
+                serde_json::from_str::<F2Observation>(line).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid F2 observation JSONL at {} line {}: {error}",
+                            path.display(),
+                            line_index + 1
+                        ),
+                    )
+                })?,
+            );
+        }
+        Ok(observations)
+    }
+
     /// All observations for a target.
     pub fn query_by_target(&self, target_mhz: u32) -> Vec<F2Observation> {
-        self.load_all().into_iter().filter(|o| o.target_mhz == target_mhz).collect()
+        self.load_all()
+            .into_iter()
+            .filter(|o| o.target_mhz == target_mhz)
+            .collect()
     }
 
     /// Observations for one target on one exact physical GPU.
@@ -1454,6 +1822,7 @@ mod tests {
 
     fn obs(target: u32, anchor: u32, outcome: F2ObsOutcome) -> F2Observation {
         F2Observation {
+            inconclusive_reason: None,
             run_id: "run-test".into(),
             timestamp: "2026-06-21T00:00:00Z".into(),
             gpu_key: Some("RTX 3060 Ti".into()),
@@ -1485,6 +1854,7 @@ mod tests {
             avg_clock_mhz: Some(target + 15),
             sustained_clock_mhz: Some(target + 15),
             sustained_upper_clock_mhz: Some(target + 15),
+            max_clock_mhz: Some(target + 15),
             watts: Some(180),
             max_watts: Some(188),
             power_p99_w: Some(186.0),
@@ -1526,8 +1896,9 @@ mod tests {
     ) -> F2Observation {
         o.evidence_kind = F2EvidenceKind::Qualification;
         o.discovery_contract_version = None;
-        o.qualification_contract_version = Some(F2_QUALIFICATION_CONTRACT_VERSION);
+        o.qualification_contract_version = Some(F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION);
         o.qualification_coverage = Some(F2QualificationCoverage {
+            active_target: None,
             strength: F2QualificationStrength::Fsgl4,
             pattern: Some(pattern),
             pass_index: match pattern {
@@ -1540,6 +1911,7 @@ mod tests {
                 F2QualificationPattern::Endurance => 5,
                 F2QualificationPattern::TransitionShock => 6,
                 F2QualificationPattern::Dx11Game => 7,
+                F2QualificationPattern::Dx12Game => 8,
             },
             verdict: F2QualificationVerdict::Pass,
             phases_completed: 8,
@@ -1563,8 +1935,65 @@ mod tests {
     ) -> F2Observation {
         let mut o = qualification_pass_with_pattern(o, pattern);
         o.evidence_kind = F2EvidenceKind::ApplyQualification;
+        o.qualification_contract_version = Some(F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION);
         o.mode = F2ObsMode::ApplyQualification;
+        if pattern == F2QualificationPattern::Dx11Game {
+            o.qualification_coverage.as_mut().unwrap().active_target = Some(F2ActiveTargetCoverage {
+                observed_active_ms: 80_000, target_active_ms: 40_000, power_limited_active_ms: 0, required_target_ms: 30_000,
+                sample_count: 3000, phases_completed: 5, upper_clock_exceeded: false, heavy_target_proven: true,
+                diagnostics: None,
+            });
+        }
         o
+    }
+
+    #[test]
+    fn clock_envelope_requires_absolute_peak_and_never_promotes_nominal_target() {
+        let discovery = obs(1800,900,F2ObsOutcome::Validated);
+        let frontier = qualification_pass(discovery.clone());
+        let apply = apply_qualification_pass(discovery.clone(),F2QualificationPattern::Texture);
+        assert!(is_current_discovery_evidence(&discovery));
+        assert!(is_current_qualification_pass(&frontier));
+        assert!(is_current_apply_qualification_pass(&apply));
+        for original in [discovery,frontier,apply] {
+            let restored: F2Observation = serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
+            assert_eq!(restored.target_mhz,1800);
+            assert_eq!(restored.max_clock_mhz,Some(1815));
+            for peak in [None,Some(0),Some(1816),Some(1830)] {
+                let mut invalid=original.clone();
+                invalid.max_clock_mhz=peak;
+                invalid.sustained_upper_clock_mhz=Some(1800);
+                assert!(!is_current_discovery_evidence(&invalid));
+                assert!(!is_current_qualification_pass(&invalid));
+                assert!(!is_current_apply_qualification_pass(&invalid));
+            }
+        }
+    }
+    #[test]
+    fn dx11_active_proof_is_required_after_serialization() {
+        let mut pass = apply_qualification_pass(obs(1800, 900, F2ObsOutcome::Validated), F2QualificationPattern::Dx11Game);
+        assert!(is_current_apply_qualification_evidence(&pass));
+        pass.qualification_coverage.as_mut().unwrap().active_target = None;
+        let restored: F2Observation = serde_json::from_str(&serde_json::to_string(&pass).unwrap()).unwrap();
+        assert!(!is_current_apply_qualification_evidence(&restored), "a Pass label cannot replace active exposure proof");
+        let coverage = F2ActiveTargetCoverage {
+            observed_active_ms:80_000, target_active_ms:40_000, power_limited_active_ms: 0, required_target_ms:30_000,
+            sample_count:3000, phases_completed:5, upper_clock_exceeded: false, heavy_target_proven: true,
+            diagnostics: None,
+        };
+        let loaded: F2ActiveTargetCoverage = serde_json::from_str(&serde_json::to_string(&coverage).unwrap()).unwrap();
+        assert!(loaded.proves_target());
+        let mut legacy = serde_json::to_value(&coverage).unwrap();
+        legacy.as_object_mut().unwrap().remove("diagnostics");
+        let legacy: F2ActiveTargetCoverage = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.proves_target(), "diagnostic additions do not erase existing v31 evidence");
+        for bad in [
+            F2ActiveTargetCoverage {target_active_ms:0,..loaded.clone()},
+            F2ActiveTargetCoverage {target_active_ms:90_000,..loaded.clone()},
+            F2ActiveTargetCoverage {sample_count:0,..loaded.clone()},
+            F2ActiveTargetCoverage {required_target_ms:1,..loaded.clone()},
+            F2ActiveTargetCoverage {upper_clock_exceeded: true, heavy_target_proven: true,..loaded.clone()},
+        ] { assert!(!bad.proves_target()); }
     }
 
     fn legacy_fsgl2_qualification_pass(o: F2Observation) -> F2Observation {
@@ -1590,13 +2019,24 @@ mod tests {
         let mut deeper_qual_fail = obs(t, 962, F2ObsOutcome::Unstable);
         deeper_qual_fail.evidence_kind = F2EvidenceKind::Qualification;
         deeper_qual_fail.discovery_contract_version = None;
-        deeper_qual_fail.qualification_contract_version = Some(F2_QUALIFICATION_CONTRACT_VERSION);
+        deeper_qual_fail.qualification_contract_version =
+            Some(F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION);
         v.push(deeper_qual_fail);
 
         let entry = frontier_entry_for_target(&v, t).expect("a qualified frontier point exists");
-        assert_eq!(entry.best_anchor_mv, 968, "deepest QUALIFIED bin, not the rejected 962");
-        assert!(entry.validation_count >= 1, "selected point carries its qualification pass");
-        assert_eq!(entry.first_bad_mv, Some(962), "the rejected deeper bin bounds the frontier");
+        assert_eq!(
+            entry.best_anchor_mv, 968,
+            "deepest QUALIFIED bin, not the rejected 962"
+        );
+        assert!(
+            entry.validation_count >= 1,
+            "selected point carries its qualification pass"
+        );
+        assert_eq!(
+            entry.first_bad_mv,
+            Some(962),
+            "the rejected deeper bin bounds the frontier"
+        );
     }
 
     #[test]
@@ -1677,6 +2117,17 @@ mod tests {
     }
 
     #[test]
+    fn current_clock_drop_and_contaminated_failure_are_not_nominal_instability() {
+        let mut candidate=obs(1800,875,F2ObsOutcome::ClockDrop);
+        assert!(first_bad_for_target(&[candidate.clone()],1800).is_none());
+        candidate.outcome=F2ObsOutcome::SilentError;
+        candidate.inconclusive_reason=Some("control_failure_outside_requested_pair".into());
+        assert!(!is_known_bad(&[candidate.clone()],1800,875));
+        candidate.inconclusive_reason=None;
+        assert!(is_known_bad(&[candidate],1800,875));
+    }
+
+    #[test]
     fn is_known_bad_is_conservative_downward() {
         let v = vec![obs(1800, 956, F2ObsOutcome::Unstable)];
         // The exact failed voltage and anything LOWER is known bad.
@@ -1686,6 +2137,54 @@ mod tests {
         assert!(!is_known_bad(&v, 1800, 962));
         // Different target is unaffected.
         assert!(!is_known_bad(&v, 1815, 956));
+    }
+
+    #[test]
+    fn harder_qualified_lower_voltage_reopens_only_clock_drop_boundary() {
+        let mut clock_drop = obs(1815, 968, F2ObsOutcome::ClockDrop);
+        clock_drop.discovery_contract_version = Some(F2_DISCOVERY_CONTRACT_VERSION - 1);
+        assert_eq!(
+            first_bad_for_target(std::slice::from_ref(&clock_drop), 1815).map(|bad| bad.anchor_mv),
+            Some(968)
+        );
+
+        let harder_discovery = obs(1935, 906, F2ObsOutcome::Validated);
+        let harder_qualification = qualification_pass(harder_discovery.clone());
+        let reconciled = [
+            clock_drop,
+            harder_discovery.clone(),
+            harder_qualification.clone(),
+        ];
+        assert!(first_bad_for_target(&reconciled, 1815).is_none());
+        assert!(!is_known_bad(&reconciled, 1815, 900));
+
+        let silent_error = obs(1815, 968, F2ObsOutcome::SilentError);
+        let physical_failure = [silent_error, harder_discovery, harder_qualification];
+        assert_eq!(
+            first_bad_for_target(&physical_failure, 1815).map(|bad| bad.anchor_mv),
+            Some(968),
+            "a harder pass must never erase direct instability evidence"
+        );
+    }
+
+    #[test]
+    fn same_target_lower_qualified_pair_reopens_only_clock_drop_boundary() {
+        let mut clock_drop = obs(1815, 968, F2ObsOutcome::ClockDrop);
+        clock_drop.discovery_contract_version = Some(F2_DISCOVERY_CONTRACT_VERSION - 1);
+        let lower_discovery = obs(1815, 962, F2ObsOutcome::Validated);
+        let lower_qualification = qualification_pass(lower_discovery.clone());
+        let reconciled = [clock_drop.clone(), lower_discovery, lower_qualification];
+        assert!(first_bad_for_target(&reconciled, 1815).is_none());
+        assert!(!is_known_bad(&reconciled, 1815, 950));
+
+        let equal_discovery = obs(1815, 968, F2ObsOutcome::Validated);
+        let equal_qualification = qualification_pass(equal_discovery.clone());
+        let not_strictly_lower = [clock_drop, equal_discovery, equal_qualification];
+        assert_eq!(
+            first_bad_for_target(&not_strictly_lower, 1815).map(|bad| bad.anchor_mv),
+            Some(968),
+            "same-target domination requires a strictly lower voltage"
+        );
     }
 
     #[test]
@@ -1710,17 +2209,29 @@ mod tests {
         aborted.boot_flag_cleared = true;
         aborted.unstable = false;
         let v = vec![obs(1800, 975, F2ObsOutcome::Validated), aborted];
-        assert_eq!(validated_descent_baseline(&v, 1800, None).unwrap().anchor_mv, 975);
+        assert_eq!(
+            validated_descent_baseline(&v, 1800, None)
+                .unwrap()
+                .anchor_mv,
+            975
+        );
         // A validated point on a DIFFERENT GPU must not bound this GPU's descent.
         let mut other_gpu = obs(1800, 962, F2ObsOutcome::Validated);
         other_gpu.gpu_key = Some("RTX 4090".into());
         let v2 = vec![obs(1800, 975, F2ObsOutcome::Validated), other_gpu];
         assert_eq!(
-            validated_descent_baseline(&v2, 1800, Some("RTX 3060 Ti")).unwrap().anchor_mv,
+            validated_descent_baseline(&v2, 1800, Some("RTX 3060 Ti"))
+                .unwrap()
+                .anchor_mv,
             975
         );
         // Unfiltered (gpu_key None) sees both → deepest wins.
-        assert_eq!(validated_descent_baseline(&v2, 1800, None).unwrap().anchor_mv, 962);
+        assert_eq!(
+            validated_descent_baseline(&v2, 1800, None)
+                .unwrap()
+                .anchor_mv,
+            962
+        );
     }
 
     #[test]
@@ -1729,7 +2240,12 @@ mod tests {
         let mut dirty = obs(1800, 962, F2ObsOutcome::Validated);
         dirty.boot_flag_cleared = false;
         let v = vec![obs(1800, 975, F2ObsOutcome::Validated), dirty];
-        assert_eq!(validated_descent_baseline(&v, 1800, None).unwrap().anchor_mv, 975);
+        assert_eq!(
+            validated_descent_baseline(&v, 1800, None)
+                .unwrap()
+                .anchor_mv,
+            975
+        );
     }
 
     #[test]
@@ -1781,7 +2297,10 @@ mod tests {
         ];
         let fr = learned_frontier(&v);
         // Two targets have a validated point (1800, 1815); 1830 has none → excluded.
-        assert_eq!(fr.iter().map(|e| e.target_mhz).collect::<Vec<_>>(), vec![1800, 1815]);
+        assert_eq!(
+            fr.iter().map(|e| e.target_mhz).collect::<Vec<_>>(),
+            vec![1800, 1815]
+        );
         let e1800 = &fr[0];
         assert_eq!(e1800.best_anchor_mv, 962); // lowest validated
         assert_eq!(e1800.first_bad_mv, Some(956));
@@ -1796,17 +2315,19 @@ mod tests {
         let discovery = obs(1800, 962, F2ObsOutcome::Validated);
         let mut inconclusive = qualification_pass(discovery.clone());
         inconclusive.outcome = F2ObsOutcome::QualificationInconclusive;
-        inconclusive.qualification_coverage.as_mut().unwrap().verdict =
-            F2QualificationVerdict::Inconclusive;
+        inconclusive
+            .qualification_coverage
+            .as_mut()
+            .unwrap()
+            .verdict = F2QualificationVerdict::Inconclusive;
         let mut old_pass = qualification_pass(discovery.clone());
-        old_pass.qualification_contract_version = Some(F2_QUALIFICATION_CONTRACT_VERSION - 1);
+        old_pass.qualification_contract_version =
+            Some(F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION - 1);
         let current_pass = qualification_pass(discovery.clone());
 
-        let entry = frontier_entry_for_target(
-            &[discovery, inconclusive, old_pass, current_pass],
-            1800,
-        )
-        .unwrap();
+        let entry =
+            frontier_entry_for_target(&[discovery, inconclusive, old_pass, current_pass], 1800)
+                .unwrap();
         assert_eq!(entry.best_anchor_mv, 962);
         assert_eq!(entry.validation_count, 1);
     }
@@ -1819,8 +2340,11 @@ mod tests {
         let deeper_discovery = obs(target, 931, F2ObsOutcome::Validated);
         let mut deeper_inconclusive = qualification_pass(deeper_discovery.clone());
         deeper_inconclusive.outcome = F2ObsOutcome::QualificationInconclusive;
-        deeper_inconclusive.qualification_coverage.as_mut().unwrap().verdict =
-            F2QualificationVerdict::Inconclusive;
+        deeper_inconclusive
+            .qualification_coverage
+            .as_mut()
+            .unwrap()
+            .verdict = F2QualificationVerdict::Inconclusive;
 
         let observations = [
             qualified_discovery,
@@ -1859,17 +2383,103 @@ mod tests {
     }
 
     #[test]
+    fn monotonic_qualified_frontier_uses_measured_shallower_alternative() {
+        let low = obs(1695, 887, F2ObsOutcome::Validated);
+        let high_deep = obs(1710, 881, F2ObsOutcome::Validated);
+        let high_monotonic = obs(1710, 887, F2ObsOutcome::Validated);
+        let observations = [
+            low.clone(),
+            qualification_pass(low),
+            high_deep.clone(),
+            qualification_pass(high_deep),
+            high_monotonic.clone(),
+            qualification_pass(high_monotonic),
+        ];
+
+        let frontier = monotonic_qualified_frontier_for_gpu(&observations, "RTX 3060 Ti");
+        assert_eq!(
+            frontier
+                .iter()
+                .map(|entry| (entry.target_mhz, entry.best_anchor_mv))
+                .collect::<Vec<_>>(),
+            vec![(1695, 887), (1710, 887)]
+        );
+    }
+
+    #[test]
+    fn monotonic_qualified_frontier_allows_measured_plateau() {
+        let low = obs(1695, 887, F2ObsOutcome::Validated);
+        let high = obs(1710, 887, F2ObsOutcome::Validated);
+        let observations = [
+            low.clone(),
+            qualification_pass(low),
+            high.clone(),
+            qualification_pass(high),
+        ];
+
+        let frontier = monotonic_qualified_frontier_for_gpu(&observations, "RTX 3060 Ti");
+        assert_eq!(
+            frontier
+                .iter()
+                .map(|entry| (entry.target_mhz, entry.best_anchor_mv))
+                .collect::<Vec<_>>(),
+            vec![(1695, 887), (1710, 887)]
+        );
+    }
+
+    #[test]
+    fn monotonic_qualified_frontier_omits_target_without_measured_alternative() {
+        let low = obs(1695, 887, F2ObsOutcome::Validated);
+        let inverted_only = obs(1710, 881, F2ObsOutcome::Validated);
+        let later = obs(1725, 893, F2ObsOutcome::Validated);
+        let observations = [
+            low.clone(),
+            qualification_pass(low),
+            inverted_only.clone(),
+            qualification_pass(inverted_only),
+            later.clone(),
+            qualification_pass(later),
+        ];
+
+        let frontier = monotonic_qualified_frontier_for_gpu(&observations, "RTX 3060 Ti");
+        assert_eq!(
+            frontier
+                .iter()
+                .map(|entry| (entry.target_mhz, entry.best_anchor_mv))
+                .collect::<Vec<_>>(),
+            vec![(1695, 887), (1725, 893)],
+            "a missing compatible measurement is omitted, never synthesized"
+        );
+    }
+
+    #[test]
+    fn frontier_voltage_order_allows_plateau_but_rejects_inversion() {
+        let entry = |target_mhz, best_anchor_mv| {
+            let discovery = obs(target_mhz, best_anchor_mv, F2ObsOutcome::Validated);
+            let qualification = qualification_pass(discovery.clone());
+            qualified_frontier_entry_for_target(&[discovery, qualification], target_mhz).unwrap()
+        };
+        let plateau = [entry(1815, 975), entry(1860, 975), entry(1875, 981)];
+        assert_eq!(frontier_voltage_order_violation(&plateau), None);
+
+        let inverted = [entry(1815, 975), entry(1875, 975), entry(1935, 906)];
+        assert_eq!(
+            frontier_voltage_order_violation(&inverted),
+            Some((1815, 975, 1935, 906))
+        );
+    }
+
+    #[test]
     fn learned_frontier_ignores_legacy_strengths_for_apply_qualification() {
         let discovery = obs(1800, 962, F2ObsOutcome::Validated);
         let mut fsgl1 = qualification_pass(discovery.clone());
-        fsgl1.qualification_coverage.as_mut().unwrap().strength =
-            F2QualificationStrength::Fsgl1;
+        fsgl1.qualification_coverage.as_mut().unwrap().strength = F2QualificationStrength::Fsgl1;
         fsgl1.qualification_coverage.as_mut().unwrap().pattern = None;
         let fsgl2 = legacy_fsgl2_qualification_pass(discovery.clone());
         let current_fsgl3 = qualification_pass(discovery.clone());
 
-        let entry = frontier_entry_for_target(&[discovery, fsgl1, fsgl2, current_fsgl3], 1800)
-            .unwrap();
+        let entry =
+            frontier_entry_for_target(&[discovery, fsgl1, fsgl2, current_fsgl3], 1800).unwrap();
         assert_eq!(entry.best_anchor_mv, 962);
         assert_eq!(entry.validation_count, 1);
     }
@@ -1912,8 +2522,11 @@ mod tests {
             obs(1800, 893, F2ObsOutcome::SilentError),
             F2QualificationPattern::Texture,
         );
-        apply_failure.qualification_coverage.as_mut().unwrap().verdict =
-            F2QualificationVerdict::Fail;
+        apply_failure
+            .qualification_coverage
+            .as_mut()
+            .unwrap()
+            .verdict = F2QualificationVerdict::Fail;
         let observations = [discovery, apply_pass, apply_failure];
         assert_eq!(
             last_discovery_good_for_target(&observations, 1800)
@@ -1922,6 +2535,41 @@ mod tests {
             881
         );
         assert!(first_bad_for_target(&observations, 1800).is_none());
+    }
+
+    #[test]
+    fn frontier_v28_and_exact_apply_v29_are_independently_current() {
+        let discovery = obs(1800, 881, F2ObsOutcome::Validated);
+        let frontier = qualification_pass(discovery.clone());
+        assert_eq!(
+            F2_QUALIFICATION_CONTRACT_VERSION,
+            F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION
+        );
+        assert_eq!(
+            frontier.qualification_contract_version,
+            Some(F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION)
+        );
+        assert!(is_current_qualification_pass(&frontier));
+
+        let exact = apply_qualification_pass(discovery.clone(), F2QualificationPattern::Texture);
+        assert_eq!(
+            exact.qualification_contract_version,
+            Some(F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION)
+        );
+        assert!(is_current_apply_qualification_pass(&exact));
+
+        let exact_dx11 = apply_qualification_pass(discovery, F2QualificationPattern::Dx11Game);
+        assert!(is_current_apply_qualification_evidence(&exact_dx11));
+
+        let mut pre_v29_exact = exact.clone();
+        pre_v29_exact.qualification_contract_version =
+            Some(F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION);
+        assert!(!is_current_apply_qualification_pass(&pre_v29_exact));
+
+        let mut exact_version_on_frontier = frontier;
+        exact_version_on_frontier.qualification_contract_version =
+            Some(F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION);
+        assert!(!is_current_qualification_pass(&exact_version_on_frontier));
     }
 
     #[test]
@@ -1951,7 +2599,7 @@ mod tests {
         assert_eq!(p.validation_count, Some(0));
         assert!(p.perf_per_watt > 0.0);
         assert!(conf >= 0.85); // passes the balanced confidence gate
-        // Whole-frontier bridge preserves count.
+                               // Whole-frontier bridge preserves count.
         assert_eq!(frontier_to_points(&fr).len(), 1);
     }
 
@@ -2014,10 +2662,8 @@ mod tests {
         provenance.driver_info = None;
         assert!(!is_current_qualification_pass(&missing_driver));
 
-        let mut missing_checksum = apply_qualification_pass(
-            discovery,
-            F2QualificationPattern::Texture,
-        );
+        let mut missing_checksum =
+            apply_qualification_pass(discovery, F2QualificationPattern::Texture);
         missing_checksum
             .evidence_provenance
             .as_mut()
@@ -2051,7 +2697,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_v6_rejects_v5_and_unconfirmed_positive_evidence() {
+    fn discovery_v7_rejects_v6_and_unconfirmed_positive_evidence() {
         let mut old = obs(1800, 962, F2ObsOutcome::Validated);
         old.discovery_contract_version = Some(3);
         assert!(!is_current_discovery_evidence(&old));
@@ -2135,6 +2781,18 @@ mod tests {
         );
         endurance.run_id = "apply-v7".into();
         endurance.power_p99_w = Some(181.5);
+        let mut dx11 = apply_qualification_pass(
+            obs(1830, 862, F2ObsOutcome::Validated),
+            F2QualificationPattern::Dx11Game,
+        );
+        dx11.run_id = "apply-v7".into();
+        dx11.power_p99_w = Some(176.0);
+        let mut dx12 = apply_qualification_pass(
+            obs(1830, 862, F2ObsOutcome::Validated),
+            F2QualificationPattern::Dx12Game,
+        );
+        dx12.run_id = "apply-v7".into();
+        dx12.power_p99_w = Some(177.0);
         // Thermal slowdown that ALSO sagged the sustained clock below tolerance stays excluded
         // (fail-closed). The held-clock case (throttle but clock >= target) is trusted now and is
         // covered by `apply_qualification_held_thermal_reading_is_trusted_but_sag_is_excluded`.
@@ -2157,18 +2815,30 @@ mod tests {
         let mut other_run_endurance = endurance.clone();
         other_run_endurance.run_id = "other-run".into();
         other_run_endurance.power_p99_w = Some(192.0);
+        let mut other_run_dx11 = dx11.clone();
+        other_run_dx11.run_id = "other-run".into();
+        other_run_dx11.power_p99_w = Some(191.5);
+        let mut other_run_dx12 = dx12.clone();
+        other_run_dx12.run_id = "other-run".into();
+        other_run_dx12.power_p99_w = Some(191.8);
 
+        throttled.qualification_coverage.as_mut().unwrap().verdict = F2QualificationVerdict::Inconclusive;
+        throttled.run_id = "incomplete-thermal-run".into();
         let observations = [
             high_fps.clone(),
             texture,
             transitions,
             memory,
+            dx11,
+            dx12,
             endurance,
             throttled,
             other_run_high_fps,
             other_run_texture,
             other_run_transitions,
             other_run_memory,
+            other_run_dx11,
+            other_run_dx12,
             other_run_endurance,
         ];
         assert_eq!(
@@ -2208,12 +2878,7 @@ mod tests {
             "complete gate power includes the harsher Endurance p99"
         );
         assert_eq!(
-            highest_complete_apply_gate_p99_at_anchor(
-                &observations,
-                1830,
-                862,
-                "RTX 3060 Ti"
-            ),
+            highest_complete_apply_gate_p99_at_anchor(&observations, 1830, 862, "RTX 3060 Ti"),
             Some(192.0),
             "restored snapshots preserve the worst complete-gate run"
         );
@@ -2254,12 +2919,24 @@ mod tests {
             held(F2QualificationPattern::Memory, 199.3),
         ];
         assert_eq!(
-            current_apply_qualification_p99_at_anchor(&held_set, "held-thermal", 1935, 956, "RTX 4070"),
+            current_apply_qualification_p99_at_anchor(
+                &held_set,
+                "held-thermal",
+                1935,
+                956,
+                "RTX 4070"
+            ),
             Some(199.7),
             "held-clock thermal readings publish (highest p99), never understating power"
         );
         assert_eq!(
-            current_apply_qualification_p95_clock_at_anchor(&held_set, "held-thermal", 1935, 956, "RTX 4070"),
+            current_apply_qualification_p95_clock_at_anchor(
+                &held_set,
+                "held-thermal",
+                1935,
+                956,
+                "RTX 4070"
+            ),
             Some(1965),
             "held-clock thermal readings publish the sustained upper clock"
         );
@@ -2268,42 +2945,144 @@ mod tests {
         // the triad is incomplete, and both gates fail closed.
         let mut sagged_set = held_set.clone();
         sagged_set[1].sustained_clock_mhz = Some(1935 - F2_APPLY_CLOCK_HOLD_TOL_MHZ - 1);
+        assert!(current_apply_qualification_p99_at_anchor(&sagged_set, "held-thermal", 1935, 956, "RTX 4070").is_some(),
+            "aggregate idle downclock cannot override proven heavy phases");
+        sagged_set[1].qualification_coverage.as_mut().unwrap().verdict = F2QualificationVerdict::Inconclusive;
         assert_eq!(
-            current_apply_qualification_p99_at_anchor(&sagged_set, "held-thermal", 1935, 956, "RTX 4070"),
+            current_apply_qualification_p99_at_anchor(
+                &sagged_set,
+                "held-thermal",
+                1935,
+                956,
+                "RTX 4070"
+            ),
             None,
             "a thermal slowdown that sagged the clock still fails closed"
         );
         assert_eq!(
-            current_apply_qualification_p95_clock_at_anchor(&sagged_set, "held-thermal", 1935, 956, "RTX 4070"),
+            current_apply_qualification_p95_clock_at_anchor(
+                &sagged_set,
+                "held-thermal",
+                1935,
+                956,
+                "RTX 4070"
+            ),
             None,
             "a thermal slowdown that sagged the clock still fails closed"
         );
     }
 
     #[test]
-    fn endurance_gate_is_run_scoped_and_fails_closed() {
-        let pass = |run: &str, pattern: F2QualificationPattern, outcome: F2ObsOutcome| -> F2Observation {
-            let mut o = apply_qualification_pass(obs(1935, 956, outcome), pattern);
-            o.run_id = run.into();
-            o.gpu_key = Some("RTX 4070".into());
-            o
-        };
-        // The current run's continuous Endurance gate at the exact pair is sufficient in v24.
-        let endurance = [pass(
+    fn exact_apply_matrix_is_run_scoped_and_fails_closed() {
+        let pass =
+            |run: &str, pattern: F2QualificationPattern, outcome: F2ObsOutcome| -> F2Observation {
+                let mut o = apply_qualification_pass(obs(1935, 956, outcome), pattern);
+                o.run_id = run.into();
+                o.gpu_key = Some("RTX 4070".into());
+                o
+            };
+        let matrix = [
+            pass(
+                "R1",
+                F2QualificationPattern::Dx11Game,
+                F2ObsOutcome::Validated,
+            ),
+            pass(
+                "R1",
+                F2QualificationPattern::Texture,
+                F2ObsOutcome::Validated,
+            ),
+            pass(
+                "R1",
+                F2QualificationPattern::Dx12Game,
+                F2ObsOutcome::Validated,
+            ),
+            pass(
+                "R1",
+                F2QualificationPattern::Endurance,
+                F2ObsOutcome::Validated,
+            ),
+        ];
+        assert!(point_has_current_exact_apply_qualification(
+            &matrix, "R1", 1935, 956, "RTX 4070"
+        ));
+        assert!(!point_has_n_current_exact_apply_qualifications(
+            &matrix, "R1", 1935, 956, "RTX 4070", 2
+        ));
+        let mut duplicated_lane = matrix.to_vec();
+        duplicated_lane.push(matrix[0].clone());
+        assert!(
+            !point_has_n_current_exact_apply_qualifications(
+                &duplicated_lane,
+                "R1",
+                1935,
+                956,
+                "RTX 4070",
+                2,
+            ),
+            "a duplicated lane is not a second complete matrix"
+        );
+        let retried_lanes = matrix
+            .iter()
+            .flat_map(|observation| [observation.clone(), observation.clone()])
+            .collect::<Vec<_>>();
+        assert!(point_has_current_exact_apply_qualification(
+            &retried_lanes,
             "R1",
-            F2QualificationPattern::Endurance,
-            F2ObsOutcome::Validated,
-        )];
-        assert!(point_has_current_endurance_qualification(
-            &endurance,
+            1935,
+            956,
+            "RTX 4070",
+        ));
+        assert!(
+            !point_has_n_current_exact_apply_qualifications(
+                &retried_lanes,
+                "R1",
+                1935,
+                956,
+                "RTX 4070",
+                2,
+            ),
+            "lane retries within one ordered ladder are still only one complete matrix"
+        );
+        let mut duplicate_matrix = matrix.to_vec();
+        duplicate_matrix.extend(matrix.clone());
+        assert!(point_has_current_exact_apply_qualification(
+            &duplicate_matrix,
             "R1",
             1935,
             956,
             "RTX 4070"
         ));
-        let mut missing_provenance = endurance.clone();
+        assert!(point_has_n_current_exact_apply_qualifications(
+            &duplicate_matrix,
+            "R1",
+            1935,
+            956,
+            "RTX 4070",
+            2,
+        ));
+        assert!(!point_has_n_current_exact_apply_qualifications(
+            &duplicate_matrix,
+            "R1",
+            1935,
+            956,
+            "RTX 4070",
+            0,
+        ));
+        let mut missing_dx12_driver = matrix.clone();
+        let dx12_provenance = missing_dx12_driver[2].evidence_provenance.as_mut().unwrap();
+        dx12_provenance.driver_name = None;
+        dx12_provenance.driver_info = None;
+        assert!(!point_has_current_exact_apply_qualification(
+            &missing_dx12_driver,
+            "R1",
+            1935,
+            956,
+            "RTX 4070"
+        ));
+        let mut missing_provenance = matrix.clone();
         missing_provenance[0].evidence_provenance = None;
-        assert!(!point_has_current_endurance_qualification(
+        assert!(!point_has_current_exact_apply_qualification(
             &missing_provenance,
             "R1",
             1935,
@@ -2311,28 +3090,72 @@ mod tests {
             "RTX 4070"
         ));
         // Run-scoped: the same evidence never publishes a different run.
-        assert!(!point_has_current_endurance_qualification(
-            &endurance,
-            "R2",
+        assert!(!point_has_current_exact_apply_qualification(
+            &matrix, "R2", 1935, 956, "RTX 4070"
+        ));
+        // Removed legacy gates cannot publish a current point by themselves.
+        let shock_only = [pass(
+            "R1",
+            F2QualificationPattern::TransitionShock,
+            F2ObsOutcome::Validated,
+        )];
+        assert!(!point_has_current_exact_apply_qualification(
+            &shock_only,
+            "R1",
             1935,
             956,
             "RTX 4070"
         ));
-        // Removed legacy gates cannot publish a v24 point by themselves.
-        let shock_only =
-            [pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated)];
-        assert!(!point_has_current_endurance_qualification(&shock_only, "R1", 1935, 956, "RTX 4070"));
-        // Fail closed: Texture qualification without the continuous Endurance gate is not publishable.
-        let mut no_gate =
-            apply_qualification_pass(obs(1935, 956, F2ObsOutcome::Validated), F2QualificationPattern::Texture);
-        no_gate.run_id = "R1".into();
-        no_gate.gpu_key = Some("RTX 4070".into());
-        assert!(!point_has_current_endurance_qualification(&[no_gate], "R1", 1935, 956, "RTX 4070"));
+        // Fail closed: every individual API/Endurance lane is mandatory.
+        for missing_index in 0..REQUIRED_EXACT_APPLY_PATTERNS.len() {
+            let incomplete = matrix
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != missing_index)
+                .map(|(_, observation)| observation.clone())
+                .collect::<Vec<_>>();
+            assert!(!point_has_current_exact_apply_qualification(
+                &incomplete,
+                "R1",
+                1935,
+                956,
+                "RTX 4070"
+            ));
+        }
+        let mut inconclusive_dx12 = matrix.clone();
+        inconclusive_dx12[2].outcome = F2ObsOutcome::QualificationInconclusive;
+        inconclusive_dx12[2]
+            .qualification_coverage
+            .as_mut()
+            .unwrap()
+            .verdict = F2QualificationVerdict::Inconclusive;
+        assert!(!point_has_current_exact_apply_qualification(
+            &inconclusive_dx12,
+            "R1",
+            1935,
+            956,
+            "RTX 4070"
+        ));
         // A non-validated endurance dwell (silent error mid-soak) rejects the point.
-        let mut failed = pass("R1", F2QualificationPattern::Endurance, F2ObsOutcome::SilentError);
+        let mut failed = pass(
+            "R1",
+            F2QualificationPattern::Endurance,
+            F2ObsOutcome::SilentError,
+        );
         failed.silent_error = true;
-        let with_failed_endurance = [failed];
-        assert!(!point_has_current_endurance_qualification(&with_failed_endurance, "R1", 1935, 956, "RTX 4070"));
+        let with_failed_endurance = [
+            matrix[0].clone(),
+            matrix[1].clone(),
+            matrix[2].clone(),
+            failed,
+        ];
+        assert!(!point_has_current_exact_apply_qualification(
+            &with_failed_endurance,
+            "R1",
+            1935,
+            956,
+            "RTX 4070"
+        ));
     }
 
     #[test]
@@ -2388,8 +3211,7 @@ mod tests {
         let near = obs(1920, 912, F2ObsOutcome::Validated);
         let clear = obs(1920, 918, F2ObsOutcome::Validated);
         assert_eq!(crash_floor_for_target(&[crash.clone()], 1920), Some(906));
-        let entry =
-            frontier_entry_for_target(&[crash.clone(), near.clone(), clear], 1920).unwrap();
+        let entry = frontier_entry_for_target(&[crash.clone(), near.clone(), clear], 1920).unwrap();
         assert_eq!(entry.best_anchor_mv, 918);
         // Only the tainted bin available -> no boundary at all.
         assert!(frontier_entry_for_target(&[crash, near], 1920).is_none());
@@ -2401,25 +3223,33 @@ mod tests {
             obs(1935, 956, F2ObsOutcome::Unstable),
             F2QualificationPattern::HighFps,
         );
-        fail_a.qualification_coverage.as_mut().unwrap().failure_phase =
-            Some("frame-cadence".into());
+        fail_a
+            .qualification_coverage
+            .as_mut()
+            .unwrap()
+            .failure_phase = Some("frame-cadence".into());
         let mut fail_b = fail_a.clone();
-        fail_b.qualification_coverage.as_mut().unwrap().failure_phase =
-            Some("frame-cadence".into());
+        fail_b
+            .qualification_coverage
+            .as_mut()
+            .unwrap()
+            .failure_phase = Some("frame-cadence".into());
         let mut fail_other = apply_qualification_pass(
             obs(1935, 950, F2ObsOutcome::Unstable),
             F2QualificationPattern::Memory,
         );
-        fail_other.qualification_coverage.as_mut().unwrap().failure_phase =
-            Some("vram-pressure".into());
+        fail_other
+            .qualification_coverage
+            .as_mut()
+            .unwrap()
+            .failure_phase = Some("vram-pressure".into());
         // A clean pass (no failure_phase) contributes nothing.
         let clean = apply_qualification_pass(
             obs(1935, 962, F2ObsOutcome::Validated),
             F2QualificationPattern::Texture,
         );
 
-        let histogram =
-            qualification_failure_histogram(&[fail_a, fail_b, fail_other, clean]);
+        let histogram = qualification_failure_histogram(&[fail_a, fail_b, fail_other, clean]);
         assert_eq!(
             histogram
                 .get(&(1935, 956, "HighFps".into(), "frame-cadence".into()))
@@ -2453,9 +3283,33 @@ mod tests {
         assert_eq!(decoded, current);
 
         let mut legacy = serde_json::to_value(current).unwrap();
-        legacy.as_object_mut().unwrap().remove("evidence_provenance");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("evidence_provenance");
         let decoded_legacy: F2Observation = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded_legacy.evidence_provenance, None);
+    }
+
+    #[test]
+    fn discovery_measurement_refusal_round_trips_without_becoming_a_boundary() {
+        let mut current = obs(1710, 875, F2ObsOutcome::DiscoveryInconclusive);
+        current.dwell_result = F2ObsDwell::DiscoveryInconclusive;
+        current.inconclusive_reason = Some("voltage_telemetry_low".into());
+        current.measured_voltage_sample_count = 1;
+        let decoded: F2Observation = serde_json::from_str(
+            &serde_json::to_string(&current).unwrap(),
+        ).unwrap();
+        assert_eq!(decoded, current);
+        assert!(first_bad_for_target(std::slice::from_ref(&decoded), 1710).is_none());
+        assert!(last_good_for_target(&[decoded], 1710).is_none());
+
+        let mut legacy = serde_json::to_value(obs(1710, 875,
+            F2ObsOutcome::PowerTelemetryInconclusive)).unwrap();
+        legacy.as_object_mut().unwrap().remove("inconclusive_reason");
+        let decoded: F2Observation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.outcome, F2ObsOutcome::PowerTelemetryInconclusive);
+        assert_eq!(decoded.inconclusive_reason, None);
     }
 
     #[test]
@@ -2465,13 +3319,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let store = F2ObservationStore::new(&base);
         assert!(store.load_all().is_empty()); // missing file → empty
-        store.append(&obs(1800, 968, F2ObsOutcome::Validated)).unwrap();
-        store.append(&obs(1800, 962, F2ObsOutcome::Validated)).unwrap();
-        store.append(&obs(1815, 980, F2ObsOutcome::Unstable)).unwrap();
+        store
+            .append(&obs(1800, 968, F2ObsOutcome::Validated))
+            .unwrap();
+        store
+            .append(&obs(1800, 962, F2ObsOutcome::Validated))
+            .unwrap();
+        store
+            .append(&obs(1815, 980, F2ObsOutcome::Unstable))
+            .unwrap();
         // Append accumulates (does NOT overwrite).
         assert_eq!(store.load_all().len(), 3);
         assert_eq!(store.query_by_target(1800).len(), 2);
-        assert_eq!(store.learned_frontier().iter().map(|e| e.target_mhz).collect::<Vec<_>>(), vec![1800]);
+        assert_eq!(
+            store
+                .learned_frontier()
+                .iter()
+                .map(|e| e.target_mhz)
+                .collect::<Vec<_>>(),
+            vec![1800]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn checked_store_load_treats_missing_as_empty_and_accepts_bom() {
+        let base = std::env::temp_dir().join(format!(
+            "nidav-f2-obs-checked-missing-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = F2ObservationStore::new(&base);
+        assert!(store.load_all_checked().unwrap().is_empty());
+
+        std::fs::create_dir_all(&base).unwrap();
+        let good = serde_json::to_string(&obs(1800, 962, F2ObsOutcome::Validated)).unwrap();
+        std::fs::write(store.path(), format!("\u{feff}{good}\n\n")).unwrap();
+        assert_eq!(store.load_all_checked().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn checked_store_load_rejects_malformed_nonempty_line_with_context() {
+        let base = std::env::temp_dir().join(format!(
+            "nidav-f2-obs-checked-invalid-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = F2ObservationStore::new(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let good = serde_json::to_string(&obs(1800, 962, F2ObsOutcome::Validated)).unwrap();
+        std::fs::write(store.path(), format!("{good}\n{{not valid json}}\n")).unwrap();
+
+        let error = store.load_all_checked().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains(&store.path().display().to_string()));
+        assert!(message.contains("line 2"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn checked_store_load_propagates_non_missing_io_error() {
+        let base = std::env::temp_dir().join(format!(
+            "nidav-f2-obs-checked-io-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = F2ObservationStore::new(&base);
+        std::fs::create_dir_all(store.path()).unwrap();
+
+        let error = store.load_all_checked().unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error
+            .to_string()
+            .contains(&store.path().display().to_string()));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

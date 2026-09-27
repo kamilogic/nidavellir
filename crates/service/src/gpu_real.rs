@@ -70,6 +70,7 @@ fn worst(a: StabilityResult, b: StabilityResult) -> StabilityResult {
 pub struct GpuValidationHandle {
     status: Arc<Mutex<GpuValidationStatus>>,
     running: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
 }
 
 impl Default for GpuValidationHandle {
@@ -77,11 +78,14 @@ impl Default for GpuValidationHandle {
         Self {
             status: Arc::new(Mutex::new(idle_validation())),
             running: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl GpuValidationHandle {
+    pub fn is_running(&self) -> bool { self.running.load(Ordering::SeqCst) }
+    pub fn stop(&self) { self.stop.store(true, Ordering::SeqCst); }
     pub fn status(&self) -> GpuValidationStatus {
         self.status.lock().map(|s| s.clone()).unwrap_or_else(|_| idle_validation())
     }
@@ -91,6 +95,7 @@ impl GpuValidationHandle {
         if self.running.swap(true, Ordering::SeqCst) {
             return false;
         }
+        self.stop.store(false, Ordering::SeqCst);
 
         // The battery: (label, runner). Each runner targets a failure mode.
         type Runner = Box<dyn Fn(&nidavellir_gpu_stress::GpuCtx) -> nidavellir_gpu_stress::StageReport + Send>;
@@ -112,6 +117,7 @@ impl GpuValidationHandle {
 
         let status = Arc::clone(&self.status);
         let running = Arc::clone(&self.running);
+        let stop = Arc::clone(&self.stop);
         std::thread::spawn(move || {
             info!("GPU validation battery started ({total} estágios)");
             let ctx = match nidavellir_gpu_stress::GpuCtx::new() {
@@ -132,6 +138,7 @@ impl GpuValidationHandle {
 
             let mut overall = StabilityResult::Stable;
             for (idx, (name, run)) in battery.iter().enumerate() {
+                if stop.load(Ordering::SeqCst) { break; }
                 if let Ok(mut s) = status.lock() {
                     s.stage_index = idx as u32;
                     s.current_stage = Some(name.to_string());
@@ -148,14 +155,23 @@ impl GpuValidationHandle {
                 }
             }
 
+            // Keep both published status and the ownership flag active until teardown finishes.
+            drop(ctx);
+            let cancelled = stop.load(Ordering::SeqCst);
             if let Ok(mut s) = status.lock() {
                 s.running = false;
                 s.current_stage = None;
-                s.stage_index = total;
-                s.result = Some(overall);
+                if cancelled {
+                    s.result = None;
+                    s.error = Some("Validation cancelled before completion".into());
+                } else {
+                    s.stage_index = total;
+                    s.result = Some(overall);
+                }
             }
             running.store(false, Ordering::SeqCst);
-            info!("GPU validation battery finished: {overall:?}");
+            if cancelled { info!("GPU validation battery cancelled"); }
+            else { info!("GPU validation battery finished: {overall:?}"); }
         });
         true
     }

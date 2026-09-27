@@ -81,6 +81,9 @@ impl RealSweepHandle {
     pub fn progress(&self) -> GpuSweepProgress {
         self.progress.lock().map(|p| p.clone()).unwrap_or_else(|_| idle())
     }
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
@@ -112,23 +115,19 @@ fn set_progress(progress: &Arc<Mutex<GpuSweepProgress>>, p: GpuSweepProgress) {
     }
 }
 
-/// Recover the GPU context after a TDR / device-lost. The driver needs a few
-/// seconds to reset the adapter; recreating the device immediately fails with
-/// "lost during initialization", so we wait and retry a handful of times.
 #[cfg(windows)]
-fn recover_gpu_ctx() -> Option<nidavellir_gpu_stress::GpuCtx> {
-    use nidavellir_gpu_stress::GpuCtx;
-    for attempt in 1..=6 {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        match GpuCtx::new() {
-            Ok(c) => {
-                info!("real sweep: GPU device recovered after TDR (attempt {attempt})");
-                return Some(c);
-            }
-            Err(e) => warn!("real sweep: recovery attempt {attempt}/6 failed: {e}"),
-        }
-    }
-    None
+fn reset_real_sweep_to_stock(store: &SafeLoopStore) -> Result<(), String> {
+    crate::tdr_sentinel::legacy_stock_reset_guard(store)?;
+    nidavellir_gpu_nvapi::reset_all().map_err(|error| format!("real sweep stock reset: {error}"))
+}
+
+#[cfg(windows)]
+fn reset_and_clear_real_transaction(
+    store: &SafeLoopStore,
+    flag: &nidavellir_core::safe_loop::BootFlag,
+) -> Result<(), String> {
+    reset_real_sweep_to_stock(store)?;
+    crate::tdr_sentinel::clear_legacy_gpu_transaction(store, flag)
 }
 
 /// Peak core clock + temperature sampled via NVML while `body` runs (the load).
@@ -181,7 +180,7 @@ fn run_real_sweep(
 
     info!("Real GPU sweep starting (lock-voltage / raise-clock)");
 
-    let mut ctx = match GpuCtx::new() {
+    let ctx = match GpuCtx::new() {
         Ok(c) => c,
         Err(e) => {
             warn!("real sweep: GpuCtx init failed: {e}");
@@ -190,7 +189,22 @@ fn run_real_sweep(
         }
     };
 
-    let _ = gpu::reset_all();
+    if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+        warn!("real sweep: startup refused: {error}");
+        let mut aborted = idle();
+        aborted.phase = SweepPhase::Aborted;
+        aborted.validation_note = Some(error);
+        set_progress(&progress, aborted);
+        return;
+    }
+    if let Err(error) = reset_real_sweep_to_stock(&store) {
+        warn!("real sweep: startup stock reset failed: {error}");
+        let mut aborted = idle();
+        aborted.phase = SweepPhase::Aborted;
+        aborted.validation_note = Some(error);
+        set_progress(&progress, aborted);
+        return;
+    }
 
     let mut prog = idle();
     prog.total_freqs = q.voltages.len();
@@ -204,7 +218,10 @@ fn run_real_sweep(
     };
     if !vram.is_stable() {
         warn!("real sweep: VRAM check failed at stock ({vram:?}) — aborting before tuning");
-        let _ = gpu::reset_all();
+        if matches!(vram, StabilityResult::Crash) {
+            crate::tdr_sentinel::mark_legacy_device_loss("gpu_real_sweep_vram");
+        }
+        let _ = reset_real_sweep_to_stock(&store);
         prog.phase = SweepPhase::Aborted;
         prog.last_result = Some(vram);
         set_progress(&progress, prog);
@@ -228,16 +245,13 @@ fn run_real_sweep(
     // real boost clock, so once we know a cliff we slow the approach near it to
     // surface a silent error before a hard TDR.
     let mut min_unstable_real: Option<u32> = None;
+    let mut active_flag: Option<BootFlag> = None;
     // How close (MHz) to a known cliff before we shrink the step.
     const CLIFF_APPROACH_MHZ: u32 = 75;
     let fine_step = (q.step_mhz / 3).max(5);
 
     'voltages: for (vi, &v) in q.voltages.iter().enumerate() {
         if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        if let Err(e) = gpu::lock_core_voltage_mv(v) {
-            warn!("real sweep: lock {v}mV failed: {e}; aborting");
             break;
         }
         prog.phase = SweepPhase::VoltageBisection;
@@ -256,11 +270,43 @@ fn run_real_sweep(
                 ("gpu_voltage_mv", v as i64),
                 ("gpu_offset_mhz", offset as i64),
             ]);
-            let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_real_sweep"));
-
+            let flag = BootFlag::new(intent, "gpu_real_sweep");
+            if let Err(error) = crate::tdr_sentinel::arm_legacy_gpu_transaction(&store, &flag) {
+                warn!("real sweep: candidate arm refused: {error}");
+                prog.validation_note = Some(error);
+                crashed = true;
+                break 'voltages;
+            }
+            active_flag = Some(flag);
+            if let Err(error) = gpu::lock_core_voltage_mv(v) {
+                warn!("real sweep: lock {v}mV failed: {error}; aborting");
+                if let Some(flag) = active_flag.as_ref() {
+                    if reset_and_clear_real_transaction(&store, flag).is_ok() {
+                        active_flag = None;
+                    }
+                }
+                crashed = true;
+                break 'voltages;
+            }
+            if let Some(flag) = active_flag.as_ref() {
+                if let Err(error) =
+                    crate::tdr_sentinel::legacy_owned_gpu_write_guard(&store, flag)
+                {
+                    warn!("real sweep: offset write refused after voltage lock: {error}");
+                    prog.validation_note = Some(error);
+                    crashed = true;
+                    break 'voltages;
+                }
+            }
             if let Err(e) = gpu::set_core_offset_mhz(offset) {
                 warn!("real sweep: set offset failed: {e}");
-                break;
+                if let Some(flag) = active_flag.as_ref() {
+                    if reset_and_clear_real_transaction(&store, flag).is_ok() {
+                        active_flag = None;
+                    }
+                }
+                crashed = true;
+                break 'voltages;
             }
 
             let (result, peak, temp) =
@@ -279,7 +325,16 @@ fn run_real_sweep(
 
             match result {
                 StabilityResult::Stable => {
-                    let _ = store.clear_boot_flag();
+                    if let Some(flag) = active_flag.as_ref() {
+                        if let Err(error) =
+                            crate::tdr_sentinel::clear_legacy_gpu_transaction(&store, flag)
+                        {
+                            prog.validation_note = Some(error);
+                            crashed = true;
+                            break 'voltages;
+                        }
+                        active_flag = None;
+                    }
                     best_stable = Some(peak);
                     if vi == 0 {
                         top_candidate = Some((v, offset));
@@ -300,32 +355,28 @@ fn run_real_sweep(
                     // Gentle cliff — record it and back off with margin.
                     min_unstable_real =
                         Some(min_unstable_real.map_or(peak, |u| u.min(peak)));
+                    if let Some(flag) = active_flag.as_ref() {
+                        if let Err(error) = reset_and_clear_real_transaction(&store, flag) {
+                            prog.validation_note = Some(error);
+                            crashed = true;
+                        } else {
+                            active_flag = None;
+                        }
+                    }
                     break;
                 }
                 StabilityResult::Crash => {
-                    // Hard cliff (device lost / TDR). The ceiling for this
-                    // voltage is the previous stable reading (already in
-                    // best_stable). Do NOT abort the whole sweep: recover the
-                    // GPU device and carry on to the remaining voltages + the
-                    // long validation, so we still deliver a profile.
-                    warn!("real sweep: device lost at {v}mV +{offset}MHz — recovering");
-                    min_unstable_real =
-                        Some(min_unstable_real.map_or(peak, |u| u.min(peak)));
-                    let _ = gpu::set_core_offset_mhz(0);
-                    let _ = gpu::unlock_core_voltage();
-                    match recover_gpu_ctx() {
-                        Some(fresh) => {
-                            ctx = fresh;
-                            break; // move on to the next voltage
-                        }
-                        None => {
-                            warn!("real sweep: device unrecoverable after retries — stopping");
-                            crashed = true;
-                            break 'voltages;
-                        }
-                    }
+                    // A recovered driver context is never trusted for another candidate write.
+                    warn!("real sweep: device lost at {v}mV +{offset}MHz — reboot required");
+                    crate::tdr_sentinel::mark_legacy_device_loss("gpu_real_sweep");
+                    crashed = true;
+                    break 'voltages;
                 }
             }
+        }
+
+        if crashed {
+            break 'voltages;
         }
 
         // Record the safe point for this voltage: max stable clock minus margin.
@@ -338,12 +389,27 @@ fn run_real_sweep(
         prog.tradeoffs = points.clone();
         set_progress(&progress, prog.clone());
 
-        // Drop the clock offset between voltages (re-lock next iteration).
-        let _ = gpu::set_core_offset_mhz(0);
+        // Restore stock between voltages. This recovery reset is checked separately and cannot
+        // clear any transaction it does not own.
+        if let Err(error) = reset_real_sweep_to_stock(&store) {
+            warn!("real sweep: inter-voltage stock reset refused: {error}");
+            prog.validation_note = Some(error);
+            crashed = true;
+            break;
+        }
     }
 
-    let _ = gpu::reset_all();
-    let _ = store.clear_boot_flag();
+    let reset_ok = reset_real_sweep_to_stock(&store).is_ok();
+    if reset_ok && crate::tdr_sentinel::reboot_required_event().is_none() {
+        if let Some(flag) = active_flag.as_ref() {
+            if let Err(error) = crate::tdr_sentinel::clear_legacy_gpu_transaction(&store, flag) {
+                prog.validation_note = Some(error);
+                crashed = true;
+            } else {
+                active_flag = None;
+            }
+        }
+    }
 
     let baseline = points.iter().map(|p| p.freq_mhz).max().unwrap_or(0);
     prog.profiles = synthesize_profiles(baseline, &points);
@@ -366,9 +432,42 @@ fn run_real_sweep(
                     ("gpu_voltage_mv", v0 as i64),
                     ("gpu_offset_mhz", val_off as i64),
                 ]);
-                let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_real_validate"));
-                let _ = gpu::lock_core_voltage_mv(v0);
+                let flag = BootFlag::new(intent, "gpu_real_validate");
+                if let Err(error) =
+                    crate::tdr_sentinel::arm_legacy_gpu_transaction(&store, &flag)
+                {
+                    note = format!("Validação abortada ao armar candidato: {error}");
+                    crashed = true;
+                    break;
+                }
+                active_flag = Some(flag);
+                if gpu::lock_core_voltage_mv(v0).is_err() {
+                    note = "Falha ao travar voltagem na validação longa".into();
+                    if let Some(flag) = active_flag.as_ref() {
+                        if reset_and_clear_real_transaction(&store, flag).is_ok() {
+                            active_flag = None;
+                        }
+                    }
+                    crashed = true;
+                    break;
+                }
+                if let Some(flag) = active_flag.as_ref() {
+                    if let Err(error) =
+                        crate::tdr_sentinel::legacy_owned_gpu_write_guard(&store, flag)
+                    {
+                        note = format!("Validação abortada antes do offset: {error}");
+                        crashed = true;
+                        break;
+                    }
+                }
                 if gpu::set_core_offset_mhz(val_off).is_err() {
+                    note = "Falha ao aplicar offset na validação longa".into();
+                    if let Some(flag) = active_flag.as_ref() {
+                        if reset_and_clear_real_transaction(&store, flag).is_ok() {
+                            active_flag = None;
+                        }
+                    }
+                    crashed = true;
                     break;
                 }
                 let (res, peak, temp) =
@@ -381,17 +480,35 @@ fn run_real_sweep(
                 prog.last_result = Some(res);
                 set_progress(&progress, prog.clone());
                 if res.is_stable() {
-                    let _ = store.clear_boot_flag();
+                    if let Some(flag) = active_flag.as_ref() {
+                        if let Err(error) =
+                            crate::tdr_sentinel::clear_legacy_gpu_transaction(&store, flag)
+                        {
+                            note = format!("Falha ao limpar transação validada: {error}");
+                            crashed = true;
+                            break;
+                        }
+                        active_flag = None;
+                    }
                     note = format!(
                         "Validado (Silver): {peak} MHz @ {v0} mV estável no soak longo — confirme em jogo",
                     );
                     break;
                 } else if matches!(res, StabilityResult::Crash) {
+                    crate::tdr_sentinel::mark_legacy_device_loss("gpu_real_validate");
                     crashed = true;
-                    note = "Travou na validação longa — recue mais".into();
+                    note = "Travou na validação longa — reinicie o Windows".into();
                     break;
                 } else {
                     note = format!("Erro silencioso no soak — recuando (tentativa {})", attempt + 1);
+                    if let Some(flag) = active_flag.as_ref() {
+                        if let Err(error) = reset_and_clear_real_transaction(&store, flag) {
+                            note = format!("{note}; limpeza fail-closed: {error}");
+                            crashed = true;
+                            break;
+                        }
+                        active_flag = None;
+                    }
                     val_off = (val_off - q.step_mhz * 2).max(0);
                 }
             }
@@ -399,8 +516,15 @@ fn run_real_sweep(
         }
     }
 
-    let _ = gpu::reset_all();
-    let _ = store.clear_boot_flag();
+    let reset_ok = reset_real_sweep_to_stock(&store).is_ok();
+    if reset_ok && crate::tdr_sentinel::reboot_required_event().is_none() {
+        if let Some(flag) = active_flag.as_ref() {
+            if let Err(error) = crate::tdr_sentinel::clear_legacy_gpu_transaction(&store, flag) {
+                prog.validation_note = Some(error);
+                crashed = true;
+            }
+        }
+    }
     prog.current = None;
     prog.phase = if crashed { SweepPhase::Aborted } else { SweepPhase::Done };
     prog.freq_index = prog.total_freqs;

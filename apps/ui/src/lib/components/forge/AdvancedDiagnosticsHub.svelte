@@ -49,9 +49,9 @@
     onStopDetectorLab,
     onOpenDetectorLabLog,
     onClose,
+    activeTab = $bindable("log"),
   } = $props();
 
-  let activeTab = $state("log");
   const blacklist = $derived(safeLoop?.blacklist ?? []);
   const condemnations = $derived.by(() =>
     [...(safeLoop?.condemnations ?? [])].sort((a, b) => {
@@ -211,7 +211,7 @@
   <header class="hub-header">
     <div>
       <span class="eyebrow">Technical workspace</span>
-      <h2 id="advanced-diagnostics-title">Advanced Diagnostics</h2>
+      <h1 id="advanced-diagnostics-title" data-forge-heading tabindex="-1">Advanced Diagnostics</h1>
       <p>Live Forge activity, automatic protection and read-only game telemetry.</p>
     </div>
     <button class="back-button" type="button" onclick={onClose}>
@@ -868,13 +868,13 @@
     text-transform: uppercase;
   }
 
-  h2,
+  h1,
   h3,
   p {
     margin: 0;
   }
 
-  h2 {
+  h1 {
     margin-top: 0.25rem;
     font-size: clamp(1.55rem, 2.4vw, 2.15rem);
     font-weight: 580;

@@ -1,165 +1,259 @@
 use serde_json::Value;
 
 #[cfg(windows)]
-use std::io::{Read, Write};
-
 const PIPE_NAME: &str = r"\\.\pipe\NidavellirCore";
 
-pub fn call_service(method: &str) -> Result<Value, String> {
-    call_service_with_params(method, None)
-}
-
-pub fn call_service_with_params(method: &str, params: Option<Value>) -> Result<Value, String> {
+pub async fn call_service_with_params(
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, String> {
     let request = match params {
-        Some(params) => serde_json::to_string(&serde_json::json!({
-            "method": method,
-            "params": params,
-        }))
-        .map_err(|e| format!("Invalid service request: {e}"))?,
-        None => serde_json::to_string(&serde_json::json!({ "method": method }))
-            .map_err(|e| format!("Invalid service request: {e}"))?,
+        Some(params) => serde_json::json!({ "method": method, "params": params }),
+        None => serde_json::json!({ "method": method }),
     };
-    let response = send_request(&request)?;
-    let parsed: Value = serde_json::from_str(&response)
-        .map_err(|e| format!("Invalid service response: {e}"))?;
-    if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let msg = parsed
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown service error");
-        return Err(msg.to_string());
-    }
-    Ok(parsed)
-}
-
-fn send_request(request: &str) -> Result<String, String> {
     #[cfg(windows)]
     {
-        use std::io::Write;
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        };
-        use windows::Win32::System::Pipes::WaitNamedPipeW;
-        use windows::Win32::Foundation::GENERIC_READ;
-        use windows::Win32::Foundation::GENERIC_WRITE;
-
-        let pipe_name: Vec<u16> = PIPE_NAME
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
-        unsafe {
-            let ok = WaitNamedPipeW(
-                windows::core::PCWSTR(pipe_name.as_ptr()),
-                5000,
-            );
-            if !ok.as_bool() {
-                #[cfg(debug_assertions)]
-                let msg = "Core Service not running - start with: cargo run -p nidavellir-service -- console";
-                #[cfg(not(debug_assertions))]
-                let msg = "Core Service not running - check Windows Services (NidavellirCore) or reinstall";
-                return Err(msg.into());
-            }
-        }
-
-        let handle = unsafe {
-            CreateFileW(
-                windows::core::PCWSTR(pipe_name.as_ptr()),
-                (GENERIC_READ | GENERIC_WRITE).0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                windows::Win32::Foundation::HANDLE::default(),
-            )
-        };
-        if handle.is_err() {
-            return Err(format!(
-                "Failed to connect to Core Service: {}",
-                handle.unwrap_err()
-            ));
-        }
-        let handle = handle.unwrap();
-
-        let mut file = PipeHandle { handle };
-        file.write_all(request.as_bytes())
-            .map_err(|e| format!("Write failed: {e}"))?;
-        file.write_all(b"\n")
-            .map_err(|e| format!("Write failed: {e}"))?;
-
-        let mut buf = String::new();
-        file.read_line(&mut buf)
-            .map_err(|e| format!("Read failed: {e}"))?;
-
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
-
-        Ok(buf.trim().to_string())
+        let response = exchange(
+            PIPE_NAME,
+            &format!("{request}\n"),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
+        parse_response(&response)
     }
-
     #[cfg(not(windows))]
     {
-        let _ = (request, Duration::from_secs(1));
+        let _ = request;
         Err("Nidavellir Core Service IPC requires Windows".into())
     }
 }
 
-#[cfg(windows)]
-struct PipeHandle {
-    handle: windows::Win32::Foundation::HANDLE,
+fn parse_response(response: &str) -> Result<Value, String> {
+    let parsed: Value = serde_json::from_str(response)
+        .map_err(|e| format!("Invalid service response; action outcome unknown: {e}"))?;
+    if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return Err(parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Invalid or failed service response")
+            .to_string());
+    }
+    Ok(parsed)
 }
 
+/// One connection and one send. Dropping Tokio's pipe cancels owned pending I/O;
+/// a timeout does not cancel or retry an operation already accepted by the service.
 #[cfg(windows)]
-impl Write for PipeHandle {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        use windows::Win32::Storage::FileSystem::WriteFile;
-        let mut written: u32 = 0;
-        unsafe {
-            WriteFile(self.handle, Some(buf), Some(&mut written), None)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        }
-        Ok(written as usize)
-    }
+async fn exchange(
+    pipe_name: &str,
+    request: &str,
+    connect_timeout: std::time::Duration,
+    response_timeout: std::time::Duration,
+) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use tokio::time::{sleep, timeout};
+    use windows::Win32::Foundation::ERROR_PIPE_BUSY;
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-impl Read for PipeHandle {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        use windows::Win32::Storage::FileSystem::ReadFile;
-        let mut read: u32 = 0;
-        unsafe {
-            ReadFile(self.handle, Some(buf), Some(&mut read), None)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        }
-        Ok(read as usize)
-    }
-}
-
-#[cfg(windows)]
-impl PipeHandle {
-    fn read_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
-        let mut total = 0;
-        let mut byte = [0u8; 1];
-        let mut bytes: Vec<u8> = Vec::new();
+    let mut pipe = timeout(connect_timeout, async {
         loop {
-            let n = self.read(&mut byte)?;
-            if n == 0 {
-                break;
+            match ClientOptions::new().open(pipe_name) {
+                Ok(pipe) => return Ok(pipe),
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
+                    sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(format!("Core Service unavailable: {e}")),
             }
-            total += n;
-            if byte[0] == b'\n' {
-                break;
-            }
-            bytes.push(byte[0]);
         }
-        *buf = String::from_utf8(bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(total)
+    })
+    .await
+    .map_err(|_| {
+        "Core Service is busy; connection timed out before sending the request".to_string()
+    })??;
+
+    let response = timeout(response_timeout, async {
+        pipe.write_all(request.as_bytes()).await?;
+        // Bound both time and memory if a broken peer never terminates its JSON line.
+        const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+        let mut reader = BufReader::new(pipe.take(MAX_RESPONSE_BYTES));
+        let mut response = String::new();
+        reader.read_line(&mut response).await?;
+        if !response.ends_with('\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData, "incomplete or oversized response",
+            ));
+        }
+        Ok(response)
+    }).await
+        .map_err(|_| "Core Service response timed out; action outcome unknown. Wait for status to reconnect before another action. The request was not retried.".to_string())?;
+    response.map_err(|e: std::io::Error| format!("Core Service connection lost; action outcome unknown. Wait for status to reconnect: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_and_failed_envelopes_never_become_success() {
+        for response in ["not json", "{}", r#"{"ok":false,"error":"stock refused"}"#] {
+            assert!(parse_response(response).is_err());
+        }
+        assert!(parse_response(r#"{"ok":true,"data":{"type":"Pong"}}"#).is_ok());
+    }
+
+    #[cfg(windows)]
+    mod pipes {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::windows::named_pipe::ServerOptions;
+        use tokio::time::timeout;
+
+        static NEXT_PIPE: AtomicUsize = AtomicUsize::new(0);
+        fn name() -> String {
+            format!(
+                r"\\.\pipe\nidavellir-ipc-test-{}-{}",
+                std::process::id(),
+                NEXT_PIPE.fetch_add(1, Ordering::Relaxed)
+            )
+        }
+        fn run(future: impl std::future::Future<Output = ()>) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(future);
+        }
+
+        #[test]
+        fn fragmented_reply_and_partial_reply_are_handled() {
+            run(async {
+                for complete in [true, false] {
+                    let name = name();
+                    let mut server = ServerOptions::new()
+                        .first_pipe_instance(true)
+                        .create(&name)
+                        .unwrap();
+                    let peer = tokio::spawn(async move {
+                        server.connect().await.unwrap();
+                        let mut request = String::new();
+                        BufReader::new(&mut server)
+                            .read_line(&mut request)
+                            .await
+                            .unwrap();
+                        assert_eq!(request, "{\"method\":\"Ping\"}\n");
+                        server.write_all(b"{\"ok\":true}").await.unwrap();
+                        if complete {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            server.write_all(b"\n").await.unwrap();
+                        }
+                        let _ = server.read(&mut [0u8; 1]).await;
+                    });
+                    let result = exchange(
+                        &name,
+                        "{\"method\":\"Ping\"}\n",
+                        Duration::from_secs(1),
+                        Duration::from_millis(150),
+                    )
+                    .await;
+                    if complete {
+                        assert_eq!(result.unwrap(), "{\"ok\":true}\n");
+                    } else {
+                        assert!(result.unwrap_err().contains("outcome unknown"));
+                    }
+                    timeout(Duration::from_secs(2), peer)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+            });
+        }
+
+        #[test]
+        fn unresponsive_peer_times_out_without_retry_and_releases_pipe() {
+            run(async {
+                let name = name();
+                let server = ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&name)
+                    .unwrap();
+                let peer = tokio::spawn(async move {
+                    server.connect().await.unwrap();
+                    let mut reader = BufReader::new(server);
+                    let mut request = String::new();
+                    reader.read_line(&mut request).await.unwrap();
+                    assert_eq!(request, "ResetGpuTuning\n");
+                    // EOF/broken pipe proves the deadline dropped the connection, with no resend.
+                    match reader.read_line(&mut String::new()).await {
+                        Ok(n) => assert_eq!(n, 0),
+                        Err(e) => assert!(matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                        )),
+                    }
+                });
+                let error = exchange(
+                    &name,
+                    "ResetGpuTuning\n",
+                    Duration::from_secs(1),
+                    Duration::from_millis(100),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains("timed out; action outcome unknown"));
+                timeout(Duration::from_secs(2), peer)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&name)
+                    .unwrap();
+            });
+        }
+
+        #[test]
+        fn blocked_write_and_busy_connection_have_deadlines() {
+            run(async {
+                let name = name();
+                let server = ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .max_instances(1)
+                    .in_buffer_size(1024)
+                    .create(&name)
+                    .unwrap();
+                let held = tokio::net::windows::named_pipe::ClientOptions::new()
+                    .open(&name)
+                    .unwrap();
+                server.connect().await.unwrap();
+                let error = exchange(
+                    &name,
+                    "Ping\n",
+                    Duration::from_millis(80),
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains("before sending"));
+                drop(held);
+                server.disconnect().unwrap();
+                let peer = tokio::spawn(async move {
+                    server.connect().await.unwrap();
+                    std::future::pending::<()>().await;
+                });
+                let error = exchange(
+                    &name,
+                    &"x".repeat(4 * 1024 * 1024),
+                    Duration::from_secs(1),
+                    Duration::from_millis(100),
+                )
+                .await
+                .unwrap_err();
+                peer.abort();
+                assert!(error.contains("outcome unknown"), "{error}");
+            });
+        }
     }
 }

@@ -203,6 +203,10 @@ rustup default stable-x86_64-pc-windows-msvc
 
 ## Development Workflow
 
+For one explicitly reviewed development validation after an exhausted crash budget, see
+[command-based manual validation](docs/development-validation.md). This opt-in console flow
+preserves historical exclusions and does not change the installed application's default policy.
+
 ### Core Service
 
 The service requires administrator privileges for hardware-level operations.

@@ -50,6 +50,9 @@ impl MemSweepHandle {
     pub fn progress(&self) -> MemSweepProgress {
         self.progress.lock().map(|p| p.clone()).unwrap_or_else(|_| idle())
     }
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
@@ -83,18 +86,19 @@ fn mem_clock_mhz() -> u32 {
         .unwrap_or(0)
 }
 
-/// Recover the GPU context after a TDR. The driver needs a few seconds to reset;
-/// recreating the device immediately fails ("lost during init"), so wait + retry.
 #[cfg(windows)]
-fn recover_ctx() -> Option<nidavellir_gpu_stress::GpuCtx> {
-    use nidavellir_gpu_stress::GpuCtx;
-    for _ in 0..6 {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        if let Ok(c) = GpuCtx::new() {
-            return Some(c);
-        }
-    }
-    None
+fn reset_mem_worker_to_stock(store: &SafeLoopStore) -> Result<(), String> {
+    crate::tdr_sentinel::legacy_stock_reset_guard(store)?;
+    nidavellir_gpu_nvapi::reset_all().map_err(|error| format!("mem sweep stock reset: {error}"))
+}
+
+#[cfg(windows)]
+fn reset_and_clear_mem_transaction(
+    store: &SafeLoopStore,
+    flag: &nidavellir_core::safe_loop::BootFlag,
+) -> Result<(), String> {
+    reset_mem_worker_to_stock(store)?;
+    crate::tdr_sentinel::clear_legacy_gpu_transaction(store, flag)
 }
 
 #[cfg(windows)]
@@ -115,7 +119,7 @@ fn run_mem_sweep(
     };
 
     info!("Memory sweep starting (bandwidth-peak search)");
-    let mut ctx = match GpuCtx::new() {
+    let ctx = match GpuCtx::new() {
         Ok(c) => c,
         Err(e) => {
             warn!("mem sweep: GpuCtx init failed: {e}");
@@ -124,7 +128,22 @@ fn run_mem_sweep(
         }
     };
 
-    let _ = gpu::reset_all();
+    if let Err(error) = crate::tdr_sentinel::legacy_gpu_write_guard(&store) {
+        warn!("mem sweep: startup refused: {error}");
+        let mut aborted = idle();
+        aborted.phase = SweepPhase::Aborted;
+        aborted.validation_note = Some(error);
+        set(&progress, aborted);
+        return;
+    }
+    if let Err(error) = reset_mem_worker_to_stock(&store) {
+        warn!("mem sweep: startup stock reset failed: {error}");
+        let mut aborted = idle();
+        aborted.phase = SweepPhase::Aborted;
+        aborted.validation_note = Some(error);
+        set(&progress, aborted);
+        return;
+    }
 
     let mut prog = idle();
     prog.running = true;
@@ -142,6 +161,7 @@ fn run_mem_sweep(
     let mut best = baseline;
     let mut crashed = false;
     let mut offset = step;
+    let mut active_flag: Option<BootFlag> = None;
 
     prog.phase = SweepPhase::VoltageBisection; // (reused: "sweeping")
     loop {
@@ -149,10 +169,22 @@ fn run_mem_sweep(
             break;
         }
         let intent = TuningPoint::from_axes([("gpu_mem_offset_mhz", offset as i64)]);
-        let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_mem_sweep"));
-
+        let flag = BootFlag::new(intent, "gpu_mem_sweep");
+        if let Err(error) = crate::tdr_sentinel::arm_legacy_gpu_transaction(&store, &flag) {
+            warn!("mem sweep: failed to arm +{offset} MHz candidate: {error}");
+            prog.validation_note = Some(error);
+            crashed = true;
+            break;
+        }
+        active_flag = Some(flag);
         if let Err(e) = gpu::set_mem_offset_mhz(offset) {
             warn!("mem sweep: set offset failed: {e}");
+            if let Some(flag) = active_flag.as_ref() {
+                if reset_and_clear_mem_transaction(&store, flag).is_ok() {
+                    active_flag = None;
+                }
+            }
+            crashed = true;
             break;
         }
 
@@ -168,9 +200,14 @@ fn run_mem_sweep(
             Ok(r) => r.result,
             Err(_) => {
                 crashed = true;
+                crate::tdr_sentinel::mark_legacy_device_loss("gpu_mem_sweep");
                 nidavellir_core::gpu_sweep::StabilityResult::Crash
             }
         };
+        if matches!(integ, nidavellir_core::gpu_sweep::StabilityResult::Crash) {
+            crashed = true;
+            crate::tdr_sentinel::mark_legacy_device_loss("gpu_mem_sweep");
+        }
         if !crashed {
             prog.validation_note = Some(format!("Testando +{offset} MHz · banda…"));
             set(&progress, prog.clone());
@@ -184,13 +221,25 @@ fn run_mem_sweep(
         let stable = integ.is_stable() && !crashed && peak > 0.0 && consistent;
 
         if stable {
-            let _ = store.clear_boot_flag();
+            if let Some(flag) = active_flag.as_ref() {
+                if let Err(error) =
+                    crate::tdr_sentinel::clear_legacy_gpu_transaction(&store, flag)
+                {
+                    warn!("mem sweep: owned candidate clear failed: {error}");
+                    prog.validation_note = Some(error);
+                    crashed = true;
+                } else {
+                    active_flag = None;
+                }
+            }
         }
 
         prog.current_offset_mhz = offset;
         prog.current_mem_mhz = mem_mhz;
         prog.current_gbps = peak as f32;
-        prog.validation_note = None;
+        if !crashed {
+            prog.validation_note = None;
+        }
         prog.points.push(MemSweepPoint {
             offset_mhz: offset,
             mem_mhz,
@@ -204,11 +253,26 @@ fn run_mem_sweep(
         );
 
         if !integ.is_stable() || crashed {
+            if !matches!(integ, nidavellir_core::gpu_sweep::StabilityResult::Crash) {
+                if let Some(flag) = active_flag.as_ref() {
+                    if reset_and_clear_mem_transaction(&store, flag).is_ok() {
+                        active_flag = None;
+                    }
+                }
+            }
             set(&progress, prog.clone());
             break; // hard cliff: artifacts / device lost
         }
         if !consistent {
             info!("mem sweep: bandwidth inconsistent (CRC-retry/stutter onset) at +{offset} — stopping");
+            if let Some(flag) = active_flag.as_ref() {
+                if let Err(error) = reset_and_clear_mem_transaction(&store, flag) {
+                    prog.validation_note = Some(error);
+                    crashed = true;
+                } else {
+                    active_flag = None;
+                }
+            }
             set(&progress, prog.clone());
             break; // stutter onset — the previous clean clock is the recommendation
         }
@@ -236,41 +300,55 @@ fn run_mem_sweep(
             }
             prog.validation_note = Some(format!("Soak combinado (core+mem) em +{off} MHz…"));
             set(&progress, prog.clone());
-            let _ = store.arm_boot_flag(&BootFlag::new(
+            let flag = BootFlag::new(
                 TuningPoint::from_axes([("gpu_mem_offset_mhz", off as i64)]),
                 "gpu_mem_validate",
-            ));
-            let _ = gpu::set_mem_offset_mhz(off);
+            );
+            if let Err(error) = crate::tdr_sentinel::arm_legacy_gpu_transaction(&store, &flag) {
+                warn!("mem sweep: combined soak arm refused: {error}");
+                prog.validation_note = Some(error);
+                crashed = true;
+                break;
+            }
+            active_flag = Some(flag);
+            if let Err(error) = gpu::set_mem_offset_mhz(off) {
+                warn!("mem sweep: combined soak write failed: {error}");
+                if let Some(flag) = active_flag.as_ref() {
+                    if reset_and_clear_mem_transaction(&store, flag).is_ok() {
+                        active_flag = None;
+                    }
+                }
+                crashed = true;
+                break;
+            }
             let comb = match catch_unwind(AssertUnwindSafe(|| ctx.run_combined(40_000))) {
                 Ok(r) => r.result,
                 Err(_) => nidavellir_core::gpu_sweep::StabilityResult::Crash,
             };
 
-            // A device-lost during the soak kills the context — recover it and
-            // recede, instead of giving up (the goal is to find a clock that
-            // survives the combined load, not to abort at the first TDR).
+            // A device-lost/TDR is terminal for this Windows boot. Never reset and recede into a
+            // second candidate on a recovered driver context.
             if matches!(comb, nidavellir_core::gpu_sweep::StabilityResult::Crash) {
-                let _ = gpu::set_mem_offset_mhz(0);
-                match recover_ctx() {
-                    Some(fresh) => {
-                        ctx = fresh;
-                        info!("mem sweep: recovered after soak TDR at +{off} MHz — receding");
-                        prog.peak_offset_mhz = (off - 2 * step).max(0);
-                        off -= 2 * step;
-                        continue;
-                    }
-                    None => {
-                        crashed = true;
-                        prog.validation_note = Some("GPU não recuperou no soak — pare".into());
-                        break;
-                    }
-                }
+                crate::tdr_sentinel::mark_legacy_device_loss("gpu_mem_validate");
+                crashed = true;
+                prog.validation_note =
+                    Some("Device-lost no soak; reinicie o Windows antes de novo teste".into());
+                break;
             }
 
             let (peak, minbw) = ctx.measure_bandwidth_stats(20_000);
             let consistency = if peak > 0.0 { minbw / peak } else { 0.0 };
             if comb.is_stable() && consistency >= 0.96 {
-                let _ = store.clear_boot_flag();
+                if let Some(flag) = active_flag.as_ref() {
+                    if let Err(error) =
+                        crate::tdr_sentinel::clear_legacy_gpu_transaction(&store, flag)
+                    {
+                        prog.validation_note = Some(error);
+                        crashed = true;
+                        break;
+                    }
+                    active_flag = None;
+                }
                 prog.peak_offset_mhz = off;
                 prog.validation_note =
                     Some(format!("Validado: +{off} MHz sob carga combinada core+mem — confirme em jogo"));
@@ -278,17 +356,47 @@ fn run_mem_sweep(
             }
             // Failed under combined load → recede 100 MHz and re-test.
             info!("mem sweep: +{off} MHz failed combined soak (comb={comb:?}, {:.0}% consist) — receding", consistency * 100.0);
+            if let Some(flag) = active_flag.as_ref() {
+                if let Err(error) = reset_and_clear_mem_transaction(&store, flag) {
+                    prog.validation_note = Some(error);
+                    crashed = true;
+                    break;
+                }
+                active_flag = None;
+            }
             prog.peak_offset_mhz = (off - 2 * step).max(0);
             off -= 2 * step;
         }
         set(&progress, prog.clone());
     }
 
-    let _ = gpu::reset_all();
-    let _ = store.clear_boot_flag();
+    let reset_ok = reset_mem_worker_to_stock(&store).is_ok();
+    if reset_ok && crate::tdr_sentinel::reboot_required_event().is_none() {
+        if let Some(flag) = active_flag.as_ref() {
+            if let Err(error) = crate::tdr_sentinel::clear_legacy_gpu_transaction(&store, flag) {
+                warn!("mem sweep: final owned flag clear failed: {error}");
+                crashed = true;
+                prog.validation_note = Some(error);
+            }
+        }
+    }
     prog.running = false;
     prog.current_offset_mhz = 0;
     prog.phase = if crashed { SweepPhase::Aborted } else { SweepPhase::Done };
     set(&progress, prog);
     info!("Memory sweep finished (crashed={crashed})");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_running_accessor_covers_start_before_progress_window() {
+        let handle = MemSweepHandle::default();
+        handle.running.store(true, Ordering::SeqCst);
+
+        assert!(!handle.progress().running);
+        assert!(handle.is_running());
+    }
 }

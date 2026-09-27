@@ -4,6 +4,8 @@ node_modules/
 dist/
 .svelte-kit/
 apps/ui/dist/
+apps/ui/test-results/
+apps/ui/playwright-report/
 apps/ui/src-tauri/binaries/*.exe
 *.log
 .DS_Store

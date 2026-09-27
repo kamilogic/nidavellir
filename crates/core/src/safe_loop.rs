@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,15 @@ pub const BUGCHECK_VIDEO_TDR_TIMEOUT: u64 = 0x117;
 /// Exact boot-flag phase used by the supervised F2 Forge motor. Keep this explicit rather than
 /// matching arbitrary "probe" strings so normal apply/use crashes retain the Safe Mode threshold.
 pub const SUPERVISED_F2_FORGE_PHASE: &str = "f2_undervolt_probe";
+
+/// Exact boot-flag phase used by Detector Lab. Its temporary points are diagnostic experiments,
+/// not Forge learning evidence, so an interrupted session must recover to stock without teaching
+/// the blacklist or consuming the normal-use Safe Mode crash budget.
+pub const DETECTOR_LAB_PHASE: &str = "detector_lab";
+
+/// Operator-owned elastic-curve session observed by Game Trace and the live silent-error canary.
+/// Like Detector Lab, this is an experiment rather than profile/Forge learning.
+pub const GAME_TRACE_DIAGNOSTIC_PHASE: &str = "game_trace_curve_diagnostic";
 
 /// A point in tuning space: axis name → integer setting (mV offset, MHz, ratio…).
 ///
@@ -309,13 +319,16 @@ impl SafeLoopRecord {
 
     /// The point recovery should fall back to: last good, else stock.
     pub fn recovery_target(&self) -> TuningPoint {
-        self.last_validated.clone().unwrap_or_else(TuningPoint::stock)
+        self.last_validated
+            .clone()
+            .unwrap_or_else(TuningPoint::stock)
     }
 
     /// Clear the recovery *latch* after an operator reset: leave Safe Mode and zero the crash
     /// streak so tuning is allowed again, returning to [`SafeLoopState::Idle`]. Learning is
     /// PRESERVED — the unstable-region `blacklist`, `last_validated`, and `crash_log` history are
-    /// kept. (A full "forget everything" reset replaces the whole record with the default instead.)
+    /// kept. Full Reset also preserves this negative safety evidence; only positive qualification
+    /// observations and the forge checkpoint are removed there.
     ///
     /// This is the missing piece that lets "Reset all" actually release a latched Safe Mode: the
     /// hardware/boot-flag reset never wrote this record, so `safe_mode` could only ever be set, not
@@ -332,11 +345,64 @@ impl SafeLoopRecord {
 
     /// Persist an incident once and latch Needs Attention until the operator acknowledges it.
     pub fn record_forge_incident(&mut self, incident: ForgeIncident) -> bool {
-        let duplicate = self
+        let duplicate_id = self
             .forge_incidents
             .iter()
-            .any(|known| known.id == incident.id || (known.run_id.is_some() && known.run_id == incident.run_id));
-        if duplicate {
+            .any(|known| known.id == incident.id);
+        if duplicate_id {
+            return false;
+        }
+        // Live worker accounting can latch a generic same-run interruption just before the
+        // Sentinel/startup path recovers the exact armed candidate. Promote that one durable event
+        // in place so the more specific CandidateCrash remains acknowledgeable/resumable without
+        // duplicating the interruption in history.
+        let promotion = self.pending_forge_incident.as_ref().and_then(|pending| {
+            let same_run = pending.run_id.is_some() && pending.run_id == incident.run_id;
+            let gpu_compatible = pending.gpu_key.is_none()
+                || incident.gpu_key.is_none()
+                || pending.gpu_key == incident.gpu_key;
+            let incoming_exact_candidate = incident.kind == ForgeIncidentKind::CandidateCrash
+                && incident.target_mhz.is_some()
+                && incident.anchor_mv.is_some();
+            let pending_is_less_specific = matches!(
+                pending.kind,
+                ForgeIncidentKind::RuntimeFailure | ForgeIncidentKind::UnaccountedRestart
+            ) || (pending.kind == ForgeIncidentKind::CandidateCrash
+                && (pending.target_mhz.is_none() || pending.anchor_mv.is_none()));
+            (same_run && gpu_compatible && incoming_exact_candidate && pending_is_less_specific)
+                .then(|| {
+                    let mut promoted = incident.clone();
+                    promoted.id = pending.id.clone();
+                    promoted.detected_at = pending.detected_at.clone();
+                    promoted.gpu_key = promoted.gpu_key.or_else(|| pending.gpu_key.clone());
+                    promoted.acknowledged = false;
+                    promoted
+                })
+        });
+        if let Some(promoted) = promotion {
+            if let Some(stored) = self
+                .forge_incidents
+                .iter_mut()
+                .find(|stored| stored.id == promoted.id)
+            {
+                *stored = promoted.clone();
+            } else {
+                push_capped(&mut self.forge_incidents, promoted.clone(), 64);
+            }
+            self.pending_forge_incident = Some(promoted);
+            if !self.safe_mode {
+                self.state = SafeLoopState::Unstable;
+            }
+            return true;
+        }
+        // The active latch deduplicates the live Sentinel + startup reconciliation paths for one
+        // interruption. Once the operator acknowledges it, a later TDR in the SAME resumed run is
+        // a new safety event and must create a fresh pending incident.
+        let duplicate_pending_run = self
+            .pending_forge_incident
+            .as_ref()
+            .is_some_and(|pending| pending.run_id.is_some() && pending.run_id == incident.run_id);
+        if duplicate_pending_run {
             return false;
         }
         self.pending_forge_incident = Some(incident.clone());
@@ -372,14 +438,34 @@ pub struct BootFlag {
     pub intent: TuningPoint,
     pub phase: String,
     pub timestamp: String,
+    /// Unique owner of this hardware transaction. Legacy flags deserialize with an empty owner and
+    /// remain recoverable; every newly armed flag receives an identity so a delayed timer can only
+    /// clear the transaction it created.
+    #[serde(default)]
+    pub transaction_id: String,
 }
 
 impl BootFlag {
     pub fn new(intent: TuningPoint, phase: impl Into<String>) -> Self {
+        static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
+        let sequence = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed);
         Self {
             intent,
             phase: phase.into(),
             timestamp: chrono::Utc::now().to_rfc3339(),
+            transaction_id: format!(
+                "boot-{}-{}-{sequence}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ),
+        }
+    }
+
+    fn same_transaction(&self, other: &Self) -> bool {
+        if self.transaction_id.is_empty() || other.transaction_id.is_empty() {
+            self == other
+        } else {
+            self.transaction_id == other.transaction_id
         }
     }
 }
@@ -396,6 +482,12 @@ pub enum RecoveryAction {
     /// A previous Forge execution ended without a terminal checkpoint. Stay at stock and wait for
     /// an explicit operator acknowledgement; never silently resume or reapply.
     AwaitOperatorAcknowledgement { incident: ForgeIncident },
+    /// A Detector Lab session ended while its temporary point was armed. Return to stock and retain
+    /// the diagnostic attribution, but do not convert an experiment interruption into learning.
+    RecoverDiagnosticInterruption {
+        interrupted: TuningPoint,
+        class: CrashClass,
+    },
     /// Boot-flag armed: blacklist the crash region and recede to known-good.
     BlacklistAndRecede {
         crashed: TuningPoint,
@@ -427,8 +519,17 @@ pub fn decide_recovery(
     match boot_flag {
         Some(flag) => {
             // The apply that armed this flag never reached a clean validation.
-            let supervised_forge_tdr = flag.phase == SUPERVISED_F2_FORGE_PHASE
-                && bugcheck != CrashClass::Unrelated;
+            if matches!(
+                flag.phase.as_str(),
+                DETECTOR_LAB_PHASE | GAME_TRACE_DIAGNOSTIC_PHASE
+            ) {
+                return RecoveryAction::RecoverDiagnosticInterruption {
+                    interrupted: flag.intent.clone(),
+                    class: bugcheck,
+                };
+            }
+            let supervised_forge_tdr =
+                flag.phase == SUPERVISED_F2_FORGE_PHASE && bugcheck != CrashClass::Unrelated;
             let count_toward_safe_mode = !supervised_forge_tdr;
             let crashes = record
                 .consecutive_crashes
@@ -480,6 +581,14 @@ pub fn apply_recovery(record: &mut SafeLoopRecord, action: &RecoveryAction) -> T
             record.state = SafeLoopState::Unstable;
             TuningPoint::stock()
         }
+        RecoveryAction::RecoverDiagnosticInterruption { .. } => {
+            record.state = if record.safe_mode {
+                SafeLoopState::SafeMode
+            } else {
+                SafeLoopState::Idle
+            };
+            TuningPoint::stock()
+        }
         RecoveryAction::BlacklistAndRecede {
             crashed,
             recede_to,
@@ -490,9 +599,10 @@ pub fn apply_recovery(record: &mut SafeLoopRecord, action: &RecoveryAction) -> T
                 record.consecutive_crashes = record.consecutive_crashes.saturating_add(1);
             }
             if !record.is_blacklisted(crashed) {
-                record
-                    .blacklist
-                    .push(BlacklistRegion::around(crashed.clone(), DEFAULT_BLACKLIST_RADIUS));
+                record.blacklist.push(BlacklistRegion::around(
+                    crashed.clone(),
+                    DEFAULT_BLACKLIST_RADIUS,
+                ));
             }
             push_capped(&mut record.crash_log, *class, 32);
             record.state = SafeLoopState::Unstable;
@@ -527,9 +637,33 @@ fn push_capped<T>(v: &mut Vec<T>, item: T, cap: usize) {
 // ---------------------------------------------------------------------------
 
 const BOOT_FLAG_FILE: &str = "boot_flag.json";
+const BOOT_FLAG_CLEAR_CLAIM_PREFIX: &str = ".boot_flag.json.clear-";
 const RECORD_FILE: &str = "safe_loop.json";
 const HEARTBEAT_FILE: &str = "heartbeat.txt";
 const CLEAN_SHUTDOWN_FILE: &str = "clean_shutdown.txt";
+
+// Boot-flag compare-and-clear must be indivisible relative to every arm/clear in this process. The
+// process lock closes local timer races; the short-lived on-disk claim closes the duplicate-process
+// race. An interrupted claim is deliberately detected as still armed on the next startup.
+static BOOT_FLAG_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn boot_flag_lock() -> std::io::Result<std::sync::MutexGuard<'static, ()>> {
+    BOOT_FLAG_IO_LOCK
+        .lock()
+        .map_err(|_| std::io::Error::other("Safe Loop boot-flag I/O lock is poisoned"))
+}
+
+fn restore_boot_flag_claim(claim: &Path, target: &Path) -> std::io::Result<bool> {
+    match std::fs::hard_link(claim, target) {
+        Ok(()) => {
+            std::fs::remove_file(claim)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        // Keep `claim` as forensic evidence when restoration itself failed.
+        Err(error) => Err(error),
+    }
+}
 
 /// Filesystem-backed store for the Safe Loop. Default location is
 /// `%ProgramData%\Nidavellir` (writable by the SYSTEM/admin service and
@@ -571,29 +705,178 @@ impl SafeLoopStore {
 
     /// Arm the boot-flag before applying a point.
     pub fn arm_boot_flag(&self, flag: &BootFlag) -> std::io::Result<()> {
+        let _guard = boot_flag_lock()?;
         self.ensure_dir()?;
+        let orphaned_claims = self.boot_flag_clear_claims()?;
+        if !orphaned_claims.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "Safe Loop boot flag has {} unfinished clear claim(s); refusing to arm a new transaction",
+                    orphaned_claims.len()
+                ),
+            ));
+        }
         let json = serde_json::to_string_pretty(flag)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(self.boot_flag_path(), json)
+        let temp = self.base.join(format!(
+            ".{BOOT_FLAG_FILE}.arm-{}-{}.tmp",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            // Atomic create-if-absent: a second process can never overwrite an already armed owner.
+            std::fs::hard_link(&temp, self.boot_flag_path())
+        })();
+        let cleanup = std::fs::remove_file(&temp);
+        match (write_result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => Err(std::io::Error::new(
+                error.kind(),
+                format!("boot flag armed but temporary file cleanup failed: {error}"),
+            )),
+            (Err(error), _) => Err(error),
+        }
     }
 
     /// Read the boot-flag if armed.
     pub fn read_boot_flag(&self) -> Option<BootFlag> {
-        let data = std::fs::read_to_string(self.boot_flag_path()).ok()?;
-        serde_json::from_str(strip_bom(&data)).ok()
+        self.read_boot_flag_checked().ok().flatten()
+    }
+
+    /// Strict safety-path boot-flag reader. Missing means disarmed; every other I/O or JSON error
+    /// is returned so corrupt recovery state can never be mistaken for permission to write.
+    pub fn read_boot_flag_checked(&self) -> std::io::Result<Option<BootFlag>> {
+        let _guard = boot_flag_lock()?;
+        self.read_boot_flag_checked_unlocked()
+    }
+
+    fn read_boot_flag_checked_unlocked(&self) -> std::io::Result<Option<BootFlag>> {
+        let current = Self::read_boot_flag_at(&self.boot_flag_path())?;
+        if current.is_some() {
+            return Ok(current);
+        }
+        let claims = self.boot_flag_clear_claims()?;
+        if claims.is_empty() {
+            Ok(None)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Safe Loop boot flag has {} unfinished clear claim(s); recovery remains armed",
+                    claims.len()
+                ),
+            ))
+        }
+    }
+
+    fn boot_flag_clear_claims(&self) -> std::io::Result<Vec<PathBuf>> {
+        let entries = match std::fs::read_dir(&self.base) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut claims = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(BOOT_FLAG_CLEAR_CLAIM_PREFIX) && name.ends_with(".tmp") {
+                claims.push(entry.path());
+            }
+        }
+        Ok(claims)
+    }
+
+    fn read_boot_flag_at(path: &Path) -> std::io::Result<Option<BootFlag>> {
+        let data = match std::fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("read Safe Loop boot flag {}: {error}", path.display()),
+                ))
+            }
+        };
+        serde_json::from_str(strip_bom(&data))
+            .map(Some)
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid Safe Loop boot flag {}: {error}", path.display()),
+                )
+            })
     }
 
     pub fn is_boot_flag_armed(&self) -> bool {
-        self.boot_flag_path().exists()
+        if self.boot_flag_path().exists() {
+            return true;
+        }
+        match self.boot_flag_clear_claims() {
+            Ok(claims) => !claims.is_empty(),
+            // Status is read-only; an unreadable recovery directory must look armed, never clear.
+            Err(_) => true,
+        }
     }
 
     /// Clear the boot-flag after a clean validation.
     pub fn clear_boot_flag(&self) -> std::io::Result<()> {
+        let _guard = boot_flag_lock()?;
+        self.clear_boot_flag_unlocked()
+    }
+
+    fn clear_boot_flag_unlocked(&self) -> std::io::Result<()> {
         match std::fs::remove_file(self.boot_flag_path()) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Clear only when `expected` still owns the flag. Returns `false` when a newer transaction has
+    /// replaced it. The canonical flag is first atomically claimed; a later process can then arm a
+    /// new canonical path without that newer owner ever being deleted by this clear.
+    pub fn clear_boot_flag_if_matches(&self, expected: &BootFlag) -> std::io::Result<bool> {
+        let _guard = boot_flag_lock()?;
+        let target = self.boot_flag_path();
+        let claim = self.base.join(format!(
+            "{BOOT_FLAG_CLEAR_CLAIM_PREFIX}{}-{}.tmp",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        match std::fs::rename(&target, &claim) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let current = match Self::read_boot_flag_at(&claim) {
+            Ok(Some(current)) => current,
+            Ok(None) => unreachable!("claimed boot flag disappeared while locally locked"),
+            Err(error) => {
+                let _ = restore_boot_flag_claim(&claim, &target);
+                return Err(error);
+            }
+        };
+        if expected.same_transaction(&current) {
+            std::fs::remove_file(&claim)?;
+            return Ok(true);
+        }
+
+        // A different transaction was claimed. Restore it only if no still-newer process has
+        // already armed the canonical path. The hard link is create-if-absent and cannot replace
+        // that later owner.
+        if !restore_boot_flag_claim(&claim, &target)? {
+            std::fs::remove_file(&claim)?;
+        }
+        Ok(false)
     }
 
     /// Load the persisted record, or the default if none/unreadable.
@@ -602,6 +885,31 @@ impl SafeLoopStore {
             .ok()
             .and_then(|d| serde_json::from_str(strip_bom(&d)).ok())
             .unwrap_or_default()
+    }
+
+    /// Strict safety-path loader. A missing record means pristine state; every other read or JSON
+    /// error is returned so hardware preflights cannot silently replace unavailable safety state
+    /// with [`SafeLoopRecord::default`].
+    pub fn load_record_checked(&self) -> std::io::Result<SafeLoopRecord> {
+        let path = self.record_path();
+        let data = match std::fs::read_to_string(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SafeLoopRecord::default())
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("read Safe Loop record {}: {error}", path.display()),
+                ))
+            }
+        };
+        serde_json::from_str(strip_bom(&data)).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid Safe Loop record {}: {error}", path.display()),
+            )
+        })
     }
 
     pub fn save_record(&self, record: &SafeLoopRecord) -> std::io::Result<()> {
@@ -756,7 +1064,12 @@ mod tests {
         rec.mark_validated(good.clone());
 
         let action = decide_recovery(None, CrashClass::Unknown, &rec);
-        assert_eq!(action, RecoveryAction::ApplyLastValidated { point: good.clone() });
+        assert_eq!(
+            action,
+            RecoveryAction::ApplyLastValidated {
+                point: good.clone()
+            }
+        );
         assert_eq!(apply_recovery(&mut rec, &action), good);
     }
 
@@ -890,7 +1203,10 @@ mod tests {
             let applied = apply_recovery(&mut rec, &action);
             assert!(applied.is_stock());
         }
-        assert_eq!(rec.consecutive_crashes, 3, "streak must not grow on clean reboots");
+        assert_eq!(
+            rec.consecutive_crashes, 3,
+            "streak must not grow on clean reboots"
+        );
         assert!(rec.safe_mode);
         assert_eq!(rec.state, SafeLoopState::SafeMode);
     }
@@ -900,8 +1216,10 @@ mod tests {
         let mut rec = SafeLoopRecord::default();
         let good = TuningPoint::from_axes([("vcore", -40)]);
         rec.mark_validated(good.clone());
-        rec.blacklist
-            .push(BlacklistRegion::around(TuningPoint::from_axes([("vcore", -80)]), 1));
+        rec.blacklist.push(BlacklistRegion::around(
+            TuningPoint::from_axes([("vcore", -80)]),
+            1,
+        ));
         rec.crash_log.push(CrashClass::OcInstability);
         rec.safe_mode = true;
         rec.consecutive_crashes = 4;
@@ -917,6 +1235,34 @@ mod tests {
         assert_eq!(rec.last_validated, Some(good));
         assert_eq!(rec.blacklist.len(), 1);
         assert_eq!(rec.crash_log, vec![CrashClass::OcInstability]);
+    }
+
+    #[test]
+    fn detector_lab_interruption_returns_to_stock_without_learning() {
+        let good = TuningPoint::from_axes([("gpu_freq_mhz", 1800), ("gpu_vf_bin_mv", 875)]);
+        let mut rec = SafeLoopRecord {
+            last_validated: Some(good.clone()),
+            consecutive_crashes: 2,
+            ..SafeLoopRecord::default()
+        };
+        let interrupted = TuningPoint::from_axes([("gpu_freq_mhz", 1815), ("gpu_vf_bin_mv", 875)]);
+        let flag = BootFlag::new(interrupted.clone(), DETECTOR_LAB_PHASE);
+
+        let action = decide_recovery(Some(&flag), CrashClass::OcInstability, &rec);
+        assert_eq!(
+            action,
+            RecoveryAction::RecoverDiagnosticInterruption {
+                interrupted,
+                class: CrashClass::OcInstability,
+            }
+        );
+        assert!(apply_recovery(&mut rec, &action).is_stock());
+        assert_eq!(rec.state, SafeLoopState::Idle);
+        assert_eq!(rec.last_validated, Some(good));
+        assert_eq!(rec.consecutive_crashes, 2);
+        assert!(rec.blacklist.is_empty());
+        assert!(rec.crash_log.is_empty());
+        assert!(!rec.safe_mode);
     }
 
     #[test]
@@ -970,6 +1316,150 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_run_can_latch_a_later_candidate_crash_without_duplicating_pending_event() {
+        let mut rec = SafeLoopRecord::default();
+        let first = ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash,
+            Some("run-resumed".into()),
+            Some("gpu-1".into()),
+            Some(1920),
+            Some(931),
+            "first TDR",
+        );
+        assert!(rec.record_forge_incident(first.clone()));
+
+        let duplicate_while_pending = ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash,
+            Some("run-resumed".into()),
+            Some("gpu-1".into()),
+            Some(1920),
+            Some(931),
+            "startup reconciliation of the same interruption",
+        );
+        assert!(!rec.record_forge_incident(duplicate_while_pending));
+        assert_eq!(rec.forge_incidents.len(), 1);
+
+        assert_eq!(rec.acknowledge_forge_incident().unwrap().id, first.id);
+        let second = ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash,
+            Some("run-resumed".into()),
+            Some("gpu-1".into()),
+            Some(1860),
+            Some(900),
+            "second TDR after explicit resume",
+        );
+        assert!(rec.record_forge_incident(second.clone()));
+        assert_eq!(rec.pending_forge_incident, Some(second));
+        assert_eq!(rec.forge_incidents.len(), 2);
+        assert!(rec.forge_incidents[0].acknowledged);
+    }
+
+    #[test]
+    fn exact_candidate_crash_promotes_generic_same_run_incident_in_place() {
+        for generic_kind in [
+            ForgeIncidentKind::RuntimeFailure,
+            ForgeIncidentKind::UnaccountedRestart,
+        ] {
+            let mut rec = SafeLoopRecord::default();
+            let generic = ForgeIncident::new(
+                generic_kind,
+                Some("run-promote".into()),
+                Some("gpu-1".into()),
+                None,
+                None,
+                "generic interruption",
+            );
+            assert!(rec.record_forge_incident(generic.clone()));
+
+            let exact = ForgeIncident::new(
+                ForgeIncidentKind::CandidateCrash,
+                Some("run-promote".into()),
+                Some("gpu-1".into()),
+                Some(1860),
+                Some(868),
+                "exact armed candidate",
+            );
+            assert!(rec.record_forge_incident(exact));
+
+            let pending = rec.pending_forge_incident.as_ref().unwrap();
+            assert_eq!(pending.kind, ForgeIncidentKind::CandidateCrash);
+            assert_eq!(
+                (pending.target_mhz, pending.anchor_mv),
+                (Some(1860), Some(868))
+            );
+            assert_eq!(pending.id, generic.id);
+            assert_eq!(pending.detected_at, generic.detected_at);
+            assert_eq!(rec.forge_incidents, vec![pending.clone()]);
+        }
+    }
+
+    #[test]
+    fn exact_candidate_crash_promotes_incomplete_candidate_but_not_operator_or_other_gpu() {
+        let mut incomplete = SafeLoopRecord::default();
+        let partial = ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash,
+            Some("run-partial".into()),
+            Some("gpu-1".into()),
+            Some(1860),
+            None,
+            "candidate coordinates incomplete",
+        );
+        assert!(incomplete.record_forge_incident(partial.clone()));
+        assert!(incomplete.record_forge_incident(ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash,
+            Some("run-partial".into()),
+            Some("gpu-1".into()),
+            Some(1860),
+            Some(868),
+            "candidate coordinates recovered",
+        )));
+        let promoted = incomplete.pending_forge_incident.as_ref().unwrap();
+        assert_eq!(promoted.id, partial.id);
+        assert_eq!(promoted.anchor_mv, Some(868));
+        assert_eq!(incomplete.forge_incidents.len(), 1);
+
+        let mut operator = SafeLoopRecord::default();
+        let field_failure = ForgeIncident::new(
+            ForgeIncidentKind::OperatorFieldFailure,
+            Some("run-operator".into()),
+            Some("gpu-1".into()),
+            Some(1800),
+            Some(875),
+            "operator report",
+        );
+        assert!(operator.record_forge_incident(field_failure.clone()));
+        assert!(!operator.record_forge_incident(ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash,
+            Some("run-operator".into()),
+            Some("gpu-1".into()),
+            Some(1815),
+            Some(875),
+            "must not replace operator evidence",
+        )));
+        assert_eq!(operator.pending_forge_incident, Some(field_failure));
+
+        let mut other_gpu = SafeLoopRecord::default();
+        let generic = ForgeIncident::new(
+            ForgeIncidentKind::RuntimeFailure,
+            Some("run-gpu".into()),
+            Some("gpu-1".into()),
+            None,
+            None,
+            "gpu-1 runtime failure",
+        );
+        assert!(other_gpu.record_forge_incident(generic.clone()));
+        assert!(!other_gpu.record_forge_incident(ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash,
+            Some("run-gpu".into()),
+            Some("gpu-2".into()),
+            Some(1860),
+            Some(868),
+            "different GPU",
+        )));
+        assert_eq!(other_gpu.pending_forge_incident, Some(generic));
+    }
+
+    #[test]
     fn legacy_record_defaults_forge_incident_fields() {
         let rec: SafeLoopRecord = serde_json::from_str(
             r#"{"state":"idle","consecutive_crashes":0,"last_validated":null,"blacklist":[],"safe_mode":false,"crash_log":[]}"#,
@@ -1020,6 +1510,96 @@ mod tests {
     }
 
     #[test]
+    fn delayed_owner_cannot_clear_a_later_boot_transaction() {
+        let dir = std::env::temp_dir().join(format!(
+            "nidavellir-sl-owned-flag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = SafeLoopStore::new(&dir);
+        let first = BootFlag::new(TuningPoint::from_axes([("gpu_freq_mhz", 1800)]), "apply");
+        let later = BootFlag::new(TuningPoint::from_axes([("gpu_freq_mhz", 1815)]), "sentinel");
+        store.arm_boot_flag(&first).unwrap();
+        assert!(
+            store.arm_boot_flag(&later).is_err(),
+            "arming cannot overwrite another transaction"
+        );
+        assert_eq!(store.read_boot_flag_checked().unwrap(), Some(first.clone()));
+        store.clear_boot_flag().unwrap();
+        store.arm_boot_flag(&later).unwrap();
+
+        assert!(!store.clear_boot_flag_if_matches(&first).unwrap());
+        assert_eq!(store.read_boot_flag_checked().unwrap(), Some(later.clone()));
+        assert!(store.clear_boot_flag_if_matches(&later).unwrap());
+        assert_eq!(store.read_boot_flag_checked().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrupted_conditional_clear_remains_fail_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "nidavellir-sl-orphaned-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SafeLoopStore::new(&dir);
+        let claimed = BootFlag::new(
+            TuningPoint::from_axes([("gpu_freq_mhz", 1800)]),
+            "interrupted-clear",
+        );
+        let claim_path = dir.join(format!("{BOOT_FLAG_CLEAR_CLAIM_PREFIX}orphaned-owner.tmp"));
+        std::fs::write(&claim_path, serde_json::to_vec(&claimed).unwrap()).unwrap();
+
+        let error = store.read_boot_flag_checked().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("unfinished clear claim"),
+            "{error}"
+        );
+        assert!(store.is_boot_flag_armed());
+        assert!(
+            store
+                .arm_boot_flag(&BootFlag::new(TuningPoint::stock(), "later"))
+                .is_err(),
+            "an orphaned clear claim must block every later hardware transaction"
+        );
+        assert!(claim_path.exists());
+        assert!(!store.boot_flag_path().exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checked_boot_flag_reader_rejects_corrupt_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "nidavellir-sl-corrupt-flag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = SafeLoopStore::new(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(store.boot_flag_path(), "{ truncated").unwrap();
+
+        let error = store.read_boot_flag_checked().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(BOOT_FLAG_FILE), "{error}");
+        assert!(
+            store.is_boot_flag_armed(),
+            "corrupt flag remains physically armed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_record_tolerates_utf8_bom() {
         let dir = std::env::temp_dir().join(format!("nidavellir-sl-bom-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1027,16 +1607,58 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let json = "\u{feff}{\"intent\":{\"axes\":{\"vcore\":-80}},\"phase\":\"probing\",\"timestamp\":\"2026-05-31T05:00:00Z\"}";
         std::fs::write(store.boot_flag_path(), json).unwrap();
-        let flag = store.read_boot_flag().expect("BOM-prefixed flag should still parse");
+        let flag = store
+            .read_boot_flag()
+            .expect("BOM-prefixed flag should still parse");
         assert_eq!(flag.intent, TuningPoint::from_axes([("vcore", -80)]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_record_defaults_when_missing() {
-        let dir = std::env::temp_dir().join(format!("nidavellir-sl-missing-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nidavellir-sl-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = SafeLoopStore::new(&dir);
         assert_eq!(store.load_record(), SafeLoopRecord::default());
+    }
+
+    #[test]
+    fn checked_load_record_defaults_when_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "nidavellir-sl-checked-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SafeLoopStore::new(&dir);
+
+        assert_eq!(
+            store.load_record_checked().unwrap(),
+            SafeLoopRecord::default()
+        );
+    }
+
+    #[test]
+    fn checked_load_record_rejects_invalid_json_with_path_context() {
+        let dir = std::env::temp_dir().join(format!(
+            "nidavellir-sl-checked-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = SafeLoopStore::new(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(store.record_path(), "{ truncated").unwrap();
+
+        let error = store.load_record_checked().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(RECORD_FILE), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -5,13 +5,37 @@ use nidavellir_core::ipc::{
 };
 use tracing::{debug, warn};
 
+#[cfg(windows)]
+const PIPE_SECURITY_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+
 use crate::AppState;
 use crate::PIPE_NAME;
 use nidavellir_driver_pawnio::DriverManager;
 
-pub fn run_pipe_server(state: Arc<Mutex<AppState>>) -> Result<(), String> {
+pub fn run_pipe_server(
+    state: Arc<Mutex<AppState>>,
+    ready: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+) -> Result<(), String> {
+    serve_clients(|listening| serve_one_client(Arc::clone(&state), listening), ready)
+}
+
+fn serve_clients(
+    mut serve: impl FnMut(&mut dyn FnMut()) -> Result<(), String>,
+    mut ready: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+) -> Result<(), String> {
     loop {
-        match serve_one_client(Arc::clone(&state)) {
+        let mut listening = false;
+        let result = serve(&mut || {
+            listening = true;
+            if let Some(ready) = ready.take() { let _ = ready.send(Ok(())); }
+        });
+        if !listening {
+            // Listener/ACL creation failure is fatal, not a disconnected client to retry forever.
+            let error = result.err().unwrap_or_else(|| "Pipe listener was not created".into());
+            if let Some(ready) = ready.take() { let _ = ready.send(Err(error.clone())); }
+            return Err(error);
+        }
+        match result {
             Ok(()) => debug!("Client disconnected"),
             Err(e) => {
                 // Common on UI reload/close: broken pipe / pipe ended (0x8007006D).
@@ -27,37 +51,66 @@ pub fn run_pipe_server(state: Arc<Mutex<AppState>>) -> Result<(), String> {
     }
 }
 
-fn serve_one_client(state: Arc<Mutex<AppState>>) -> Result<(), String> {
+fn serve_one_client(state: Arc<Mutex<AppState>>, listening: &mut dyn FnMut()) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::io::{BufRead, BufReader};
-        use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED};
+        use windows::Win32::Foundation::{LocalFree, ERROR_PIPE_CONNECTED, HLOCAL};
+        use windows::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
         use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
         use windows::Win32::System::Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-            PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+            ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
         };
 
-        let pipe_name: Vec<u16> = PIPE_NAME
+        let pipe_name: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let pipe_security_sddl: Vec<u16> = PIPE_SECURITY_SDDL
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
+        let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                windows::core::PCWSTR(pipe_security_sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut security_descriptor,
+                None,
+            )
+            .map_err(|error| format!("Named pipe security descriptor failed: {error}"))?;
+        }
+        let security_attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: security_descriptor.0,
+            bInheritHandle: false.into(),
+        };
 
         let handle = unsafe {
             CreateNamedPipeW(
                 windows::core::PCWSTR(pipe_name.as_ptr()),
                 PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES,
                 4096,
                 4096,
                 0,
-                None,
+                Some(&security_attributes),
             )
         };
+        unsafe {
+            let _ = LocalFree(HLOCAL(security_descriptor.0));
+        }
         if handle.is_invalid() {
             return Err("CreateNamedPipeW failed".into());
         }
+        // Every read/write/connect failure must close the instance too. In particular,
+        // a client timeout must not leave an orphaned instance accepting later clients.
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        let _pipe_owner = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        // Creation, not the first client connection, establishes listener readiness.
+        listening();
 
         unsafe {
             if let Err(e) = ConnectNamedPipe(handle, None) {
@@ -68,7 +121,6 @@ fn serve_one_client(state: Arc<Mutex<AppState>>) -> Result<(), String> {
                 // frozen-UI symptom). Any other connect error must close the handle before
                 // returning, or the instance leaks the same way.
                 if e.code() != ERROR_PIPE_CONNECTED.to_hresult() {
-                    let _ = CloseHandle(handle);
                     return Err(format!("ConnectNamedPipe failed: {e}"));
                 }
             }
@@ -88,15 +140,12 @@ fn serve_one_client(state: Arc<Mutex<AppState>>) -> Result<(), String> {
             line.clear();
         }
 
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
         Ok(())
     }
 
     #[cfg(not(windows))]
     {
-        let _ = state;
+        let _ = (state, listening);
         Err("Named pipe server requires Windows".into())
     }
 }
@@ -140,6 +189,9 @@ fn write_pipe(handle: windows::Win32::Foundation::HANDLE, data: &[u8]) -> Result
 }
 
 fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
+    if crate::shutdown::is_requested() {
+        return IpcResponse::failure("Core Service is shutting down; no new action was accepted");
+    }
     let request = match parse_request(line) {
         Ok(r) => r,
         Err(e) => return IpcResponse::failure(e),
@@ -149,11 +201,20 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         Ok(g) => g,
         Err(e) => return IpcResponse::failure(format!("State lock poisoned: {e}")),
     };
+    // Also reject a request that was waiting on a preceding GPU operation when Stop arrived.
+    if crate::shutdown::is_requested() {
+        return IpcResponse::failure("Core Service is shutting down; no new action was accepted");
+    }
 
     if gpu_write_requires_idle(&request) && gpu_operation_running(&guard) {
         return IpcResponse::failure(
             "Another GPU operation owns the service-wide tuning lease; stop it before starting or applying another operation",
         );
+    }
+    if crate::gpu_apply::full_reset_pending(guard.safe_store.base_dir())
+        && (gpu_write_requires_idle(&request) || matches!(request, IpcRequest::StartDetectorLab { .. }))
+    {
+        return IpcResponse::failure("Full Reset was interrupted; retry Full Reset before tuning");
     }
     if gpu_reboot_guard_applies(&request) {
         if let Some(event) = crate::tdr_sentinel::reboot_required_event() {
@@ -163,18 +224,34 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         }
     }
 
+    if crate::development_validation::enabled()
+        && (gpu_write_requires_idle(&request) || matches!(request, IpcRequest::StartDetectorLab { .. }))
+        && !crate::development_validation::allows_tuning_request(&request)
+    {
+        return IpcResponse::failure("Development validation permits only one fresh Standard Forge. Resume, Long, other tuning workers and profile Apply require a separate review.");
+    }
+
     match &request {
         IpcRequest::Ping => IpcResponse::success(ResponseData::Pong),
+        IpcRequest::AuthorizeDevelopmentValidation { reason } => {
+            match crate::development_validation::authorize(&guard.safe_store, reason) {
+                Ok(()) => {
+                    let mut progress = guard.power_sweep.progress();
+                    progress.start_block_reason = crate::gpu_power_sweep::forge_start_block_reason(&guard.safe_store);
+                    progress.development_validation_note = crate::development_validation::status_note();
+                    IpcResponse::success(ResponseData::PowerSweep(progress))
+                }
+                Err(error) => IpcResponse::failure(error),
+            }
+        }
         IpcRequest::DetectHardware => {
             let mut hw = nidavellir_core::detect_hardware();
             refine_cpu_max_clock(&mut hw.cpu, &guard.driver);
             IpcResponse::success(ResponseData::Hardware(hw))
         }
         IpcRequest::ReadSensors => {
-            let input = crate::sensor_gather::gather_sensor_input(
-                &guard.driver,
-                &guard.motherboard,
-            );
+            let input =
+                crate::sensor_gather::gather_sensor_input(&guard.driver, &guard.motherboard);
             let sensors = guard.sensor_engine.read(&input);
             IpcResponse::success(ResponseData::Sensors(sensors))
         }
@@ -197,15 +274,20 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         }
         IpcRequest::AcknowledgeForgeIncident => {
             match crate::safe_loop_runtime::acknowledge_forge_incident(&guard.safe_store) {
-                Ok(_) => IpcResponse::success(ResponseData::SafeLoop(
-                    crate::safe_loop_runtime::status_snapshot(&guard.safe_store),
-                )),
+                Ok(acknowledged) => {
+                    if acknowledged {
+                        guard.power_sweep.refresh_resume_state(&guard.safe_store);
+                    }
+                    IpcResponse::success(ResponseData::SafeLoop(
+                        crate::safe_loop_runtime::status_snapshot(&guard.safe_store),
+                    ))
+                }
                 Err(e) => IpcResponse::failure(e),
             }
         }
-        IpcRequest::GetGpuCurve => {
-            IpcResponse::success(ResponseData::GpuCurve(crate::gpu_real::read_curve_snapshot()))
-        }
+        IpcRequest::GetGpuCurve => IpcResponse::success(ResponseData::GpuCurve(
+            crate::gpu_real::read_curve_snapshot(),
+        )),
         IpcRequest::StartGpuValidation => {
             if guard.gpu_validation.start() {
                 IpcResponse::success(ResponseData::GpuValidation(guard.gpu_validation.status()))
@@ -218,7 +300,10 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         }
         IpcRequest::StartRealSweep => {
             let store = guard.safe_store.clone();
-            if guard.real_sweep.start(store, crate::gpu_sweep_real::Quality::thorough()) {
+            if guard
+                .real_sweep
+                .start(store, crate::gpu_sweep_real::Quality::thorough())
+            {
                 IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
             } else {
                 IpcResponse::failure("Real sweep already running")
@@ -226,7 +311,10 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         }
         IpcRequest::StartRealSweepFast => {
             let store = guard.safe_store.clone();
-            if guard.real_sweep.start(store, crate::gpu_sweep_real::Quality::fast()) {
+            if guard
+                .real_sweep
+                .start(store, crate::gpu_sweep_real::Quality::fast())
+            {
                 IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
             } else {
                 IpcResponse::failure("Real sweep already running")
@@ -263,16 +351,24 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             });
             match chosen {
                 Some((name, point)) => {
-                    let mut ap = crate::gpu_apply::load_applied().unwrap_or_default();
+                    let mut ap = match crate::gpu_apply::load_applied_checked() {
+                        Ok(profile) => profile.unwrap_or_default(),
+                        Err(error) => return IpcResponse::failure(error),
+                    };
                     ap.label = name.clone();
                     ap.core = Some(point);
-                    let msg = match crate::gpu_apply::apply_and_persist(
-                        ap.label.clone(), ap.core, ap.mem_offset_mhz, &guard.safe_store,
-                    ) {
-                        Ok(()) => format!("Applied {} ({} MHz @ {} mV)", name, point.freq_mhz, point.voltage_mv),
-                        Err(e) => format!("Apply failed: {e}"),
-                    };
-                    IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
+                    gpu_apply_result_response(
+                        crate::gpu_apply::apply_and_persist(
+                            ap.label.clone(),
+                            ap.core,
+                            ap.mem_offset_mhz,
+                            &guard.safe_store,
+                        ),
+                        format!(
+                            "Applied {} ({} MHz @ {} mV)",
+                            name, point.freq_mhz, point.voltage_mv
+                        ),
+                    )
                 }
                 None => IpcResponse::failure("Run the core sweep first"),
             }
@@ -282,88 +378,123 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             if peak <= 0 {
                 IpcResponse::failure("Run the memory sweep first")
             } else {
-                let mut ap = crate::gpu_apply::load_applied().unwrap_or_default();
+                let mut ap = match crate::gpu_apply::load_applied_checked() {
+                    Ok(profile) => profile.unwrap_or_default(),
+                    Err(error) => return IpcResponse::failure(error),
+                };
                 ap.mem_offset_mhz = Some(peak);
                 if ap.label.is_empty() {
                     ap.label = "Custom".into();
                 }
-                let msg = match crate::gpu_apply::apply_and_persist(
-                    ap.label.clone(), ap.core, ap.mem_offset_mhz, &guard.safe_store,
-                ) {
-                    Ok(()) => format!("Applied memory +{peak} MHz"),
-                    Err(e) => format!("Apply failed: {e}"),
-                };
-                IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
+                gpu_apply_result_response(
+                    crate::gpu_apply::apply_with_memory_offset(ap, peak, &guard.safe_store),
+                    format!("Applied memory +{peak} MHz"),
+                )
             }
         }
         IpcRequest::ResetGpuTuning => {
+            crate::development_validation::finish("stock reset requested", None);
             // Reset is the emergency recovery path after a TDR/interrupted forge. It must remain
             // available even if a worker is still marked running, so it is intentionally outside the
             // service-wide start/apply lease. Best-effort stop first; reset then clears Safe Loop.
-            guard.real_sweep.stop();
-            guard.mem_sweep.stop();
-            guard.forge_all.stop();
-            guard.benchmark.stop();
-            guard.power_sweep.abort();
-            guard.detector_lab.stop();
-            let msg = match crate::gpu_apply::reset(&guard.safe_store) {
+            request_mutating_worker_stop(&mut guard, false);
+            if let Err(error) = wait_for_mutating_workers_to_quiesce(&guard) {
+                let emergency_stock = crate::gpu_power_sweep::reset_to_stock_checked();
+                return IpcResponse::failure(match emergency_stock {
+                    Ok(()) => format!(
+                        "Reset failed: {error}. GPU was returned to stock as an emergency action, but boot/recovery state was preserved; retry after the worker exits"
+                    ),
+                    Err(stock_error) => format!(
+                        "Reset failed: {error}. Emergency stock reset also failed ({stock_error}); boot/recovery state was preserved"
+                    ),
+                });
+            }
+            match crate::gpu_apply::reset(&guard.safe_store) {
                 Ok(()) => {
                     guard.manual_point.mark_reset();
                     guard.power_sweep.recover_after_reset(
                         "Reset concluído; GPU em stock e Safe Loop desarmado. O checkpoint e a sequência da Forge foram preservados.",
                     );
-                    "Reset to stock; Forge checkpoint preserved".to_string()
+                    IpcResponse::success(ResponseData::GpuApply(applied_status(
+                        "Reset to stock; Forge checkpoint preserved".to_string(),
+                    )))
                 }
-                Err(e) => format!("Reset failed: {e}"),
-            };
-            IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
+                Err(e) => reset_failure_response(e),
+            }
         }
-        IpcRequest::ResetGpuTuningFull => {
-            // Deep active-learning reset. Same emergency recovery as ResetGpuTuning (outside the
-            // start/apply lease), but additionally wipes the Safe Loop working blacklist (by
-            // replacing the record with the default), the F2 observation frontier, and legacy
-            // knowledge. The durable condemnation ledger remains hardware-derived field evidence;
-            // the UI arms the next Forge as Clean Run so that ledger does not steer the experiment.
-            // Hardware → stock and the latch are handled by gpu_apply::reset first.
-            guard.real_sweep.stop();
-            guard.mem_sweep.stop();
-            guard.forge_all.stop();
-            guard.benchmark.stop();
-            guard.power_sweep.abort();
-            guard.detector_lab.stop();
-            let msg = match crate::gpu_apply::reset(&guard.safe_store) {
-                Ok(()) => {
-                    guard.manual_point.mark_reset();
-                    let mut problems: Vec<String> = Vec::new();
-                    // Replace the whole Safe Loop record with the default — this is what additionally
-                    // drops the blacklist that the latch-only reset preserves.
-                    if let Err(e) = guard
-                        .safe_store
-                        .save_record(&nidavellir_core::safe_loop::SafeLoopRecord::default())
-                    {
-                        problems.push(format!("safe loop record: {e}"));
-                    }
-                    problems.extend(crate::gpu_apply::clear_all_learning());
-                    if let Err(e) = crate::gpu_power_sweep::clear_persisted_forge_state() {
-                        problems.push(format!("forge checkpoint: {e}"));
-                    }
-                    // The sentinel's persisted history (baseline, status card, event log) is part of
-                    // the learned state — wipe it too so a full reset leaves nothing inconsistent with
-                    // the now-empty blacklist.
-                    problems.extend(crate::tdr_sentinel::reset_sentinel_state());
-                    guard.power_sweep.forget_after_full_reset(
-                        "Reset completo concluído; GPU em stock, aprendizado ativo apagado e condenações reais duráveis preservadas.",
-                    );
-                    if problems.is_empty() {
-                        "Full reset to stock; active learning cleared and durable real-world condemnations preserved"
-                            .to_string()
-                    } else {
-                        format!("Full reset to stock; some state could not be cleared: {}", problems.join("; "))
-                    }
-                }
-                Err(e) => format!("Reset failed: {e}"),
+        IpcRequest::ResetGpuTuningFull | IpcRequest::ResetGpuTuningSoft => {
+            let full = matches!(request, IpcRequest::ResetGpuTuningFull);
+            crate::development_validation::finish("learning reset requested", None);
+            request_mutating_worker_stop(&mut guard, false);
+            if let Err(error) = wait_for_mutating_workers_to_quiesce(&guard) {
+                return IpcResponse::failure(format!(
+                    "Learning reset refused before touching applied/Safe Loop/learning state: {error}"
+                ));
+            }
+            let _sentinel = match crate::tdr_sentinel::lock_reset_activity() {
+                Ok(activity) => activity,
+                Err(error) => return IpcResponse::failure(error),
             };
-            IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
+            if let Some(event) = crate::tdr_sentinel::reboot_required_event() {
+                return IpcResponse::failure(format!("Restart Windows before resetting learning after GPU driver reset {event}"));
+            }
+            if full {
+                if let Err(error) = crate::gpu_apply::reset(&guard.safe_store) {
+                    return reset_failure_response(error);
+                }
+                if let Err(error) = crate::gpu_apply::forget_all_gpu_learning(&guard.safe_store) {
+                    return IpcResponse::failure(error);
+                }
+                forget_worker_results(&mut guard);
+                guard.power_sweep.forget_after_full_reset(
+                    "Full Reset concluído; GPU em stock, todo aprendizado, blacklist e histórico de falhas apagados.",
+                );
+                return IpcResponse::success(ResponseData::GpuApply(applied_status(
+                    "Full Reset completed; GPU at stock and all saved GPU learning, profiles, blacklist and failure history erased".into(),
+                )));
+            }
+            if crate::gpu_apply::full_reset_pending(guard.safe_store.base_dir()) {
+                return IpcResponse::failure("An incomplete Full Reset must be retried as Full Reset, not Soft Reset");
+            }
+            if let Err(error) = guard.safe_store.load_record_checked() {
+                let _ = crate::gpu_power_sweep::reset_to_stock_checked();
+                return IpcResponse::failure(format!(
+                    "Soft reset refused because the Safe Loop record is unreadable; positive learning, applied descriptor and checkpoint were preserved: {error}"
+                ));
+            }
+            if let Err(error) = guard.safe_store.read_boot_flag_checked() {
+                let _ = crate::gpu_power_sweep::reset_to_stock_checked();
+                return IpcResponse::failure(format!(
+                    "Soft reset refused because the boot flag is unreadable and remains armed; positive learning, applied descriptor and checkpoint were preserved: {error}"
+                ));
+            }
+            // Stock is attempted first without touching Safe Loop/checkpoint. Therefore corrupt F2
+            // JSONL or a failed atomic rewrite cannot erase the pending latch/blacklist/checkpoint.
+            if let Err(error) = crate::gpu_apply::reset_hardware_and_descriptor_only() {
+                return reset_failure_response(error);
+            }
+            guard.manual_point.mark_reset();
+            if let Err(error) = crate::gpu_apply::clear_all_learning() {
+                return IpcResponse::failure(format!(
+                    "Soft reset stopped before changing Safe Loop/checkpoint: {error}"
+                ));
+            }
+            if let Err(error) = crate::gpu_apply::reset(&guard.safe_store) {
+                return reset_failure_response(error);
+            }
+            if let Err(error) = crate::gpu_power_sweep::finish_soft_reset(&guard.safe_store) {
+                return IpcResponse::failure(format!(
+                    "Soft reset reached stock but recovery could not be completed: {error}"
+                ));
+            }
+            forget_worker_results(&mut guard);
+            guard.power_sweep.forget_after_full_reset(
+                "Soft Reset concluído; GPU em stock, evidência positiva apagada e histórico de falhas preservado.",
+            );
+            IpcResponse::success(ResponseData::GpuApply(applied_status(
+                "Soft Reset completed; GPU at stock, profiles and positive learning cleared, known failures preserved"
+                    .to_string(),
+            )))
         }
         IpcRequest::GetAppliedProfile => {
             IpcResponse::success(ResponseData::GpuApply(applied_status(String::new())))
@@ -407,42 +538,38 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         }
         IpcRequest::StartPowerSweep => {
             let store = guard.safe_store.clone();
-            if guard.power_sweep.start(store) {
-                IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
-            } else {
-                IpcResponse::failure(power_sweep_start_failure(&guard.safe_store))
+            match guard.power_sweep.start(store) {
+                Ok(()) => IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress())),
+                Err(error) => IpcResponse::failure(error),
             }
         }
         IpcRequest::StartPowerSweepClean => {
             let store = guard.safe_store.clone();
-            if guard.power_sweep.start_clean_run(store) {
-                IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
-            } else {
-                IpcResponse::failure(power_sweep_start_failure(&guard.safe_store))
+            match guard.power_sweep.start_clean_run(store) {
+                Ok(()) => IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress())),
+                Err(error) => IpcResponse::failure(error),
             }
         }
         IpcRequest::StartPowerSweepFast => {
             // Backward-compatible wire alias only. Fast no longer exists as a Forge behavior;
             // an older UI therefore receives the same bounded, fully qualified Standard run.
             let store = guard.safe_store.clone();
-            if guard
+            match guard
                 .power_sweep
                 .start_with_mode(store, crate::gpu_power_sweep::PowerSweepMode::Standard)
             {
-                IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
-            } else {
-                IpcResponse::failure(power_sweep_start_failure(&guard.safe_store))
+                Ok(()) => IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress())),
+                Err(error) => IpcResponse::failure(error),
             }
         }
         IpcRequest::StartPowerSweepLong => {
             let store = guard.safe_store.clone();
-            if guard
+            match guard
                 .power_sweep
                 .start_with_mode(store, crate::gpu_power_sweep::PowerSweepMode::Long)
             {
-                IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
-            } else {
-                IpcResponse::failure(power_sweep_start_failure(&guard.safe_store))
+                Ok(()) => IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress())),
+                Err(error) => IpcResponse::failure(error),
             }
         }
         IpcRequest::StopPowerSweep => {
@@ -457,7 +584,10 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             }
         }
         IpcRequest::GetPowerSweepProgress => {
-            IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
+            let mut progress = guard.power_sweep.progress();
+            progress.start_block_reason = crate::gpu_power_sweep::forge_start_block_reason(&guard.safe_store);
+            progress.development_validation_note = crate::development_validation::status_note();
+            IpcResponse::success(ResponseData::PowerSweep(progress))
         }
         IpcRequest::ApplyPowerGodforge => {
             let prog = guard.power_sweep.progress();
@@ -518,6 +648,19 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                 Err(error) => IpcResponse::failure(error),
             }
         }
+        IpcRequest::ApplyManualDiagnosticCurvePoint {
+            target_mhz,
+            voltage_mv,
+        } => {
+            let store = guard.safe_store.clone();
+            match guard
+                .manual_point
+                .apply_curve(&store, *target_mhz, *voltage_mv)
+            {
+                Ok(status) => IpcResponse::success(ResponseData::ManualDiagnosticPoint(status)),
+                Err(error) => IpcResponse::failure(error),
+            }
+        }
         IpcRequest::ResetManualDiagnosticPoint => {
             if guard.detector_lab.running() {
                 return IpcResponse::failure(
@@ -530,9 +673,9 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                 Err(error) => IpcResponse::failure(error),
             }
         }
-        IpcRequest::GetManualDiagnosticPointStatus => {
-            IpcResponse::success(ResponseData::ManualDiagnosticPoint(guard.manual_point.status()))
-        }
+        IpcRequest::GetManualDiagnosticPointStatus => IpcResponse::success(
+            ResponseData::ManualDiagnosticPoint(guard.manual_point.status()),
+        ),
         IpcRequest::StartDetectorLab { recipe, duration_s } => {
             let store = guard.safe_store.clone();
             let manual_status = guard.manual_point.status_slot();
@@ -560,34 +703,106 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
     }
 }
 
-fn power_sweep_start_failure(store: &nidavellir_core::safe_loop::SafeLoopStore) -> String {
-    if store.load_record().pending_forge_incident.is_some() {
-        "Forge recovery requires explicit operator acknowledgement before continuation".into()
+pub(crate) fn gpu_operation_running(state: &AppState) -> bool {
+    state.gpu_validation.is_running()
+        || state.real_sweep.is_running()
+        || state.mem_sweep.is_running()
+        || state.forge_all.is_running()
+        || state.benchmark.is_running()
+        || crate::gpu_power_sweep::FORGE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+        || state.manual_point.status().active
+        || state.detector_lab.running()
+}
+
+const RESET_QUIESCENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const RESET_QUIESCENCE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+pub(crate) fn request_mutating_worker_stop(state: &mut AppState, pause_forge: bool) {
+    state.gpu_validation.stop();
+    state.real_sweep.stop();
+    state.mem_sweep.stop();
+    state.forge_all.stop();
+    state.benchmark.stop();
+    if pause_forge { state.power_sweep.stop(); } else { state.power_sweep.abort(); }
+    state.detector_lab.stop();
+}
+
+fn mutating_worker_names(state: &AppState) -> Vec<&'static str> {
+    let mut running = Vec::new();
+    if state.gpu_validation.is_running() {
+        running.push("GPU validation");
+    }
+    if state.real_sweep.is_running() {
+        running.push("real sweep");
+    }
+    if state.mem_sweep.is_running() {
+        running.push("memory sweep");
+    }
+    if state.forge_all.is_running() {
+        running.push("forge all");
+    }
+    if state.benchmark.is_running() {
+        running.push("benchmark");
+    }
+    if crate::gpu_power_sweep::FORGE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        running.push("power sweep");
+    }
+    if state.detector_lab.running() {
+        running.push("Detector Lab");
+    }
+    running
+}
+
+fn reset_quiescence_decision(running: &[&str], timeout: std::time::Duration) -> Result<(), String> {
+    if running.is_empty() {
+        Ok(())
     } else {
-        "Power sweep already running".into()
+        Err(format!(
+            "mutating GPU worker did not stop within {}s: {}",
+            timeout.as_secs(),
+            running.join(", ")
+        ))
     }
 }
 
-fn gpu_operation_running(state: &AppState) -> bool {
-    state.gpu_validation.status().running
-        || !matches!(
-            state.real_sweep.progress().phase,
-            nidavellir_core::gpu_sweep::SweepPhase::Idle
-                | nidavellir_core::gpu_sweep::SweepPhase::Done
-                | nidavellir_core::gpu_sweep::SweepPhase::Aborted
-        )
-        || state.mem_sweep.progress().running
-        || state.forge_all.progress().running
-        || state.benchmark.progress().running
-        || state.power_sweep.progress().running
-        || state.manual_point.status().active
-        || state.detector_lab.running()
+pub(crate) fn wait_for_mutating_workers_to_quiesce(state: &AppState) -> Result<(), String> {
+    wait_for_workers(RESET_QUIESCENCE_TIMEOUT, RESET_QUIESCENCE_POLL, || mutating_worker_names(state))
+}
+
+fn wait_for_workers(
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+    mut running_workers: impl FnMut() -> Vec<&'static str>,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        let running = running_workers();
+        if running.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return reset_quiescence_decision(&running, timeout);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+fn reset_failure_response(error: impl std::fmt::Display) -> IpcResponse {
+    IpcResponse::failure(format!("Reset failed: {error}"))
+}
+
+fn gpu_apply_result_response(result: Result<(), String>, success_message: String) -> IpcResponse {
+    match result {
+        Ok(()) => IpcResponse::success(ResponseData::GpuApply(applied_status(success_message))),
+        Err(error) => IpcResponse::failure(format!("Apply failed: {error}")),
+    }
 }
 
 fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
     matches!(
         request,
-        IpcRequest::StartGpuValidation
+        IpcRequest::AuthorizeDevelopmentValidation { .. }
+            | IpcRequest::StartGpuValidation
             | IpcRequest::StartRealSweep
             | IpcRequest::StartRealSweepFast
             | IpcRequest::StartMemSweep
@@ -606,11 +821,27 @@ fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
             | IpcRequest::ApplyPowerBrokkrs
             | IpcRequest::ApplyPowerDeepCalm
             | IpcRequest::ApplyManualDiagnosticPoint { .. }
+            | IpcRequest::ApplyManualDiagnosticCurvePoint { .. }
     )
 }
 
 fn gpu_reboot_guard_applies(request: &IpcRequest) -> bool {
-    gpu_write_requires_idle(request) || matches!(request, IpcRequest::StartDetectorLab { .. })
+    gpu_write_requires_idle(request)
+        || matches!(
+            request,
+            IpcRequest::StartDetectorLab { .. } | IpcRequest::ResetGpuTuningFull | IpcRequest::ResetGpuTuningSoft
+        )
+}
+
+// Only after worker quiescence and a completed learning reset: no stale in-memory profile
+// may remain applicable through a legacy IPC method after its disk evidence was forgotten.
+fn forget_worker_results(state: &mut AppState) {
+    state.gpu_validation = Default::default();
+    state.real_sweep = Default::default();
+    state.mem_sweep = Default::default();
+    state.forge_all = Default::default();
+    state.benchmark = Default::default();
+    state.manual_point = Default::default();
 }
 
 /// Route a forge-profile apply to the correct writer (Phase 2). When the active forge produced an F2
@@ -624,7 +855,14 @@ fn apply_forge_profile(
     pt: Option<nidavellir_core::ipc::PowerSweepPoint>,
     label: &str,
 ) -> IpcResponse {
-    let record = store.load_record();
+    let record = match store.load_record_checked() {
+        Ok(record) => record,
+        Err(error) => {
+            return IpcResponse::failure(format!(
+                "Safe Loop record is unreadable; Apply refused: {error}"
+            ))
+        }
+    };
     if record.pending_forge_incident.is_some() {
         return IpcResponse::failure(
             "Forge recovery requires explicit operator acknowledgement before Apply",
@@ -637,28 +875,14 @@ fn apply_forge_profile(
             );
         }
         if let Some(point) = pt {
-            let (target_mhz, anchor_mv) = undervolt_apply_params(&point);
-            #[cfg(windows)]
-            let ledger_condemned = nidavellir_core::condemnation::CondemnationLedger::new(
-                store.base_dir(),
-            )
-            .condemned_pairs(&crate::gpu_power_sweep::current_gpu_key())
-            .refuses(target_mhz, anchor_mv);
-            #[cfg(not(windows))]
-            let ledger_condemned = false;
-            if crate::gpu_undervolt::field_pair_blacklisted(&record, target_mhz, anchor_mv)
-                || ledger_condemned
-            {
-                return IpcResponse::failure(
-                    "F2 profile is condemned by durable real-use evidence on this GPU — run Forge again",
-                );
-            }
-            apply_undervolt_profile(store, Some(point), label)
+            apply_undervolt_profile(store, Some(point), label, prog.run_id.as_deref())
         } else {
-            apply_undervolt_profile(store, None, label)
+            apply_undervolt_profile(store, None, label, prog.run_id.as_deref())
         }
     } else {
-        apply_power_profile(store, pt, label)
+        IpcResponse::failure(
+            "Legacy Forge V/F profiles have no exact-Apply v29 GPU/run proof and cannot be applied; run Forge again",
+        )
     }
 }
 
@@ -679,6 +903,7 @@ fn apply_undervolt_profile(
     store: &nidavellir_core::safe_loop::SafeLoopStore,
     pt: Option<nidavellir_core::ipc::PowerSweepPoint>,
     label: &str,
+    qualification_run_id: Option<&str>,
 ) -> IpcResponse {
     let Some(p) = pt else {
         return IpcResponse::failure("Run the forge first (no point for this profile)");
@@ -693,57 +918,52 @@ fn apply_undervolt_profile(
     }
     if !p.apply_qualified
         || p.apply_qualification_version
-            != Some(
-                nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
-            )
+            != Some(nidavellir_core::f2_observation::F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION)
     {
         return IpcResponse::failure(
-            "F2 profile was not reconciled and qualified under the current v6 contract — run Forge again",
+            "F2 profile was not reconciled and qualified under the current exact-Apply v29 contract — run Forge again",
         );
     }
     let (target_mhz, anchor_mv) = undervolt_apply_params(&p);
-    let mem = crate::gpu_apply::load_applied().unwrap_or_default().mem_offset_mhz;
-    let msg = match crate::gpu_apply::apply_and_persist_undervolt(
+    let Some(qualification_run_id) = qualification_run_id else {
+        return IpcResponse::failure(
+            "F2 profile has no exact qualification run identity — run Forge again",
+        );
+    };
+    #[cfg(windows)]
+    let gpu_key = crate::gpu_power_sweep::current_gpu_key();
+    #[cfg(not(windows))]
+    let gpu_key = "unsupported".to_string();
+    let mem = match crate::gpu_apply::load_applied_checked() {
+        Ok(profile) => profile.unwrap_or_default().mem_offset_mhz,
+        Err(error) => return IpcResponse::failure(error),
+    };
+    match crate::gpu_apply::apply_and_persist_undervolt(
         label.into(),
         target_mhz,
         anchor_mv,
+        gpu_key,
+        qualification_run_id.to_string(),
+        nidavellir_core::f2_observation::F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION,
         mem,
         store,
     ) {
-        Ok(()) => format!("Applied {label}: {target_mhz} MHz @ {anchor_mv} mV VF bin (undervolt)"),
-        Err(e) => format!("Apply failed: {e}"),
-    };
-    IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
-}
-
-/// Apply a power-sweep profile point (core voltage + clock, with the hard clock
-/// cap) and persist it, keeping any existing memory offset.
-fn apply_power_profile(
-    store: &nidavellir_core::safe_loop::SafeLoopStore,
-    pt: Option<nidavellir_core::ipc::PowerSweepPoint>,
-    label: &str,
-) -> IpcResponse {
-    let Some(p) = pt else {
-        return IpcResponse::failure("Run the power sweep first (no point for this profile)");
-    };
-    let mut ap = crate::gpu_apply::load_applied().unwrap_or_default();
-    ap.core = Some(nidavellir_core::gpu_sweep::VfPoint {
-        freq_mhz: p.clock_mhz,
-        voltage_mv: p.voltage_mv,
-    });
-    ap.label = label.into();
-    let msg = match crate::gpu_apply::apply_and_persist(ap.label.clone(), ap.core, ap.mem_offset_mhz, store) {
-        Ok(()) => format!("Applied {label}: {} MHz @ {} mV", p.clock_mhz, p.voltage_mv),
-        Err(e) => format!("Apply failed: {e}"),
-    };
-    IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
+        Ok(()) => IpcResponse::success(ResponseData::GpuApply(applied_status(format!(
+            "Applied {label}: {target_mhz} MHz @ {anchor_mv} mV VF bin (undervolt)"
+        )))),
+        Err(e) => IpcResponse::failure(format!("Apply failed: {e}")),
+    }
 }
 
 /// Build the apply-status payload from the persisted profile.
 fn applied_status(message: String) -> nidavellir_core::ipc::GpuApplyStatus {
     let ap = crate::gpu_apply::load_applied().unwrap_or_default();
     nidavellir_core::ipc::GpuApplyStatus {
-        label: if ap.label.is_empty() { None } else { Some(ap.label) },
+        label: if ap.label.is_empty() {
+            None
+        } else {
+            Some(ap.label)
+        },
         core: ap.core,
         mem_offset_mhz: ap.mem_offset_mhz,
         message,
@@ -757,10 +977,7 @@ fn applied_status(message: String) -> nidavellir_core::ipc::GpuApplyStatus {
 /// The actual turbo ceiling lives in MSR_TURBO_RATIO_LIMIT (0x1AD); we fall
 /// back to IA32_HWP_CAPABILITIES (0x771). Intel-only: AMD encodes ratios
 /// differently (COF), so we leave its value untouched.
-fn refine_cpu_max_clock(
-    cpu: &mut nidavellir_core::detector::CpuInfo,
-    driver: &DriverManager,
-) {
+fn refine_cpu_max_clock(cpu: &mut nidavellir_core::detector::CpuInfo, driver: &DriverManager) {
     use nidavellir_core::msr;
 
     if cpu.vendor != "Intel" {
@@ -796,6 +1013,107 @@ fn refine_cpu_max_clock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_failure_is_reported_without_readiness_or_infinite_retry() {
+        let (ready, result) = std::sync::mpsc::sync_channel(1);
+        let mut attempts = 0;
+        let failure = serve_clients(|_| {
+            attempts += 1;
+            Err("injected listener permission failure".into())
+        }, Some(ready));
+        assert_eq!(attempts, 1);
+        assert_eq!(failure, Err("injected listener permission failure".into()));
+        assert_eq!(result.recv().unwrap(), failure);
+    }
+
+    #[test]
+    fn client_disconnect_retries_without_announcing_readiness_again() {
+        let (ready, result) = std::sync::mpsc::sync_channel(1);
+        let mut attempts = 0;
+        let failure = serve_clients(|listening| {
+            attempts += 1;
+            if attempts <= 2 {
+                listening();
+                Err("broken pipe".into())
+            } else {
+                Err("listener recreation failed".into())
+            }
+        }, Some(ready));
+        assert_eq!(attempts, 3);
+        assert_eq!(failure, Err("listener recreation failed".into()));
+        assert_eq!(result.recv().unwrap(), Ok(()));
+        assert!(result.try_recv().is_err());
+    }
+
+    #[test]
+    fn reset_failure_is_returned_as_an_ipc_failure() {
+        let response = reset_failure_response("voltage lock still active");
+        assert!(!response.ok);
+        assert!(response.data.is_none());
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Reset failed: voltage lock still active")
+        );
+    }
+
+    #[test]
+    fn f1_apply_failure_is_returned_as_an_ipc_failure() {
+        let response = gpu_apply_result_response(
+            Err("checked safety preflight refused the pair".into()),
+            "must not be visible".into(),
+        );
+        assert!(!response.ok);
+        assert!(response.data.is_none());
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Apply failed: checked safety preflight refused the pair")
+        );
+    }
+
+    #[test]
+    fn reset_quiescence_refuses_persistent_worker_and_allows_quiet_state() {
+        assert!(reset_quiescence_decision(&[], RESET_QUIESCENCE_TIMEOUT).is_ok());
+        let error = reset_quiescence_decision(&["power sweep", "Detector Lab"], RESET_QUIESCENCE_TIMEOUT).unwrap_err();
+        assert!(error.contains("did not stop"), "{error}");
+        assert!(error.contains("power sweep"), "{error}");
+        assert!(error.contains("Detector Lab"), "{error}");
+    }
+
+    #[test]
+    fn quiescence_waits_for_the_last_worker_and_names_a_stalled_worker() {
+        use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
+        use std::time::Duration;
+        let active = Arc::new(AtomicBool::new(true));
+        let remaining = active.clone();
+        let (entered, observed) = mpsc::channel();
+        let (done, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = wait_for_workers(Duration::from_secs(2), Duration::from_millis(1), || {
+                // The power worker has finished, but GPU validation still owns its context.
+                let running = if remaining.load(Ordering::SeqCst) { vec!["GPU validation"] } else { vec![] };
+                let _ = entered.send(());
+                running
+            });
+            done.send(outcome).unwrap();
+        });
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(result.try_recv().is_err());
+        active.store(false, Ordering::SeqCst);
+        result.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        worker.join().unwrap();
+        let error = wait_for_workers(Duration::from_millis(10), Duration::from_millis(1), || vec!["GPU validation"]).unwrap_err();
+        assert!(error.contains("GPU validation"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_acl_is_local_and_allows_the_unelevated_interactive_ui() {
+        assert!(PIPE_SECURITY_SDDL.contains("(A;;GA;;;SY)"));
+        assert!(PIPE_SECURITY_SDDL.contains("(A;;GA;;;BA)"));
+        assert!(PIPE_SECURITY_SDDL.contains("(A;;GRGW;;;IU)"));
+        assert!(!PIPE_SECURITY_SDDL.contains(";;;WD)"));
+    }
     use nidavellir_core::ipc::PowerSweepProgress;
 
     use nidavellir_core::ipc::PowerSweepPoint;
@@ -817,7 +1135,11 @@ mod tests {
     #[test]
     fn undervolt_apply_params_fall_back_to_measured_for_legacy_points() {
         // A legacy point without the deterministic fields falls back to measured clock/voltage.
-        let p = PowerSweepPoint { clock_mhz: 1800, voltage_mv: 906, ..Default::default() };
+        let p = PowerSweepPoint {
+            clock_mhz: 1800,
+            voltage_mv: 906,
+            ..Default::default()
+        };
         assert_eq!(undervolt_apply_params(&p), (1800, 906));
     }
 
@@ -833,7 +1155,10 @@ mod tests {
         };
         assert!(f2.is_undervolt);
         let f1 = PowerSweepProgress::default();
-        assert!(!f1.is_undervolt, "default must keep the legacy F1 apply behavior");
+        assert!(
+            !f1.is_undervolt,
+            "default must keep the legacy F1 apply behavior"
+        );
 
         let r_f2 = apply_forge_profile(&dummy_store(), &f2, None, "Godforge");
         assert!(!r_f2.ok, "no forge point → failure");
@@ -850,13 +1175,11 @@ mod tests {
         };
         let response = apply_forge_profile(&dummy_store(), &provisional, None, "Godforge");
         assert!(!response.ok);
-        assert!(
-            response
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("provisional")
-        );
+        assert!(response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("provisional"));
     }
 
     #[test]
@@ -872,16 +1195,18 @@ mod tests {
             power_p99_w: None,
             ..Default::default()
         };
-        let response =
-            apply_forge_profile(&dummy_store(), &qualified, Some(legacy_point), "Brokkr's Best");
-        assert!(!response.ok);
-        assert!(
-            response
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("sustained-p99")
+        let response = apply_forge_profile(
+            &dummy_store(),
+            &qualified,
+            Some(legacy_point),
+            "Brokkr's Best",
         );
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("sustained-p99"));
     }
 
     #[test]
@@ -891,27 +1216,41 @@ mod tests {
             profiles_qualified: true,
             ..Default::default()
         };
-        let old_point = PowerSweepPoint {
-            target_clock_mhz: Some(1860),
-            vf_table_voltage_mv: Some(893),
-            power_p99_w: Some(180.0),
-            apply_qualified: false,
-            apply_qualification_version: None,
-            ..Default::default()
-        };
-        let response =
-            apply_forge_profile(&dummy_store(), &qualified, Some(old_point), "Brokkr's Best");
-        assert!(!response.ok);
-        assert!(response
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("current v6 contract"));
+        for old_point in [
+            PowerSweepPoint {
+                target_clock_mhz: Some(1860),
+                vf_table_voltage_mv: Some(893),
+                power_p99_w: Some(180.0),
+                apply_qualified: false,
+                apply_qualification_version: None,
+                ..Default::default()
+            },
+            PowerSweepPoint {
+                target_clock_mhz: Some(1860),
+                vf_table_voltage_mv: Some(893),
+                power_p99_w: Some(180.0),
+                apply_qualified: true,
+                apply_qualification_version: Some(
+                    nidavellir_core::f2_observation::F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION,
+                ),
+                ..Default::default()
+            },
+        ] {
+            let response =
+                apply_forge_profile(&dummy_store(), &qualified, Some(old_point), "Brokkr's Best");
+            assert!(!response.ok);
+            assert!(response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exact-Apply v29 contract"));
+        }
     }
 
     #[test]
     fn service_wide_gpu_lease_covers_starts_and_applies_but_not_recovery_reset() {
         for request in [
+            IpcRequest::AuthorizeDevelopmentValidation { reason: "Reviewed development validation".into() },
             IpcRequest::StartGpuValidation,
             IpcRequest::StartRealSweep,
             IpcRequest::StartMemSweep,
@@ -929,6 +1268,10 @@ mod tests {
                 target_mhz: 1800,
                 voltage_mv: 869,
             },
+            IpcRequest::ApplyManualDiagnosticCurvePoint {
+                target_mhz: 1860,
+                voltage_mv: 869,
+            },
         ] {
             assert!(
                 gpu_write_requires_idle(&request),
@@ -939,6 +1282,7 @@ mod tests {
         assert!(!gpu_write_requires_idle(&IpcRequest::GetPowerSweepProgress));
         assert!(!gpu_write_requires_idle(&IpcRequest::StopPowerSweep));
         assert!(!gpu_write_requires_idle(&IpcRequest::ReadSensors));
+        assert!(gpu_reboot_guard_applies(&IpcRequest::AuthorizeDevelopmentValidation { reason:"Reviewed validation".into() }));
         assert!(!gpu_write_requires_idle(&IpcRequest::StartDetectorLab {
             recipe: "dense_v14".into(),
             duration_s: 60,
@@ -948,10 +1292,14 @@ mod tests {
             duration_s: 60,
         }));
         assert!(gpu_reboot_guard_applies(&IpcRequest::StartPowerSweep));
+        assert!(gpu_reboot_guard_applies(&IpcRequest::ResetGpuTuningFull));
+        assert!(gpu_reboot_guard_applies(&IpcRequest::ResetGpuTuningSoft));
         assert!(!gpu_reboot_guard_applies(&IpcRequest::ResetGpuTuning));
     }
 
     fn dummy_store() -> nidavellir_core::safe_loop::SafeLoopStore {
-        nidavellir_core::safe_loop::SafeLoopStore::new(std::env::temp_dir().join("nidavellir-test-ipc"))
+        nidavellir_core::safe_loop::SafeLoopStore::new(
+            std::env::temp_dir().join("nidavellir-test-ipc"),
+        )
     }
 }

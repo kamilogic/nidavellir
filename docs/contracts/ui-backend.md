@@ -1,11 +1,449 @@
 \# UI ↔ Backend Contract
 
+## 2026-09-26 (evening): representative-load power contract (current)
+
+Frontier32 / ExactApply35 / search7; Discovery9 and matrix27 unchanged. Supersedes the worst-load
+energy rule in the section below; everything else there still applies.
+- Only PowerRender (the representative load) must hold the target strictly below the board limit.
+  Qualification lanes may reach the limit: a sample below target counts as held when NVML reports
+  the SW power cap without thermal slowdown (sampled power is a 1 s average on Ampere and cannot
+  decide it). Integrity, containment and cleanup are unchanged.
+- Additive, legacy default 0: `F2ActiveTargetCoverage.power_limited_active_ms` and
+  `F2ActiveClockPhase.power_limited_active_us`. `target_active_ms` stays real target exposure;
+  the DX11 30 s / 35% exposure rule uses target + power-limited time.
+- Removed (never released): `ForgeDiscoveryBand.power_bound_voltage_mv`. A PowerRender power-bound
+  result now jumps straight to the lowest bin above the measured equilibrium voltage.
+- Profile admissibility uses `comparison_power_p99_w` (PowerRender) < limit; `power_p99_w` keeps the
+  worst lane and may sit at the limit. Search6 checkpoints cannot Resume.
+- After an attributed CandidateCrash, a terminal `interrupted` progress may now carry
+  `godforge`/`brokkrs`/`deep_calm`, `frontier_complete: true` and `profiles_qualified` from pairs
+  proven before the crash (TDR cone excluded). Apply still fails while
+  `SafeLoopStatus.recovery_pending_ack` is true; the note says profiles were published.
+- Inconclusive closes only its band (band `stop_reason` `evidence_incomplete_no_boundary_inferred`).
+  Before a qualified top the search stop reason becomes `qualified_top_unavailable`.
+
+## 2026-09-26: top-first / worst-load qualification
+
+Supersedes conflicting discovery/residency/energy rules below.
+ExactApply34, search5; Discovery9/Frontier31; matrix27 unchanged. See ../qualification-rules-2026-09-25.md.
+Current clock contract is nominal..nominal+15MHz with unchanged requested cap, voltage and power
+bounds. Observation `max_clock_mhz` is an optional absolute sampled peak (legacy default None);
+current positive evidence requires it within the envelope. p95 remains distinct. DX11 upper counts
+still show nominal excursions; only beyond-envelope samples fail containment. No peak promotes
+a higher profile. Old search/positive versions cannot Resume/Apply under this contract.
+`ForgeDiscoverySearch.control_retries_used` defaults to0 for legacy JSON and persists the single
+clean discovery same-pair retry. Repeated excursions stop with `control_reapplication_failed`.
+Search3 checkpoints cannot Resume under search4; qualification/driver/reset failures still stop.
+Search3 starts at the stock VF domain top instead of the heavy preheat p5. Upper candidates
+remain unqualified; bounded downward transitions do not inherit stability. Search2 cannot Resume.
+`ForgeDiscoveryBand.status` also supports `waiting_for_top`; economic regions start only after
+performance closes with a fully qualified candidate. Current outcomes preserve exact refusal
+reasons; cancelled workloads do not close a region as unstable. `F2ActiveTargetCoverage` adds
+`heavy_target_proven` (legacy default false). `F2ActiveClockPhase` adds `observed_active_us` and
+`target_active_us` (legacy default0), carrying bounded sampled time, not continuous HW tracing.
+New stop reasons: `qualified_top_unavailable`, `evidence_incomplete_no_boundary_inferred`,
+`physical_clock_domain_exhausted`, `power_integrity_boundary`. These do not prove global optimum.
+Budgets remain24/8h Standard. Old saved search versions cannot Resume under this policy.
+
+
+## 2026-09-24: qualification before refinement and a durable search budget
+
+This is the historical September24 discovery contract. It supersedes the exhaustive clock/voltage descent,
+post-discovery qualification and one-off economic extension described in historical sections.
+The measured-power ranking and distinct-result presentation below remain in effect.
+
+- Discovery v7, Frontier v29 and Exact Apply v32 are separate evidence contracts. Texture and
+  Endurance now check their concurrent secondary context against a stock golden and propagate
+  the first worker failure to its peer. Old positives remain readable but cannot qualify the
+  new Frontier/Apply contract. This does not certify untested pairs or guarantee game stability.
+- Each admitted pair receives one PowerRender calibration, short Texture screening and, if
+  eligible, the complete ordered exact-Apply matrix: native DX11, Vulkan, DX12, Endurance.
+  A complete current-run/current-GPU proof at the exact clock/voltage pair, including confirmed
+  stock cleanup, is required before ordinary refinement or profile publication. An incomplete
+  or inconclusive matrix is never promoted by a short pass or by another pair's result.
+- Three persistent regions (`performance`, `balanced`, `efficiency`) begin from this GPU's
+  stock measurements and physical curve bins. Standard permits at most 24 admitted candidates
+  and an 8-hour run budget; Long scales the time allowance to its longer matrix. Admission
+  reserves enough estimated time for the whole candidate before hardware work. Cleanup can
+  extend beyond this scheduling budget; it is not a forced process-exit deadline.
+- `PowerSweepProgress.discovery_search: Option<ForgeDiscoverySearch>` is additive and defaults
+  to `None` for historical results. It describes search policy, not evidence of stability:
+  `version`, `attempts_used`, `attempts_limit`, `time_budget_ms`, `elapsed_ms`, `stop_reason`,
+  `integrity_errors`, `next_band_index` and `bands`. Attempts and cumulative elapsed time persist
+  across Resume; cancellation/interruption does not refund an admission. The service writes
+  and confirms the admission checkpoint before arming the candidate.
+- Each `ForgeDiscoveryBand` contains `id`, pending `target_clock_mhz`/`voltage_mv`,
+  `clock_ceiling_mhz`, `status`, `attempts`, `stop_reason`, `power_preparation_used`,
+  `last_qualified_clock_mhz`, `last_qualified_voltage_mv` and `next_raise_clock`. Status is
+  `pending`, `in_flight` or `closed`; none is an approval. Only the explicit last-qualified
+  fields identify the last fully proven pair. A pending refinement is not that pair.
+- One confirmed power-limited preparation step per region may try the next lower physical
+  voltage without claiming qualification. Inconclusive evidence closes its region. An integrity
+  failure closes its region; two such failures end the run. A driver or operational failure
+  ends all regions. Closed regions and untested points are not automatically blacklisted.
+- Global stop reasons include `attempt_budget_exhausted`, `time_budget_exhausted`,
+  `driver_failure_recovery_required`, `operational_failure`, `integrity_error_budget_exhausted`,
+  `all_regions_closed` and `invalid_search_plan`. Region reasons additionally include
+  `physical_domain_exhausted`, `power_preparation_exhausted`, `integrity_error_region_closed`
+  and `inconclusive_region_closed`. UI copy translates these reasons and shows the spent
+  candidate/time budgets and each region's qualified pair independently of the log tail.
+- `Validated`/`Pass` means **Stage passed**. `EligibleForQualification` means short screening
+  passed and the complete matrix is pending. Only `CandidateQualified` means that candidate
+  has complete proof. `PowerBoundClockDrop` is a power-limited inconclusive result;
+  `Inconclusive` alone does not assert low residency. `CandidateCrash` and `OperationalFailure`
+  show interruption/recovery, while `BandClosedIntegrityError` explains the regional stop.
+  `SearchBudgetExhausted` discloses finite exploration, not a failed physical test.
+- The progress rail is Prepare -> Test candidates -> Compare -> Restore. Qualification belongs
+  inside Test candidates. `profiles_qualified` and existing backend Apply checks still gate
+  publication/use; no stage label or search-policy field can enable Apply.
+- `profile_search_complete` stays false for this bounded sparse search: a qualified result does
+  not prove the whole economic domain was explored. The UI states that better trade-offs may
+  remain untested and continues grouping objectives that select the same exact pair.
+- A compatible manually paused run can Resume with its spent budget. A terminated or
+  version-incompatible search cannot renew that budget through Resume; a driver failure requires
+  recovery and a new run. Full Reset retains the explicit forget-all semantics below.
+
+## Historical — 2026-09-18: comparable power, bounded economic search and distinct results
+
+This section supersedes older F2 profile-selection descriptions requiring 1% publication
+headroom or ranking by the maximum power of different Apply workloads.
+
+- `PowerSweepPoint.comparison_power_p99_w: Option<f32>` is confirmed PowerRender p99 at
+  the exact Apply anchor. F2 ranking requires this finite positive metric, including when
+  the board cap is unknown. `power_p99_w` still discloses the maximum including the complete
+  Apply matrix; `max_power_w` remains peak telemetry. `perf_per_watt` uses sustained p5 /
+  comparison p99. This is a clock/W proxy, not game FPS or a universal savings promise.
+- The configured hardware power limit is unchanged. Near-cap stress power alone no longer
+  rejects a pair or skips its remaining qualification lanes. Target exposure, upper-clock
+  containment, thermal/integrity evidence, four complete lanes and transaction cleanup remain
+  mandatory. Contract v31 physical evidence is unchanged; missing lanes are never inferred.
+  The legacy diagnostics field `publication_power_ceiling_w` now reports the configured
+  board limit; `board_power_limit_observed` is telemetry, not a publication veto.
+- `clock_search: ForgeClockSearch[]` persists target, last approved voltage, first known
+  failure, optional policy-censored floor, completion and raw stop reason. A known failure
+  may be historical; the policy floor is not a measured minimum. Export includes these
+  records independently of the bounded log tail. Full Reset clears them with the checkpoint.
+- `economic_extension_cmax_mhz: Option<u32>` records a single extension to the real clock
+  bins down to 90% of final Godforge's sustained p5 (the selector's performance metric).
+  Only unfinished clocks are visited in this extension; complete same-run Apply evidence
+  remains reusable. The allowance survives Resume. Stop, unsafe termination or lack of a
+  qualified Godforge does not trigger an extension. A further required extension is disclosed,
+  not executed recursively.
+- `profile_search_complete: bool` reports coverage of that final economic domain separately
+  from `profiles_qualified` (point qualification). Missing legacy fields default to false/None.
+  A completed clock search can have policy-censored voltages; these are disclosed separately.
+- All three objective fields remain for IPC compatibility and explicit Apply routes. The UI
+  groups identical exact Apply pairs into one card, names their shared objectives, and warns
+  when economic coverage is incomplete/unknown. A qualified point remains usable without
+  pretending three distinct alternatives or a global optimum were demonstrated.
+- Old results without the comparison metric do not show a stock efficiency percentage.
+  A new Full Reset -> Clean Run is the requested first-use acceptance path; no previous
+  GPU's clock/voltage pair is encoded as a target or fallback.
+
+## 2026-09-17: explicit Full Reset and Soft Reset semantics
+
+- The normal BAT launches ordinary console mode without command-line development authorization.
+  Each reset has one UI confirmation, which closes immediately while progress is shown.
+  Completion waits for the Core response and readiness refresh, but not optional Sentinel info.
+- User-directed policy change supersedes older entries that make negatives survive Full Reset.
+  `ResetGpuTuningFull` now forgets all active GPU learning: profiles, legacy knowledge, every F2
+  observation, checkpoint, Safe Loop blacklist/incidents/crash history and condemnation ledger.
+  Derived TDR cones therefore disappear. Generated learning archives are removed too.
+- `ResetGpuTuningSoft` is the old positive-learning reset: clear profiles, successful measurements,
+  checkpoint, learning archives and last_validated; preserve active negative/inconclusive evidence, blacklist and incident
+  history. Acknowledge the incident only after the existing durable recovery checks succeed.
+- Both stop and await workers, gate concurrent Sentinel activity, confirm stock and clear only
+  the owned BootFlag before clearing knowledge. Full also discards in-memory legacy results.
+  Failure reports `ok:false`; no new workload is launched. Current-boot reboot requirements remain.
+- Full writes `full_reset_pending` before deleting stores. Interrupted/partial erasure blocks
+  tuning IPC and apply-on-boot across restarts until explicit Full Reset retry completes.
+- The UI names both actions and confirms their different effects. Full warns that forgotten
+  rejected pairs can be tested again. After either reset, refresh readiness and select Clean;
+  a remaining reboot/development requirement is still shown. Reset does not grant authorization.
+- Watchdog event cursors, operational diagnostics, developer audit and user-exported reports
+  are not learning inputs and remain. No automatic import of old exports or repository evidence.
+  Clean Run by itself still preserves negatives; Full Reset is the explicit forget-all action.
+
+## 2026-09-17: exact Apply v31, native DX11 v4 active exposure
+
+- Follow-up after run1789633001432: optional `active_target.diagnostics` adds requested maximum,
+  anchor, independent refusal reasons, publication power ceiling and five per-phase clock records.
+  Each phase carries active maximum/count, above-target count, bounded sampled support in
+  microseconds and first-event clock/voltage/temperature/time. Optional anchor curve/offset
+  snapshots are read after telemetry (at most five raw excursions per lane), not atomic evidence;
+  idle excursions can consume this diagnostic budget without counting as active violations.
+- A complete reset-clean DX11 upper excursion becomes `ExactApplyRejected: ClockControlExceeded`.
+  The pair is excluded locally, without voltage repair/blacklist. One distinct alternate may be
+  considered; a second refused pair stops with an actionable note. Same-run/GPU/current-contract
+  observations restore exclusions and the budget on Resume. Physical/cleanup failures retain
+  their original stop priority; missing/mismatched telemetry cannot use this continuation path.
+- Simultaneous power refusal is persisted/logged independently, without hiding the control
+  recurrence budget. The 1% publication margin, workload duration, clock/exposure thresholds and
+  qualification version remain unchanged. Diagnostic additions do not invalidate v31 positives.
+- DX11 keeps its existing total lane duration but splits it equally into five duty phases:
+  continuous, 75%, 50%, 25%, continuous. Middle phases alternate checked 100 ms work windows
+  with idle; these percentages describe scheduling, not reported GPU utilization. Other API
+  lanes, Discovery v7, Frontier v28 and negative CandidateCrash version floor 29 are unchanged.
+- GPU batch submission/completion callbacks delimit work. CPU-only checksums and idle receive
+  no active exposure credit. Clock/voltage reads must fit wholly within a middle-phase work
+  interval. Sample time support is bounded by the interval, adjacent sample midpoints and ±15 ms;
+  sensor gaps cannot manufacture exposure. This is sampled evidence, not continuous hardware tracing.
+- New optional `qualification_coverage.active_target` contains `observed_active_ms`,
+  `target_active_ms`, `required_target_ms`, `sample_count`, `phases_completed`,
+  `upper_clock_exceeded`. Historical absence deserializes as None, never positive proof.
+  DX11 approval requires five completed phases, at least 60 s of observed active coverage,
+  at least 30 s exactly at target and at least 35% target/active coverage; voltage must be sane
+  and <= anchor. Any sampled upper excursion within work refuses this proof. These are initial
+  conservative contract thresholds, not a universal guarantee of game stability.
+- Heavy-load integrity errors retain priority. The power screen uses the worse of whole-lane
+  and continuous-phase p99, so idle cannot dilute the existing 99%-of-board publication limit.
+- `dx11_target_unexercised` remains raw Inconclusive; its bounded lane is not identically retried.
+  The pair leaves only this run's selection as `ExactApplyRejected: TargetUnexercised`, with no
+  voltage repair, condemnation, blacklist or inherited failure. Other candidates are considered.
+  Missing active telemetry, incomplete phases and upper excursions remain diagnostic refusals.
+- Numeric power below the cap no longer overrides a predominantly asserted limiter flag when
+  inferring an old DX11 structural voltage repair, including restoration from saved observations.
+- Pre-v31 positives cannot publish; current DX11 positives also require explicit persisted active
+  proof. New provenance: `dx11-game-v4/active-residency-heavy-variable`. Stock control and the
+  legacy detector helper retain their continuous DX11 v3 provenance. No new IPC command.
+
+## Historical — 2026-09-16: exact Apply v30, native DX11 v3
+
+- DX11 queues one 16-frame batch while the CPU hashes the preceding fenced staging copy.
+  Render/compute goldens, checksum cadence, the 420 s window and exact 0 MHz / 35% target
+  residency gate remain. Completion/cancellation drains the last batch; failed checks drain
+  any queued GPU work before the Safe Loop reset. No IPC field was added.
+- Exact Apply is now v30; pre-v30 positives cannot publish. Discovery v7 and Frontier v28
+  remain. The matrix keeps its four lanes/durations; DX11 provenance is
+  `dx11-game-v3/offscreen-rgba8-texture-depth-compute-pipelined`.
+- CandidateCrash safety history has a separate minimum version, 29. Its crash budget,
+  physical cone and startup reconciliation survive later positive-evidence revisions.
+- A complete, reset-clean DX11 lane already above the existing 99%-of-board publication
+  ceiling stops the pair as `ExactApplyPowerCeilingExceeded`, including when coverage is
+  `target_residency_low`. The raw observation stays Inconclusive; no blacklist is written.
+  Numeric p99 is required: a driver cap flag or isolated peak does not trigger this screen.
+  Identical retries, remaining lanes and voltage increases at the same clock are skipped.
+  Short/cancelled dwells, hardware failures and missing telemetry retain their own handling.
+- The bounded CLI `diagnose-f2-point` records one 1830 MHz / 943 mV diagnostic under explicit
+  point-scoped development authorization, then resets; it never publishes profile evidence.
+
+## 2026-09-14: opt-in development validation
+
+- `AuthorizeDevelopmentValidation { reason: string }` is available only when this console
+  process was explicitly started with `--development-validation`. SCM/ordinary console refuse it.
+  It requires the service-wide idle lease and reboot guard, no pending recovery/applied profile/
+  saved checkpoint, checked history and hardware-only verified stock reset. It starts no workload.
+- Returns `PowerSweep` with `start_block_reason` refreshed and optional
+  `development_validation_note`. Polling exposes the same note in all themes. The note is not
+  deserialized from checkpoints and is never evidence of authorization by itself.
+- The authorization is audited before activation and durably claimed before the single Standard
+  worker starts. Negative events/cones stay unchanged. New/changed crash evidence, completion,
+  cancellation or reset ends permission; process exit never restores it. Resume, Long, other
+  tuning routes and Apply are refused in this opt-in session. Read/export/stock recovery remain.
+- `ExportForgeLog` includes the development status and audit path while the session is active.
+  The command client has bounded IPC waits and never retries uncertain authorization requests.
+  Normal Full Reset semantics and default persistent crash budget are unchanged.
+
 > NOTE (2026-07-08): the Claude/Codex backend-frontend split was retired — Claude now owns the whole
 > stack. This file is no longer a cross-agent handoff; it is REFERENCE documentation of the IPC
 > surface (methods + payload shapes). Keep it current when the IPC changes.
 
 
-\## 2026-07-23 (current): authoritative F2 point, qualification v25
+\## 2026-08-10 (current transport contract): elevated Core, unelevated local UI
+
+\- **Privilege boundary:** the Core service remains elevated for GPU mutation. The Tauri UI remains
+  unelevated and opens a fresh local `NidavellirCore` named-pipe connection per request.
+\- **Pipe authorization:** the server supplies an explicit protected DACL instead of inheriting the
+  elevated process default. SYSTEM and Administrators receive full access; the local Interactive
+  Users principal receives generic read/write access required by the request/response protocol.
+\- **Network boundary:** `PIPE_REJECT_REMOTE_CLIENTS` rejects remote named-pipe connections. Do not
+  replace the Interactive Users grant with Everyone or require the desktop UI to run as
+  administrator.
+\- **Regression evidence:** an unelevated live client successfully completed Ping, Safe Loop status,
+  power-sweep progress and applied-profile requests against the rebuilt elevated service. The
+  service suite passes 420/420.
+
+
+\## 2026-08-25 (current safety contract): transactional Sentinel, CandidateCrash and reset
+
+\- **Startup ordering:** the backend may reapply a persisted profile only after checked Event Log
+  reconciliation, durable seed/floor readback and a watcher-ready handshake. Any failure keeps stock
+  and latches recovery; spawning a thread alone is not readiness.
+\- **CandidateCrash commit:** append is flushed and the exact Rigid v29 row must be visible through the
+  strict ledger reader before Forge stores `phase = "interrupted"`. Failure stores/retains
+  `needs_attention`, pending incident and raw lane so startup can repair the same transaction.
+\- **Mutation routes:** F2 Benchmark uses the proof-aware F2 Apply path. Apply/reapply require exact
+  GPU/run/contract29 and the required complete ordered matrix proofs. Legacy real/memory routes use
+  checked Safe Loop, BootFlag and condemnation preflight, an owner-identified arm and owner-matched
+  clear. Corrupt state returns an IPC failure before hardware.
+\- **Soft Reset (formerly Full Reset; renamed 2026-09-17):** remeasure positive learning. Backend first
+  quiesces every mutating worker, then transactionally removes validated F2 positives/profiles while
+  preserving operational blacklist, Rigid/Quarantine ledger, cone and Sentinel history. As of
+  2026-09-10, explicit Full Reset confirmation also acknowledges the previous incident after stock
+  recovery and owned BootFlag clearing, before discarding its checkpoint. CandidateCrash requires
+  the same durable exact-event ledger proof as `AcknowledgeForgeIncident`; incident history remains.
+  This also resolves pending incidents left by older resets with no checkpoint. The confirmation
+  explains this acknowledgement; no run starts automatically. Same-boot reboot requirements remain
+  enforced by the backend. A timeout/corrupt input/partial commit returns `ok:false`.
+
+
+\## 2026-08-14 (current F2 contract): Discovery7, Frontier28, ExactApply29 and finite TDR recovery
+
+\- **Version identity:** `F2_DISCOVERY_CONTRACT_VERSION = 7`,
+  `F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION = 28` and
+  `F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION = 29`. The compatibility alias
+  `F2_QUALIFICATION_CONTRACT_VERSION` denotes Exact Apply v29. The four-lane recipe and semantic
+  workload fingerprint remain `matrix_v27`; UI text must not call the workload “v29”.
+\- **Residency semantics:** Discovery7 PowerRender and Frontier28 Texture may each accept no more than
+  one adjacent physical clock bin below the requested target. ExactApply29 remains strict at the
+  labeled clock/voltage pair. Frontier elasticity is discovery evidence only and cannot unlock Apply.
+\- **Homogeneous DX11 structural aggregation:** three structural DX11 inconclusives of the same class
+  at one exact pair aggregate to `DX11StructuralClockDrop`. It authorizes one run-local vertical repair
+  for that target; a repeated token closes the target. The token is neither `Pass` nor a physical
+  `Fail` and must not create Rigid/Quarantine ledger evidence.
+\- **Clean semantics:** `StartPowerSweepClean` remeasures positive discovery/profile evidence with the
+  Standard dwell policy. It still loads and applies effective global Rigid, Quarantine and TDR-cone
+  constraints. This paragraph supersedes older statements that Clean ignores durable boundaries or
+  scopes the condemnation ledger to the new run.
+\- **TDR cone:** effective Rigid `CandidateCrash` entries for the GPU/current exact contract project a
+  1 clock-bin : 1 voltage-bin floor down the real physical tables; overlapping projections take the
+  highest voltage. A pair at/below the floor is refused before arm/write/dwell and surfaced as
+  `TdrRiskGuard/CensoredBoundary`. Censorship emits no positive, physical failure or condemnation row.
+  The first physical bin above the floor still requires Frontier28 evidence and Apply still requires
+  Exact29. A durable CandidateCrash count greater than two fails closed before further candidate work.
+\- **TDR terminal truth:** a Sentinel-attributed TDR makes the owning `PowerSweep` terminal
+  `phase = "interrupted"`, `last_outcome = "TdrOrCrash"`, with publication blocked. The raw lane row
+  remains unchanged; the service projects terminal truth rather than falsifying workload evidence.
+  `SafeLoopStatus.gpu_reboot_required` remains true for the rest of that Windows boot.
+\- **Recovery transaction:** after reboot, `AcknowledgeForgeIncident` clears the pending incident and
+  recomputes resumability. The UI must then call `ResumePowerSweep` only; it must not offer a recovery
+  mode selector and must never fall back to `StartPowerSweep*`. Resume retains the original run/mode
+  and is compatible only with the exact service build/revision, GPU and driver. Any mismatch is shown
+  as a refusal and requires an explicit new run.
+
+
+\## 2026-08-11 (historical, superseded by Frontier28/ExactApply29): Discovery v7 with exact qualification v27
+
+\- **Discovery residency:** `F2_DISCOVERY_CONTRACT_VERSION = 7`. PowerRender may classify p5 at most
+  one adjacent 15 MHz boost bin below the requested target as discovery-valid. This is runtime
+  elasticity evidence only; it does not certify the labeled Apply pair.
+\- **Exact qualification:** Texture boundary qualification and the complete exact-Apply matrix remain
+  `F2_QUALIFICATION_CONTRACT_VERSION = 27` with zero clock-drop tolerance. The UI must not describe
+  the discovery-only boost-bin allowance as an Apply tolerance.
+\- **Coherent run context:** pruning, live descent and summary share GPU/run-wide evidence. A good
+  boundary requires current Discovery plus current Texture qualification at the exact same
+  target/anchor pair. A reset-clean `ClockDrop` may be dominated only by same-run/same-GPU evidence at
+  the same target and strictly lower voltage, or a harder target at the same/lower voltage. All direct
+  error outcomes remain authoritative.
+\- **Same-call continuation:** a dominated drop may continue without returning from the current
+  discovery call, using its offset only as a bounded-writer baseline and moving to the next strictly
+  lower physical VF bin. It is never displayed or persisted as a stable point.
+\- **Monotonic measured projection:** targets are processed in ascending clock order. Publication
+  chooses the lowest measured/currently-qualified anchor that is not below the previously selected
+  anchor. Equal-voltage plateaus are valid. A target without a compatible pair is omitted; backend and
+  UI must never interpolate, relabel or imply an invented voltage.
+\- **Apply margin:** the candidate is exactly the next valid physical VF-table bin above the measured
+  boundary, not a fixed `+12 mV`. Existing `boundary_voltage_mv` and `apply_margin_mv` continue to
+  expose the measured boundary and effective non-uniform millivolt delta.
+\- **Stage-aware power gate:** an unqualified candidate may enter v27 up to the numeric GPU power cap.
+  After the complete gate, publication requires worst measured Apply power at or below 99% of that cap
+  (1% headroom). Exceeding or missing required power evidence blocks publication, not discovery.
+\- **Compatibility and next run:** v6 positive discovery evidence remains readable but cannot seed v7.
+  The next acceptance attempt must use `StartPowerSweepClean`; `ResumePowerSweep` on the paused v6 run
+  is incompatible. Integrated validation passes 604 workspace tests (two hardware smokes ignored),
+  the production UI build and workspace Clippy with baseline warnings only. Hardware acceptance is
+  not yet claimed.
+
+
+\## 2026-08-04 (historical semantics; workload retained as matrix v27): qualification v27 API matrix and reboot containment
+
+\- **Physical voltage order:** publication consumes the v7 monotonic measured projection above. Any
+  inversion that remains after projection still blocks synthesis fail-closed. Equal-voltage plateaus
+  remain valid measured evidence.
+\- **ClockDrop safety boundary:** the v7 domination/continuation rules above supersede the earlier
+  harder-target-only Resume repair. `SilentError`, `Unstable`, device loss/TDR, reset failure and
+  Apply-gate failures remain unchanged.
+\- **One-click behavior:** Standard/Long Forge automatically run the exact-Apply gate; users do not
+  choose an API, configure a detector or decide how many times to repeat a marginal point.
+\- **Required evidence:** `F2_QUALIFICATION_CONTRACT_VERSION = 27`. Publication requires current,
+  same-run, reset-clean `Pass` evidence for `Dx11Game`, `Texture` (explicit Vulkan), `Dx12Game` and
+  `Endurance`. A missing or `Inconclusive` lane blocks Apply; a physical `Fail` rejects the pair.
+\- **Backend identity:** Vulkan and DX12 are explicitly selected rather than left to wgpu adapter
+  preference. Each captures independent stock goldens and runs the identical `V8Texture` recipe and
+  duration. Evidence provenance records the actual render backend.
+\- **DX11 v2:** native D3D11 now uses a 1536×1536 sampled-texture render, alpha/ROP, D24 depth,
+  pixel ALU, compute/UAV and copy/readback. It queues 16 frames between paired framebuffer/compute
+  checks instead of flushing and waiting every frame.
+\- **Order and duration:** exact Apply runs DX11 v2 resident for 420 s first, then Vulkan, DX12 and
+  Endurance. Standard uses 120 s for Vulkan/DX12 and 300 s Endurance (960 s total); Long uses 300 s
+  for Vulkan/DX12 and 1,200 s Endurance (2,220 s total). ETA derives from the same finite four-entry
+  ladder as execution.
+\- **Environment gate:** before any candidate write, Forge captures API-specific stock goldens and
+  runs stock controls for Vulkan, DX11 v2 and DX12. Backend initialization, missing checksum or
+  insufficient telemetry is environment-level `Inconclusive`, never silicon failure.
+\- **Compatibility:** pre-v27 positive evidence remains readable but cannot publish. All lanes are
+  currently headless/offscreen; swapchain Present and process isolation are not claimed by this
+  contract.
+\- **TDR containment:** Sentinel hands a new driver-reset event to the active Forge or Detector Lab
+  owner, which requests cooperative cancellation and preserves attribution before cleanup. No
+  concurrent reset races the workload. The current Windows boot remains closed to GPU mutation.
+\- **Safe Loop UI payload:** `SafeLoopStatus` adds defaulted `gpu_reboot_required: bool` and
+  `gpu_reboot_event: Option<String>`. While required, Forge exposes only `Restart Windows`, hides
+  recover/reset continuation actions and explains that the failed point and useful learning are
+  already saved. A service restart cannot clear this guard; only a newer Windows boot can.
+
+
+\## 2026-08-04 (current live diagnostic): elastic curve + Game Trace canary
+
+\- **Backend-only apply:** `ApplyManualDiagnosticCurvePoint { target_mhz, voltage_mv }` applies an
+  operator-owned anchored curve and max-clock ceiling without voltage lock. The response reuses
+  `ManualDiagnosticPointStatus`; no frontend control is exposed yet.
+\- **Game monitoring:** while that diagnostic boot-flag phase is active and real GPU utilization is
+  at least 30%, Sentinel runs its existing ~700 ms Texture/ROP self-check every 20 seconds. Game Trace
+  records the canary sequence alongside clock, voltage, power and utilization samples.
+\- **Failure behavior:** a returned non-stable canary verdict or new `nvlddmkm-153` event claims the
+  recovery episode once, resets/disarms the manual curve and writes Sentinel status. It does not
+  blacklist, auto-bump or create profile evidence. The external monitor stops Game Trace and closes
+  the stale manual-status view after observing the reset.
+\- **Safety:** Detector Lab and Forge remain excluded from the manual canary path. A TDR still latches
+  the existing reboot-required guard for the rest of the Windows boot.
+
+
+\## 2026-08-04 (current diagnostic contract): curve envelope and workload result are separate
+
+\- **Experimental backend-only recipe:** `StartDetectorLab.recipe` accepts `curve_v25` in addition to
+  `control_v25` and `dense_v14`. It is intentionally not exposed as a production/UI recipe and never
+  creates publishable evidence.
+\- **Application semantics:** `curve_v25` writes the bounded anchored curve and max-only clock
+  ceiling, but does not set a voltage lock. Clock and voltage may move within the driver-selected VF
+  envelope. `control_v25`/`dense_v14` retain the exact voltage-lock behavior below.
+\- **Classification semantics:** a voltage above the requested/resolved anchor is expected fidelity
+  metadata in `curve_v25`; it is not a workload failure or an `Inconclusive`. Missing or insufficient
+  voltage telemetry remains `Inconclusive`. Voltage above the selected bin remains `Inconclusive` for
+  voltage-locked recipes.
+\- **Journal only:** terminal records now include `workload_result`, `application_mode`,
+  `anchor_voltage_escaped`, `voltage_mv.anchor`, and a nullable `voltage_mv.ceiling`. No IPC response
+  shape changed.
+\- **Safe finish:** `curve_v25` always resets to stock and disarms Safe Loop after a normal terminal
+  result, including a workload pass. A pass means only that the detector observed no error; it does
+  not validate an exact pair or qualify a profile.
+
+
+\## 2026-08-04 (historical operational correction): Detector Lab interruption attribution
+
+\- **Candidate journal:** after `point_reapplied`, the Lab flushes `candidate_recipe_start` and a
+  `segment_start` with `scope: candidate` before every workload segment. Stock keeps the equivalent
+  `scope: stock` records. A blocked driver call therefore leaves its active phase on disk.
+\- **Recovery boundary:** a boot flag with phase `detector_lab` means an interrupted diagnostic
+  experiment, not Forge or field learning. Startup stays at stock and retains the flag until
+  apply-on-boot resets driver controls, but does not write blacklist/crash history or consume the
+  Safe Mode crash budget.
+\- **State at that change:** IPC payload shapes, the then-current v25 qualification/discovery versions,
+  fingerprints, thresholds and dwell durations were unchanged. The later v26 matrix is documented
+  above; the diagnostic-only `curve_v25` key remains separate.
+
+
+\## 2026-07-23 (historical basis): authoritative F2 point, qualification v25
 
 \- **Clock and voltage semantics:** active F2 discovery, qualification, exact Apply and Manual Point
   write the bounded anchored curve, apply a max-only NVML clock ceiling and then set/read back an
@@ -123,9 +561,10 @@
 
 \- **Clean Run is a permanent selector choice.** Command, Instrument and Workshop always expose
   Clean, alongside Standard and Long. Full Reset still selects it automatically for one run, but
-  manual selection does not require a preceding reset. StartPowerSweepClean prevents pre-run
-  blacklist/condemnation evidence from steering that new search; Sentinel, Safe Mode and new
-  same-run failures remain active.
+  manual selection does not require a preceding reset. **Historical behavior, superseded
+  2026-08-14:** the original implementation prevented pre-run blacklist/condemnation evidence from
+  steering the search. Current Clean always applies effective Rigid, Quarantine and TDR-cone safety
+  boundaries while remeasuring positive evidence.
 \- **Parameterized IPC:** `ApplyManualDiagnosticPoint` accepts `target_mhz` and `voltage_mv`.
   `ResetManualDiagnosticPoint` returns the GPU to stock and `GetManualDiagnosticPointStatus` is
   read-only. All three responses use `ManualDiagnosticPoint` with
@@ -184,10 +623,9 @@
 \- **Full Reset arms the experiment:** after a successful `ResetGpuTuningFull`, the frontend selects
   `clean`, so the next Forge request is `StartPowerSweepClean` without requiring the operator to
   remember the mode change. This automatic arm is one-shot: after that Clean Run reaches a terminal
-  finished/provisional state, the selector returns to Standard. The reset clears active
-  observations/profiles/Sentinel history but never
-  deletes the append-only condemnation ledger. The armed Clean Run reads that ledger run-scoped, so
-  pre-run field evidence remains durable without steering the new organic search.
+  finished/provisional state, the selector returns to Standard. Historical implementations cleared
+  broader active state; the current 2026-08-25 contract above supersedes that behavior and preserves
+  all negative safety evidence while removing only reusable positives.
 \- **Early energy-envelope refusal:** exact Apply still starts with Texture v9. If its reset-clean
   measured p99 or peak already exceeds the shared 94%-of-board-cap publication ceiling, the pair is
   removed from this run's profile selection and Endurance is skipped. This is explicitly power-bound,
@@ -222,7 +660,8 @@
   `{"method":"ResumePowerSweep"}`. It returns the normal `PowerSweep` response. A plain
   `StartPowerSweep*` never implicitly resumes a manual Stop; the frontend must invoke this method.
   Resume continues the same `run_id`/`run_sequence`, so already completed evidence is reused and a
-  clean-run checkpoint retains its run-scoped ledger semantics.
+  clean-run checkpoint retains its learning mode. **Superseded safety detail:** all current modes,
+  including a resumed Clean checkpoint, use the global effective negative ledger and TDR cone.
 \- **Fail-closed compatibility:** a paused checkpoint is resumable only when all of the exact
   `program_version`, embedded `build_revision`, NVML GPU identity, selected adapter name, driver
   name and driver version/details match the current backend. Legacy checkpoints without that
@@ -277,11 +716,11 @@
   `forge-archive/<run_id>/clean-run-manifest.txt` as log-independent proof of the mode. Added
   after the 2026-07-17 run proved the live-log tail cannot evidence which policy executed.
 
-\## Current F2 reference (2026-07-18): contract v22, Texture Hop v13 and uncapped Standard
+\## Historical F2 reference (2026-07-18; superseded by the 2026-08-14 contract): contract v22, Texture Hop v13 and uncapped Standard
 
-This section is the normative current behavior and supersedes the dated v4/v6/v7 runtime descriptions
-below where they conflict. Historical notes remain in place to explain payload evolution. No IPC method
-or existing field was removed.
+This section was normative for v22 and supersedes only the older dated v4/v6/v7 runtime descriptions
+below it. The 2026-08-14 section at the top is current. Historical notes remain in place to explain
+payload evolution. No IPC method or existing field was removed.
 
 \- **Evidence contract v22.** Every current F2 dwell persists `evidence_provenance` with the service
   build version/revision, semantic workload fingerprint, actual selected render backend, adapter name,
@@ -1604,3 +2043,96 @@ Frontend must not:
 
 \- infer profile state from text messages
 
+## Beta workflow closure (2026-09-11)
+
+- `forge-workflow.js` is the shared primary-action decision and explicit recovery coordinator.
+  Recovery strictly validates every IPC envelope, confirms current status is not running/reboot-
+  blocked, calls stock Reset, acknowledges, then reads updated Resume availability. It resumes only
+  when the service reports compatibility; otherwise it finishes at stock with no implicit Start.
+- `resume_available` is authoritative for both paused and recovered interrupted runs. Pending ACK
+  shows Recover Forge, not a promise of Resume. Missing/incompatible checkpoints expose Start over.
+- An in-flight action disables duplicate Start/Resume/Apply/Reset workflows. Polling may update
+  state but does not clear an action error. The default Standard mode requires no mode selection.
+- Node journey tests plus Playwright with an injected Tauri transport verify the UI boundary without
+  starting a real service. Hardware qualification and installer lifecycle remain separate evidence.
+- Native `service_request`/`service_ping` commands are asynchronous. Connection is limited to 5s;
+  the single write/response exchange to 30s and 16 MiB. A lost/timed-out reply has an unknown action
+  outcome and is never retried. Tokio owns/cancels pipe I/O; the service closes failed instances too.
+  This deadline keeps the UI responsive; it does not prove a GPU worker/driver has stopped.
+- `PowerSweep.start_block_reason` is an additive optional field recomputed by GetPowerSweepProgress
+  from effective current-GPU safety history. It prevents new exploration/Resume, survives Soft Reset
+  and does not prevent explicit incident recovery at stock. All starts repeat the guard. Underlying
+  unreadable record/ledger errors are returned directly instead of “already running”.
+- Read polling shares in-flight requests; mutations are never coalesced. NVIDIA onboarding validates
+  the response and detected target before advancing; it has no CPU/PawnIO requirement. Qualified
+  results require explicit Apply, and the default result view exposes ordinary Return to stock.
+- `nidavellir-service acceptance-preflight` reads persisted safety and the effective crash limit,
+  prints JSON including the embedded source revision, and does not enter service startup/recovery.
+  A clear report still requires live Sentinel/stock/driver verification before hardware acceptance.
+- Current delivery checklist: `roadmap.md`. Service exit during an active workload and isolated
+  install/update/uninstall remain required evidence; do not equate pipe deadlines with those gates.
+
+## Service lifecycle boundary (2026-09-12)
+
+- SCM remains StartPending through startup recovery and listener creation. Running requires a
+  successful pipe-ready handshake (5s); listener/ACL creation failure is fatal, while ordinary
+  client disconnects remain retryable. A later listener failure triggers the same shutdown path.
+- Console and SCM shutdown close IPC admission before waiting for AppState, signal all workers,
+  pause the current Forge, and wait for ownership flags plus in-flight Sentinel activity. Validation
+  includes context teardown in its running state. Sentinel cooldown sleeps do not own the GPU gate.
+- The cleanup supervisor allows 30s for console, 20s for SCM (worker quiescence is limited to 10s).
+  Timeout/error exits nonzero and does not commit a clean marker. Windows console-close/system
+  shutdown may preempt this grace; the deadline is not a hardware recovery guarantee.
+- The cleanup confirms required stock restoration and clears only the matching BootFlag. It
+  preserves the qualified descriptor, pending incident and negative history. An untouched install
+  needs no GPU reset; an unavailable driver never proves previously active tuning was restored.
+- Only the supervisor can write clean_shutdown.txt after completion and an absent, readable flag.
+  Late cleanup cannot commit it. After timeout the service requests process termination, with no
+  replacement GPU task alongside the stalled thread. Pending kernel I/O can delay actual process
+  disappearance; the marker proves application cleanup, not OS process release. The installer
+  checks nonzero SCM stop codes even on retry.
+- Production NVAPI wrapper calls share one successful initialization. Terminal cleanup releases
+  its reference once, after admission closes and GPU users quiesce, before committing the marker.
+  Unload failure/timeout is unclean; later accesses cannot reopen that runtime. A read-only short
+  subprocess exit passed on2026-09-17; shutdown after a complete tuned run remains unverified.
+- Controlled cleanup, late completion, native subprocess termination, worker ownership, listener
+  failure and injected installer tests are software evidence. Installed SCM and GPU acceptance
+  still require their own isolated/eligible environments.
+
+## Startup bugcheck correlation (2026-09-12)
+
+- Startup reads the latest WER SystemErrorReporting/1001 as timestamped JSON. A crash class is
+  accepted only when its report time is at/after the armed BootFlag time and no later than now.
+  Missing, malformed, older or future evidence yields Unknown, never a reused historical BSOD.
+- This does not weaken interrupted-candidate recovery. An armed, non-clean Forge restart is still
+  conservatively recorded under the current policy, even if its cause is unknown. Previously
+  recorded CandidateCrash entries are not automatically removed/reclassified by this change.
+
+## Recovery status versus a persistent exploration block (2026-09-13)
+
+- An idle SafeLoop without recovery latches can be protected while PowerSweep.start_block_reason
+  still refuses further exploration. Do not label this as an unresolved Safe Loop incident.
+- After recovery gates, the primary action for start_block_reason opens Review safety block.
+  It is a local disclosure only: no Start, Resume or Apply. Existing profile Apply stays disabled.
+- All three themes expose the backend reason, the Full/Soft Reset distinction, ExportForgeLog as a
+  diagnostic report, and a direct link to the Sentinel/history tab. Export keeps its existing IPC
+  and local-file behavior; it does not transmit a report or change safety history.
+- Full Reset refreshes backend readiness before announcing a new run. A remaining refusal shows
+  Reset completed; tuning blocked, and does not arm the next run. Recovery acknowledgement with
+  a persistent refusal likewise ends at stock with the block explained. No safety policy changed.
+
+## Additive F2 measurement diagnostics (2026-09-16)
+
+- Persisted/exported `F2Observation` adds optional `inconclusive_reason`. Historical records default
+  to null; do not infer a specific cause from their old generic outcome. New non-power Discovery
+  refusals use `discovery_inconclusive` for outcome/dwell_result. Missing/inconsistent p99 and an
+  ambiguous power-cap decision retain `power_telemetry_inconclusive`. Neither is positive or bad-
+  boundary evidence. Qualification keeps `qualification_inconclusive` with its specific reason.
+- Causes include `voltage_telemetry_low`, `voltage_telemetry_missing`, `voltage_ceiling_exceeded`,
+  `clock_ceiling_exceeded`, `thermal_throttled`, `thermal_clock_drop`, `power_telemetry_missing`,
+  `power_p99_inconsistent`, `power_cap_ambiguous`, `cancelled`, and existing coverage reasons.
+- `F2QualificationPhaseMetric` adds optional `sample_count` and `clock_max`. Missing historical
+  values stay unknown. Maximum is the highest retained sample, not a continuous hardware bound;
+  count is measured, not inferred from intended polling cadence or phase duration.
+- ExportForgeLog's text table includes reason; its raw JSONL includes the additive fields. No new
+  IPC command, tuning authorization, shader or qualification threshold is introduced.
