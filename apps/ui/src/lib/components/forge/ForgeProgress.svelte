@@ -286,7 +286,7 @@
   }
 
   function bandStatus(status) {
-    return { waiting_for_top: "Waiting for qualified top", pending: "Pending", in_flight: "Testing", closed: "Closed" }[status] ?? "Pending";
+    return { waiting_for_top: "Waiting for qualified top", margin_probe_waiting: "Margin check at end", pending: "Pending", in_flight: "Testing", closed: "Closed" }[status] ?? "Pending";
   }
 
   function searchStopReason(reason) {

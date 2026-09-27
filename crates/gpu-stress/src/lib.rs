@@ -201,6 +201,9 @@ pub struct Dx11Golden {
     pub compute_checksum: u32,
     pub adapter_luid: i64,
     pub frame_reference_us: u32,
+    /// Stock render checksum of the light frame (one instance instead of four; same compute).
+    /// It proves DX11 at the target pair below the power cap, like a light game.
+    pub light_checksum: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4402,6 +4405,7 @@ mod tests {
             compute_checksum: 10,
             adapter_luid: 11,
             frame_reference_us: 12,
+            light_checksum: 13,
         };
         let dx12 = WgpuRenderGoldens {
             power: 21,

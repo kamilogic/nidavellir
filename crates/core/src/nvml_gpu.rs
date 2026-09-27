@@ -60,6 +60,14 @@ impl NvmlSample {
                 | ThrottleReasons::HW_THERMAL_SLOWDOWN).bits() != 0
         })
     }
+
+    /// Hardware protection only (clocks cut hard near critical temperature). The software thermal
+    /// bit also fires during routine management (seen at 70 °C with clocks held) and is no failure.
+    pub fn hw_thermal_slowdown(&self) -> Option<bool> {
+        use nvml_wrapper::bitmasks::device::ThrottleReasons;
+        self.throttle_bits
+            .map(|bits| bits & ThrottleReasons::HW_THERMAL_SLOWDOWN.bits() != 0)
+    }
 }
 
 /// A persistent NVML handle for high-rate polling. `Nvml::init()` is the expensive call, so it is

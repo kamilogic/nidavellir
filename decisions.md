@@ -1,5 +1,40 @@
 # Nidavellir — Decision Log
 
+## 2026-09-27 (b) — margin probe last, light DX11 phase, clock×temp cells, .gitattributes
+
+User answers to the post-analysis suggestions:
+- Rejected a cool-down before discovery: games do not wait for the GPU to cool, so testing hot is
+  the realistic condition. Residual risk: a hot economic discovery near 197 W may drop a bin and
+  close that band.
+- Margin probe moves to the end: `margin_probe_waiting` holds the last admission (time is not
+  reserved), runs after the economic bands, and its integrity failure does not count toward the
+  two-error budget. The budget still ends exploration but not the planned probe; TDR/operational
+  failures still stop everything. After a probe TDR, rerun with Soft Reset.
+- DX11 gains a continuous light phase (one instance instead of four, same compute, own stock
+  checksum `light_checksum`); heavy phases stay. It must hold the exact target >=30 s
+  (`dx11_light_target_unexercised`). ExactApply36, fingerprint dx11-game-v5; DX11 now 6 phases.
+- Phase metrics persist `clock_temp` cells [clock, °C, samples, cap samples] for diagnosis.
+- `.gitattributes`: repository text LF, .bat/.cmd/.nsh CRLF; no content renormalization needed.
+
+## 2026-09-27 — hot-load bin, hardware-only thermal, hot target coverage, publication margin
+
+Run 1790537155912 passed discovery, screening, DX11, Vulkan and DX12 at 1920@937, then Endurance
+went `thermal_clock_drop`: hot, near-limit heavy phases ran one bin low (texture-rop 78% at 1920,
+rest 1905, cap bit 3%), and power-capped heavy-spike/idle-pulse were refused because the F2
+"thermal" flag was SW|HW on ANY sample (seen at 70 °C with clocks held). Light/medium phases held
+1920 up to 79 °C, so 1920@937 does run hot. User-approved package, no contract version bumps:
+- Heavy-phase sustain holds one physical bin below target (`f2_clock_held`); residency and DX11
+  exposure stay exact target (or power cap). Discovery stays exact, so no clock is promoted.
+- F2 dwell "thermal" = NVML HW thermal slowdown only; the power-cap excuse ignores the SW bit.
+- Endurance must run the exact target within 3 °C of the lane's hottest reading (>=100 samples),
+  else `thermal_target_coverage_low`.
+- Publication margin: a pair is published only if a lower voltage at the same clock also holds a
+  complete proof in this run. The performance band runs one margin probe one bin below the
+  qualified top before economics (`top_margin_proven|edge|unproven`); the top keeps its place.
+Rejected: zero-margin publication, a thermal +1-bin curve offset (unsafe if the NVML cap is not
+held after Apply), descending clocks on a top-phase Inconclusive. Acceptance also requires playing
+the chosen profile with Safe Loop active (field TDR ladder, boot reconciliation, canary).
+
 ## 2026-09-26 (night) — publish proven pairs after a crash; inconclusive closes only its band
 
 User chose option B so a run that reaches an economic band's stability edge still yields profiles.

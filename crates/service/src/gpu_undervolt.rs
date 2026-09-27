@@ -2693,9 +2693,9 @@ fn classify_f2_stress_dwell(
         if s.thermal_throttled { return inconclusive("thermal_throttled"); }
         inconclusive(if s.sample_count >= 100 { "power_limit_reached" } else { "power_limit_unproven_coverage" })
     } else if purpose == F2StressPurpose::PowerDiscovery && s.thermal_throttled {
-        // Thermal slowdown corrupts the V↔W power calibration regardless of clock (a throttled
-        // sample draws less than the point's real steady-state power), so discovery evidence is
-        // inconclusive whenever the card thermally slowed.
+        // HW thermal slowdown cuts clocks hard and corrupts the V↔W calibration. Since 2026-09-27
+        // the F2 flag is HW-only; a software thermal clock reduction still fails the exact p5 hold
+        // below (ClockDrop), so it cannot validate a pair either.
         inconclusive("thermal_throttled")
     } else if purpose.is_qualification() && s.thermal_throttled
         && s.qualification_coverage.as_ref().is_some_and(|c| c.reason.as_deref() == Some("heavy_clock_not_sustained")) {
@@ -4478,7 +4478,7 @@ fn dx11_complete_clean_lane(report: &F2StepReport, required_dwell_ms: u64) -> bo
         || coverage.compute_check_count == 0
         || coverage.sample_count == 0
         || (coverage.reason.as_deref() == Some("dx11_upper_clock_exceeded")
-            && !coverage.active_target.as_ref().is_some_and(|a| a.upper_clock_exceeded && a.phases_completed == 5))
+            && !coverage.active_target.as_ref().is_some_and(|a| a.upper_clock_exceeded && a.phases_completed == nidavellir_core::f2_observation::F2_DX11_PHASES))
     {
         return false;
     }
@@ -4490,7 +4490,7 @@ fn dx11_clock_control_rejection(report: &F2StepReport, required_dwell_ms: u64) -
     dx11_complete_clean_lane(report, required_dwell_ms)
         && report.qualification_coverage.as_ref().is_some_and(|c|
             c.reason.as_deref() == Some("dx11_upper_clock_exceeded")
-                && c.active_target.as_ref().is_some_and(|a| a.upper_clock_exceeded && a.phases_completed == 5))
+                && c.active_target.as_ref().is_some_and(|a| a.upper_clock_exceeded && a.phases_completed == nidavellir_core::f2_observation::F2_DX11_PHASES))
 }
 
 #[cfg(windows)]
@@ -5658,6 +5658,7 @@ mod tests {
             compute_checksum: 10,
             adapter_luid: 8,
             frame_reference_us: 9,
+            light_checksum: 6,
         }
     }
 
@@ -6384,8 +6385,8 @@ mod tests {
         let coverage = report.qualification_coverage.as_mut().unwrap();
         coverage.reason = Some("dx11_upper_clock_exceeded".into());
         coverage.active_target = Some(F2ActiveTargetCoverage {
-            observed_active_ms: 76_524, target_active_ms: 30_007, power_limited_active_ms: 0, required_target_ms: 30_000,
-            sample_count: 3707, phases_completed: 5, upper_clock_exceeded: true, heavy_target_proven: true,
+            observed_active_ms: 76_524, target_active_ms: 30_007, power_limited_active_ms: 0, light_target_active_ms: 30_000, required_target_ms: 30_000,
+            sample_count: 3707, phases_completed: 6, upper_clock_exceeded: true, heavy_target_proven: true,
             diagnostics: Some(F2ActiveTargetDiagnostics { requested_max_mhz: 1875, anchor_mv: 937,
                 reasons: vec!["dx11_upper_clock_exceeded".into()], publication_power_ceiling_w: None,
                 phases: vec![] }),

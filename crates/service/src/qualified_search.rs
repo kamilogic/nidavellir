@@ -6,6 +6,8 @@ use nidavellir_core::ipc::{ForgeDiscoveryBand, ForgeDiscoverySearch};
 pub const VERSION: u32 = 7;
 pub const STANDARD_ATTEMPTS: u32 = 24;
 pub const STANDARD_BUDGET_MS: u64 = 8 * 60 * 60 * 1_000;
+/// The qualified top's single margin probe waits here for the last, reserved admission.
+const MARGIN_PROBE_WAITING: &str = "margin_probe_waiting";
 
 #[derive(Debug, Clone, Copy)]
 pub struct Seed<'a> {
@@ -129,10 +131,19 @@ pub fn next_band(search: &ForgeDiscoverySearch) -> Option<usize> {
     {
         return None;
     }
+    // The top margin probe runs last on an admission reserved for it (2026-09-27), so a probe TDR
+    // cannot cost the economic evidence already gathered. Time is not reserved: if the clock runs
+    // out first, the top simply stays unpublished.
+    let probe = search.bands.iter().position(|band| band.status == MARGIN_PROBE_WAITING);
     let start = search.next_band_index % search.bands.len();
-    (0..search.bands.len())
-        .map(|offset| (start + offset) % search.bands.len())
-        .find(|&index| search.bands[index].status == "pending")
+    (search.attempts_used + u32::from(probe.is_some()) < search.attempts_limit)
+        .then(|| {
+            (0..search.bands.len())
+                .map(|offset| (start + offset) % search.bands.len())
+                .find(|&index| search.bands[index].status == "pending")
+        })
+        .flatten()
+        .or(probe)
 }
 
 /// Counts even cancelled/failed attempts. `elapsed_ms` is cumulative across service sessions.
@@ -185,6 +196,28 @@ fn close_all(search: &mut ForgeDiscoverySearch, reason: &str) {
     }
 }
 
+/// The integrity budget ends exploration, but the single planned margin probe still runs last.
+fn close_exploration(search: &mut ForgeDiscoverySearch, reason: &str) {
+    if !search.bands.iter().any(|band| band.status == MARGIN_PROBE_WAITING) {
+        return close_all(search, reason);
+    }
+    for band in &mut search.bands {
+        if band.status != "closed" && band.status != MARGIN_PROBE_WAITING {
+            close_band(band, reason);
+        }
+    }
+}
+
+/// Retry after a cancel/control retry: the margin probe goes back to its reserved slot.
+fn requeue(band: &mut ForgeDiscoveryBand) {
+    band.status = if band.id == "performance" && band.margin_probe_used {
+        MARGIN_PROBE_WAITING
+    } else {
+        "pending"
+    }
+    .into();
+}
+
 fn below_economic_floor(clock_mhz: u32, performance_clock_mhz: Option<u32>) -> bool {
     performance_clock_mhz
         .is_some_and(|performance| u64::from(clock_mhz) * 100 < u64::from(performance) * 90)
@@ -193,7 +226,8 @@ fn below_economic_floor(clock_mhz: u32, performance_clock_mhz: Option<u32>) -> b
 /// Economic exploration starts only after the performance search closes with complete proof.
 /// These are starting candidates, never predeclared profile results. Every pair needs its own matrix.
 fn start_economic_bands(search: &mut ForgeDiscoverySearch, clock_bins: &[u32]) {
-    let Some(top) = search.bands.iter().find(|b| b.id == "performance" && b.status == "closed") else { return; };
+    let Some(top) = search.bands.iter().find(|b| b.id == "performance"
+        && (b.status == "closed" || b.status == MARGIN_PROBE_WAITING)) else { return; };
     let (Some(clock), Some(voltage)) = (top.last_qualified_clock_mhz, top.last_qualified_voltage_mv) else {
         close_all(search, "qualified_top_unavailable");
         return;
@@ -248,6 +282,17 @@ pub fn record(
         .max();
     let lower_power_voltage = lower_power_voltage(band, voltage_bins, power_hint);
     match outcome {
+        // Margin probe result (2026-09-27): it only decides whether the top may be published;
+        // it never replaces the qualified top or descends further. By user decision its
+        // integrity failure does not count toward the two-error exploration budget.
+        _ if band.id == "performance" && band.margin_probe_used
+            && !matches!(outcome, Outcome::ControlMismatch | Outcome::Cancelled) => {
+            close_band(band, match outcome {
+                Outcome::Qualified => "top_margin_proven",
+                Outcome::IntegrityError => "top_margin_edge",
+                _ => "top_margin_unproven",
+            });
+        }
         Outcome::Qualified => {
             band.power_preparation_used = false;
             clear_power_bracket(band);
@@ -271,6 +316,13 @@ pub fn record(
                 band.target_clock_mhz = higher_clock.unwrap();
                 band.next_raise_clock = false;
                 band.status = "pending".into();
+            } else if band.id == "performance" && lower_voltage.is_some() {
+                // Margin (2026-09-27): prove one bin below the top once, after the economic bands;
+                // only then may the top be published. The qualified top used by the economic
+                // bands stays where it is.
+                band.margin_probe_used = true;
+                band.voltage_mv = lower_voltage.unwrap();
+                band.status = MARGIN_PROBE_WAITING.into();
             } else if band.id == "performance" {
                 close_band(band, "physical_clock_domain_exhausted");
             } else if let Some(voltage) = lower_voltage {
@@ -338,18 +390,18 @@ pub fn record(
         Outcome::ControlMismatch => {
             if search.control_retries_used == 0 {
                 search.control_retries_used += 1;
-                band.status = "pending".into();
+                requeue(band);
             } else {
                 close_all(search, "control_reapplication_failed");
                 return Ok(());
             }
         },
-        Outcome::Cancelled => band.status = "pending".into(),
+        Outcome::Cancelled => requeue(band),
         Outcome::DriverFailure | Outcome::OperationalFailure => unreachable!(),
     }
     start_economic_bands(search, clock_bins);
     if search.integrity_errors >= 2 {
-        close_all(search, "integrity_error_budget_exhausted");
+        close_exploration(search, "integrity_error_budget_exhausted");
     } else {
         let elapsed_ms = search.elapsed_ms;
         finalize_budget(search, elapsed_ms);
@@ -371,7 +423,7 @@ pub fn resume_after_stock(search: &mut ForgeDiscoverySearch) -> Result<(), Strin
     }
     for band in &mut search.bands {
         if band.status == "in_flight" {
-            band.status = "pending".into();
+            requeue(band);
         }
     }
     let elapsed_ms = search.elapsed_ms;
@@ -424,9 +476,49 @@ mod tests {
         assert_eq!(step(&mut state, Outcome::Qualified), 0);
         assert_eq!(step(&mut state, Outcome::Qualified), 0);
         assert_eq!(state.bands[0].last_qualified_clock_mhz, Some(1740));
+        assert_eq!(state.bands[0].status, MARGIN_PROBE_WAITING, "margin probe waits for the end");
         assert_eq!(next_band(&state), Some(1));
         assert_eq!(state.bands[1].target_clock_mhz,1710);
         assert_eq!(state.bands[2].target_clock_mhz,1605);
+    }
+    #[test]
+    fn top_margin_probe_runs_last_once_uncounted_and_never_moves_the_top() {
+        for (probe, reason) in [
+            (Outcome::Qualified, "top_margin_proven"),
+            (Outcome::IntegrityError, "top_margin_edge"),
+            (Outcome::Inconclusive, "top_margin_unproven"),
+        ] {
+            let mut state = search();
+            state.bands[0].target_clock_mhz = 1740;
+            step(&mut state, Outcome::Qualified);
+            let top = &state.bands[0];
+            assert_eq!((top.target_clock_mhz, top.voltage_mv, top.margin_probe_used), (1740, 900, true));
+            assert_eq!(state.bands[1].voltage_mv, 906, "economics start from the top, not the probe");
+            assert_eq!(step(&mut state, Outcome::Inconclusive), 1);
+            assert_eq!(step(&mut state, Outcome::Inconclusive), 2);
+            assert_eq!(step(&mut state, probe), 0, "the probe runs after the economic bands");
+            let top = &state.bands[0];
+            assert_eq!(top.stop_reason.as_deref(), Some(reason));
+            assert_eq!((top.last_qualified_clock_mhz, top.last_qualified_voltage_mv), (Some(1740), Some(906)));
+            assert_eq!((state.integrity_errors, next_band(&state)), (0, None));
+        }
+    }
+    #[test]
+    fn margin_probe_keeps_the_last_admission_and_survives_the_integrity_budget() {
+        let mut state = search();
+        state.attempts_limit = 3;
+        state.bands[0].target_clock_mhz = 1740;
+        step(&mut state, Outcome::Qualified);
+        assert_eq!(step(&mut state, Outcome::Qualified), 1);
+        assert_eq!(next_band(&state), Some(0), "last admission is reserved for the probe");
+        let mut state = search();
+        state.bands[0].target_clock_mhz = 1740;
+        step(&mut state, Outcome::Qualified);
+        step(&mut state, Outcome::IntegrityError);
+        step(&mut state, Outcome::IntegrityError);
+        assert_eq!((state.integrity_errors, state.stop_reason.as_deref()), (2, None));
+        assert_eq!(step(&mut state, Outcome::Qualified), 0);
+        assert_eq!(state.stop_reason.as_deref(), Some("integrity_error_budget_exhausted"));
     }
     #[test]
     fn power_bound_lowers_voltage_at_same_clock_without_promoting_evidence() {
@@ -490,7 +582,8 @@ mod tests {
         resume_after_stock(&mut restored).unwrap();
         step(&mut restored, Outcome::Qualified);
         assert_eq!(restored.bands[0].last_qualified_clock_mhz,Some(1725));
-        assert_eq!(restored.bands[0].status,"closed");
+        assert_eq!((restored.bands[0].voltage_mv, restored.bands[0].margin_probe_used), (900, true));
+        assert_eq!(restored.bands[0].status, MARGIN_PROBE_WAITING);
         assert_eq!(next_band(&restored),Some(1));
         assert_eq!(restored.attempts_used,3);
     }

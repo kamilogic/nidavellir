@@ -23,6 +23,10 @@ const SOURCE_DIM: u32 = 1024;
 const COMPUTE_ELEMENTS: u32 = 65_536;
 const GOLDEN_MIN_CHECKS: u32 = 3;
 const CHECK_INTERVAL_FRAMES: u64 = 16;
+/// Heavy frame: four overlapping full-screen instances. Light frame: one (about a quarter of the
+/// pixel work) with the same compute dispatch, so it runs the target below the power cap.
+const HEAVY_INSTANCES: u32 = 4;
+const LIGHT_INSTANCES: u32 = 1;
 const GPU_COMPLETION_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 const SHADER_SOURCE: &[u8] = br#"
@@ -346,33 +350,43 @@ impl Dx11Qualifier {
 
     pub fn capture_golden(&self, sample_ms: u64) -> Result<Dx11Golden, String> {
         let started = Instant::now();
-        let mut checks = Vec::new();
-        let mut frames = 0u64;
-        while started.elapsed() < Duration::from_millis(sample_ms)
-            || checks.len() < GOLDEN_MIN_CHECKS as usize
-        {
-            self.draw_frame();
-            frames = frames.saturating_add(1);
-            if frames.is_multiple_of(CHECK_INTERVAL_FRAMES) {
-                checks.push(self.readback_checksums()?);
-            }
-        }
-        let Some(&(checksum, compute_checksum)) = checks.first() else {
-            return Err("DX11 golden captured no checksum".into());
-        };
-        if checks
-            .iter()
-            .any(|candidate| *candidate != (checksum, compute_checksum))
-        {
-            return Err("DX11 stock golden was not deterministic".into());
-        }
+        let ((checksum, compute_checksum), frames) =
+            self.capture_checksums(sample_ms, HEAVY_INSTANCES)?;
         let elapsed_us = started.elapsed().as_micros().max(1) as u64;
+        let ((light_checksum, light_compute), _) =
+            self.capture_checksums(sample_ms, LIGHT_INSTANCES)?;
+        if light_compute != compute_checksum {
+            return Err("DX11 light frame changed the stock compute checksum".into());
+        }
         Ok(Dx11Golden {
             checksum,
             compute_checksum,
             adapter_luid: self.adapter.adapter_luid,
             frame_reference_us: (elapsed_us / frames.max(1)).clamp(1, u64::from(u32::MAX)) as u32,
+            light_checksum,
         })
+    }
+
+    fn capture_checksums(&self, sample_ms: u64, instances: u32) -> Result<((u32, u32), u64), String> {
+        let started = Instant::now();
+        let mut checks = Vec::new();
+        let mut frames = 0u64;
+        while started.elapsed() < Duration::from_millis(sample_ms)
+            || checks.len() < GOLDEN_MIN_CHECKS as usize
+        {
+            self.draw_frame(instances);
+            frames = frames.saturating_add(1);
+            if frames.is_multiple_of(CHECK_INTERVAL_FRAMES) {
+                checks.push(self.readback_checksums()?);
+            }
+        }
+        let Some(&first) = checks.first() else {
+            return Err("DX11 golden captured no checksum".into());
+        };
+        if checks.iter().any(|candidate| *candidate != first) {
+            return Err("DX11 stock golden was not deterministic".into());
+        }
+        Ok((first, frames))
     }
 
     pub fn run_with_golden(
@@ -393,6 +407,33 @@ impl Dx11Qualifier {
         cancel: Option<&AtomicBool>,
         activity: &mut dyn FnMut(bool),
     ) -> Dx11QualificationResult {
+        self.run_frames(duration_ms, golden, cancel, activity, false)
+    }
+
+    /// Same checks on the light frame, against `golden.light_checksum`.
+    pub fn run_light_with_golden_observed(
+        &self,
+        duration_ms: u64,
+        golden: Dx11Golden,
+        cancel: Option<&AtomicBool>,
+        activity: &mut dyn FnMut(bool),
+    ) -> Dx11QualificationResult {
+        self.run_frames(duration_ms, golden, cancel, activity, true)
+    }
+
+    fn run_frames(
+        &self,
+        duration_ms: u64,
+        golden: Dx11Golden,
+        cancel: Option<&AtomicBool>,
+        activity: &mut dyn FnMut(bool),
+        light: bool,
+    ) -> Dx11QualificationResult {
+        let instances = if light { LIGHT_INSTANCES } else { HEAVY_INSTANCES };
+        let expected = (
+            if light { golden.light_checksum } else { golden.checksum },
+            golden.compute_checksum,
+        );
         let started = Instant::now();
         if golden.adapter_luid != self.adapter.adapter_luid {
             return result(
@@ -417,7 +458,7 @@ impl Dx11Qualifier {
                 Some("dx11_no_work_requested".into()),
             );
         }
-        self.submit_batch();
+        self.submit_batch(instances);
         activity(true);
         let mut frames = CHECK_INTERVAL_FRAMES;
         let mut checks = 0u32;
@@ -430,14 +471,13 @@ impl Dx11Qualifier {
             let readback = self.readback_checksums_with(|| {
                 activity(false);
                 if !cancelled() && started.elapsed() < Duration::from_millis(duration_ms) {
-                    self.submit_batch();
+                    self.submit_batch(instances);
                     activity(true);
                     frames = frames.saturating_add(CHECK_INTERVAL_FRAMES);
                     queued_next = true;
                 }
             });
-            let failed = !matches!(&readback, Ok((render, compute))
-                if *render == golden.checksum && *compute == golden.compute_checksum);
+            let failed = !matches!(&readback, Ok(pair) if *pair == expected);
             // A failed check may have one batch in flight. Fence it before returning to the
             // caller's stock reset; a device failure while draining takes precedence.
             let readback = if failed && queued_next {
@@ -450,10 +490,7 @@ impl Dx11Qualifier {
             };
             if failed { activity(false); }
             match readback {
-                Ok((checksum, compute_checksum))
-                    if checksum == golden.checksum
-                        && compute_checksum == golden.compute_checksum =>
-                {
+                Ok(pair) if pair == expected => {
                     checks = checks.saturating_add(1);
                     compute_checks = compute_checks.saturating_add(1);
                 }
@@ -505,7 +542,7 @@ impl Dx11Qualifier {
         )
     }
 
-    fn draw_frame(&self) {
+    fn draw_frame(&self, instances: u32) {
         unsafe {
             self.context.OMSetRenderTargets(
                 Some(&[Some(self.render_target_view.clone())]),
@@ -534,7 +571,7 @@ impl Dx11Qualifier {
                 .PSSetShaderResources(0, Some(&[Some(self.source_view.clone())]));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-            self.context.DrawInstanced(3, 4, 0, 0);
+            self.context.DrawInstanced(3, instances, 0, 0);
 
             self.context.CSSetShader(&self.compute_shader, None);
             let uavs = [Some(self.compute_uav.clone())];
@@ -544,9 +581,9 @@ impl Dx11Qualifier {
         }
     }
 
-    fn submit_batch(&self) {
+    fn submit_batch(&self, instances: u32) {
         for _ in 0..CHECK_INTERVAL_FRAMES {
-            self.draw_frame();
+            self.draw_frame(instances);
         }
         // Dispatch queued work before the CPU starts hashing the previous readback.
         unsafe { self.context.Flush() };
@@ -755,6 +792,12 @@ mod tests {
         assert!(!run.timed_out);
         assert_eq!(run.frames, u64::from(run.checks) * CHECK_INTERVAL_FRAMES);
         assert_eq!(run.checks, run.compute_checks);
+        assert_ne!(golden.light_checksum, golden.checksum, "light frame is a different image");
+        let light = candidate.run_light_with_golden_observed(1_000, golden, None, &mut |_| {});
+        assert_eq!((light.result, light.checks > 0), (StabilityResult::Stable, true));
+        let wrong_light = Dx11Golden { light_checksum: golden.light_checksum ^ 1, ..golden };
+        let failed = candidate.run_light_with_golden_observed(1_000, wrong_light, None, &mut |_| {});
+        assert_eq!(failed.result, StabilityResult::SilentError);
 
         for bad in [
             Dx11Golden {

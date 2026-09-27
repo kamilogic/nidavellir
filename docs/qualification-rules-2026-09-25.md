@@ -4,6 +4,26 @@ Implementação: Discovery 9, Frontier 32, Exact Apply 35, busca 7 (revisada em 
 documento substitui as regras de residência/energia e a ordem de busca de 24/09. A matriz de cargas
 continua 27. Não houve execução física de carga nesta alteração; a aceitação no hardware continua pendente.
 
+## Calor, margem e aceite em jogo (27/09)
+
+- Sustentação das fases pesadas aceita **um bin abaixo** do alvo (1905 para 1920): sob carga pesada,
+  quente e perto do limite, o boost da GPU desce um bin na mesma tensão. Residência, exposição DX11
+  e descoberta continuam exigindo o alvo exato (ou o power cap), então isso não promove clock.
+- "Térmico" nas dwells F2 = slowdown térmico de **hardware**. O bit de software aparecia a 70 °C
+  com clock mantido e não é mais motivo de recusa; o power cap vale mesmo com ele.
+- Endurance exige o alvo exato a até 3 °C da temperatura máxima da lane (≥ 100 amostras), senão
+  `thermal_target_coverage_low`. Na run de 27/09 o 1920 rodou em fases médias até 79 °C.
+- Margem: só entra nos perfis o par que tem outra tensão menor, no mesmo clock, também aprovada
+  na run. O topo passa por um teste único um bin abaixo **no fim da run**, na última admissão
+  (reservada); se falhar, o topo continua qualificado mas não é publicado. Erro nesse teste não
+  conta no orçamento de 2 erros, e esse orçamento não cancela o teste. TDR no teste: Soft Reset.
+- DX11 (ExactApply 36): 6 fases — pesada, rajadas 75/50/25%, **leve contínua** (1 instância,
+  referência stock própria) e pesada. A leve precisa de ≥ 30 s no alvo exato, provando o DX11 no
+  par abaixo do limite de potência, como um jogo leve.
+- Métricas por fase gravam células `clock_temp` [clock, °C, amostras, amostras com power cap].
+- Aceite: aplicar o perfil e jogar com o Safe Loop ativo. TDR em jogo sobe um bin e reaplica; se
+  repetir, volta ao stock e condena o par. Travamento/tela azul: a inicialização volta ao stock.
+
 ## Contrato de carga representativa (26/09, noite)
 
 Decisão do usuário, revertendo a regra de pior carga de 25/09: o topo é o maior clock que a carga

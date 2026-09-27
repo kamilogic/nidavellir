@@ -52,6 +52,14 @@ pub fn f2_clock_ceiling_mhz(target: u32) -> u32 {
 pub fn f2_clock_in_target_band(clock: u32, target: u32) -> bool {
     (target..=f2_clock_ceiling_mhz(target)).contains(&clock)
 }
+/// Qualification sustain also holds one physical bin below the nominal target: under hot,
+/// near-limit heavy load the GPU's own boost management drops one bin at the same voltage (run
+/// 1790537155912 Endurance: texture-rop/mixed-game at 1905 for 1920, cap bit on 3-6%). This is
+/// never target exposure and never promotes or demotes the published nominal clock.
+pub const F2_HELD_BIN_BELOW_MHZ: u32 = 15;
+pub fn f2_clock_held(clock: u32, target: u32) -> bool {
+    (target.saturating_sub(F2_HELD_BIN_BELOW_MHZ)..=f2_clock_ceiling_mhz(target)).contains(&clock)
+}
 /// Current FailureSeekingGameLoop qualification contract.
 ///
 /// v7 requires the High-FPS, Texture and Transitions qualification set and reconciles the exact
@@ -152,7 +160,9 @@ pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 32;
 /// v32: stock-checked secondary context and immediate peer-failure cancellation.
 /// v35 (2026-09-26): representative-load contract, same rules as Frontier v32; DX11 exposure
 /// counts power-limited active time separately (`power_limited_active_ms`).
-pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 35;
+/// v36 (2026-09-27): the DX11 lane adds a continuous light phase (one-instance frame, own stock
+/// golden) that must hold the exact target for 30 s, so DX11 itself exercises the pair.
+pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 36;
 
 /// Backward-compatible alias for callers that expose one latest profile-publication contract.
 /// Frontier qualification has an independent version because exact-Apply policy changes must not
@@ -338,6 +348,10 @@ pub struct F2QualificationPhaseMetric {
     #[serde(default)]
     pub temperature_max: Option<f32>,
     pub coverage_status: String,
+    /// Joint cells `[clock MHz, whole °C, samples, SW power-cap samples]`, sorted. Diagnostic only
+    /// (2026-09-27): shows where a phase dropped a bin as it heated. Legacy evidence has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clock_temp: Vec<[u32; 4]>,
 }
 
 /// Compact, append-only qualification coverage summary. Phase details remain service-internal; this
@@ -374,6 +388,9 @@ pub struct F2QualificationCoverage {
     pub phase_metrics: Vec<F2QualificationPhaseMetric>,
 }
 
+/// Native DX11 lane phases: heavy, 75/50/25% duty heavy bursts, continuous light, heavy.
+pub const F2_DX11_PHASES: u32 = 6;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct F2ActiveTargetCoverage {
     pub observed_active_ms: u64,
@@ -382,6 +399,10 @@ pub struct F2ActiveTargetCoverage {
     /// held under the representative-load contract, reported apart from real target exposure.
     #[serde(default)]
     pub power_limited_active_ms: u64,
+    /// Exact-target time in the continuous light DX11 phase (ExactApply36): DX11 itself must
+    /// exercise the pair below the power cap, as a light game would.
+    #[serde(default)]
+    pub light_target_active_ms: u64,
     pub required_target_ms: u64,
     pub sample_count: u32,
     pub phases_completed: u32,
@@ -408,6 +429,9 @@ pub struct F2ActiveTargetDiagnostics {
 pub struct F2ActiveClockPhase {
     pub phase_index: u32,
     pub requested_duty_pct: u32,
+    /// Continuous light frame (one instance) instead of the heavy frame.
+    #[serde(default)]
+    pub light: bool,
     pub active_sample_count: u32,
     pub active_clock_max_mhz: Option<u32>,
     #[serde(default)]
@@ -416,6 +440,9 @@ pub struct F2ActiveClockPhase {
     pub target_active_us: u64,
     #[serde(default)]
     pub power_limited_active_us: u64,
+    /// One bin below target without the power-cap bit: held for heavy sustain only.
+    #[serde(default)]
+    pub one_bin_below_active_us: u64,
     pub upper_sample_count: u32,
     // Upper samples describe excursions above the nominal request, including allowed +15 MHz.
     /// Bounded sampled time support, NOT the continuous duration of an excursion.
@@ -445,7 +472,8 @@ pub struct F2ClockCurveSnapshot {
 
 impl F2ActiveTargetCoverage {
     pub fn proves_target(&self) -> bool {
-        self.heavy_target_proven && self.phases_completed == 5 && !self.upper_clock_exceeded && self.sample_count > 0
+        self.heavy_target_proven && self.phases_completed == F2_DX11_PHASES && !self.upper_clock_exceeded && self.sample_count > 0
+            && self.light_target_active_ms >= self.required_target_ms
             && self.diagnostics.as_ref().is_none_or(|d| d.phases.iter().all(|p|
                 p.active_clock_max_mhz.map_or(p.upper_sample_count == 0, |clock| clock <= f2_clock_ceiling_mhz(d.requested_max_mhz))))
             && self.observed_active_ms >= 60_000 && self.required_target_ms == 30_000
@@ -454,7 +482,8 @@ impl F2ActiveTargetCoverage {
             && self.held_active_ms() as f64 / self.observed_active_ms as f64 >= 0.35
     }
 
-    /// Target exposure plus power-limited time (representative-load contract).
+    /// Target exposure plus power-limited time (representative-load contract). One bin below the
+    /// target is held only for heavy-phase sustain, never as exposure.
     pub fn held_active_ms(&self) -> u64 {
         self.target_active_ms.saturating_add(self.power_limited_active_ms)
     }
@@ -1939,8 +1968,8 @@ mod tests {
         o.mode = F2ObsMode::ApplyQualification;
         if pattern == F2QualificationPattern::Dx11Game {
             o.qualification_coverage.as_mut().unwrap().active_target = Some(F2ActiveTargetCoverage {
-                observed_active_ms: 80_000, target_active_ms: 40_000, power_limited_active_ms: 0, required_target_ms: 30_000,
-                sample_count: 3000, phases_completed: 5, upper_clock_exceeded: false, heavy_target_proven: true,
+                observed_active_ms: 80_000, target_active_ms: 40_000, power_limited_active_ms: 0, light_target_active_ms: 30_000, required_target_ms: 30_000,
+                sample_count: 3000, phases_completed: 6, upper_clock_exceeded: false, heavy_target_proven: true,
                 diagnostics: None,
             });
         }
@@ -1977,8 +2006,8 @@ mod tests {
         let restored: F2Observation = serde_json::from_str(&serde_json::to_string(&pass).unwrap()).unwrap();
         assert!(!is_current_apply_qualification_evidence(&restored), "a Pass label cannot replace active exposure proof");
         let coverage = F2ActiveTargetCoverage {
-            observed_active_ms:80_000, target_active_ms:40_000, power_limited_active_ms: 0, required_target_ms:30_000,
-            sample_count:3000, phases_completed:5, upper_clock_exceeded: false, heavy_target_proven: true,
+            observed_active_ms:80_000, target_active_ms:40_000, power_limited_active_ms: 0, light_target_active_ms: 30_000, required_target_ms:30_000,
+            sample_count:3000, phases_completed:6, upper_clock_exceeded: false, heavy_target_proven: true,
             diagnostics: None,
         };
         let loaded: F2ActiveTargetCoverage = serde_json::from_str(&serde_json::to_string(&coverage).unwrap()).unwrap();
@@ -1993,6 +2022,8 @@ mod tests {
             F2ActiveTargetCoverage {sample_count:0,..loaded.clone()},
             F2ActiveTargetCoverage {required_target_ms:1,..loaded.clone()},
             F2ActiveTargetCoverage {upper_clock_exceeded: true, heavy_target_proven: true,..loaded.clone()},
+            F2ActiveTargetCoverage {light_target_active_ms: 29_999,..loaded.clone()},
+            F2ActiveTargetCoverage {phases_completed: 5,..loaded.clone()},
         ] { assert!(!bad.proves_target()); }
     }
 

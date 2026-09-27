@@ -78,13 +78,18 @@ const F2_QUALIFIER_TARGET_RESIDENCY_MIN: f32 = 0.35;
 const F2_QUALIFIER_BOOST_EDGE_MIN_SAMPLES: usize = 20;
 #[cfg(windows)]
 const F2_QUALIFIER_NEAR_CAP_RATIO: f32 = 0.99;
-/// Representative-load contract (2026-09-26): a qualification sample below the target band is
-/// held when NVML attributes it to the SW power cap and not to thermal slowdown. Sampled power
-/// cannot decide this: NVML power is a 1 s average on Ampere, so 100 ms DX11 bursts clamped by the
-/// limiter read 100-190 W (run 1790466472114: cap bit on 100% of DX11 samples, 73 s refused).
+/// Endurance must run the nominal target within 3 °C of the lane's hottest reading, ~3 s of samples.
 #[cfg(windows)]
-fn f2_power_limited_sample(power_capped: bool, thermal_throttled: bool) -> bool {
-    power_capped && !thermal_throttled
+const F2_ENDURANCE_HOT_BAND_C: f32 = 3.0;
+#[cfg(windows)]
+const F2_ENDURANCE_HOT_TARGET_MIN_SAMPLES: usize = 100;
+/// Representative-load contract (2026-09-26): a qualification sample below the target band is
+/// held when NVML attributes it to the SW power cap and hardware thermal slowdown is not engaged.
+/// Sampled power cannot decide this: NVML power is a 1 s average on Ampere, so 100 ms DX11 bursts
+/// clamped by the limiter read 100-190 W (run 1790466472114: cap bit on 100% of DX11 samples).
+#[cfg(windows)]
+fn f2_power_limited_sample(power_capped: bool, hw_thermal_slowdown: bool) -> bool {
+    power_capped && !hw_thermal_slowdown
 }
 #[cfg(windows)]
 const V8_GOLDEN_SAMPLE_MS: u64 = 2_000;
@@ -3286,7 +3291,7 @@ fn f2_evidence_provenance(
             ),
         ),
         RenderStressPurpose::Dx11Qualification(golden, anchor) => (
-            if anchor.is_some() {"dx11-game-v4/active-residency-heavy-variable"} else {"dx11-game-v3/offscreen-rgba8-texture-depth-compute-pipelined"}.to_owned(),
+            if anchor.is_some() {"dx11-game-v5/active-residency-heavy-variable-light"} else {"dx11-game-v3/offscreen-rgba8-texture-depth-compute-pipelined"}.to_owned(),
             "stock-golden-fnv1-32/render+compute/readback-every-16-frames-pipelined".to_owned(),
             format!(
                 "source=stock;capture_ms={V8_GOLDEN_SAMPLE_MS};checksum={};compute_checksum={};adapter_luid={};frame_reference_us={}",
@@ -3481,6 +3486,19 @@ fn qualifier_power_contrast(samples: &[PhaseSample], pattern: VfQualifierPattern
     }
 }
 
+/// Joint `[clock MHz, whole °C, samples, SW power-cap samples]` cells for one phase, sorted.
+#[cfg(windows)]
+fn f2_clock_temp_cells(samples: &[PhaseSample]) -> Vec<[u32; 4]> {
+    let mut cells = std::collections::BTreeMap::<(u32, u32), [u32; 2]>::new();
+    for sample in samples {
+        let Some(temp) = sample.3 else { continue };
+        let cell = cells.entry((sample.0, temp.round() as u32)).or_default();
+        cell[0] += 1;
+        cell[1] += u32::from(sample.2);
+    }
+    cells.into_iter().map(|((clock, temp), [n, capped])| [clock, temp, n, capped]).collect()
+}
+
 #[cfg(windows)]
 fn qualification_coverage_from_run(
     result: StabilityResult,
@@ -3643,6 +3661,7 @@ fn qualification_coverage_from_run_with_context(
                 temperature_avg: avg_f32(&temperatures),
                 temperature_max: pct_f32(temperatures, 1.0),
                 coverage_status: coverage_status.to_string(),
+                clock_temp: f2_clock_temp_cells(&phase_samples),
             }
         })
         .collect::<Vec<_>>();
@@ -3659,12 +3678,22 @@ fn qualification_coverage_from_run_with_context(
                 // prove sustain either way. Skip them instead of refusing every short screening.
                 if phase.len() < 20 { return None; }
                 evaluated = true;
-                let held = phase.iter().filter(|s| nidavellir_core::f2_observation::f2_clock_in_target_band(s.0, target)
+                let held = phase.iter().filter(|s| nidavellir_core::f2_observation::f2_clock_held(s.0, target)
                     || f2_power_limited_sample(s.2, s.5)).count();
                 (held as f64 / (phase.len() as f64) < 0.95).then_some("heavy_clock_not_sustained")
             });
         refusal.or((!evaluated).then_some("heavy_phase_telemetry_low"))
     });
+    // Endurance is the thermal soak: the nominal target itself must run near the hottest
+    // temperature the lane reached, or the pair was never proven hot (2026-09-27).
+    let hot_target_samples = target_mhz
+        .filter(|_| matches!(pattern, VfQualifierPattern::Endurance))
+        .map(|target| {
+            let lane = || samples.iter().filter(|s| VfQualifierPhase::from_code(s.4).is_some());
+            let lane_max = lane().filter_map(|s| s.3).fold(f32::MIN, f32::max);
+            lane().filter(|s| nidavellir_core::f2_observation::f2_clock_in_target_band(s.0, target)
+                && s.3.is_some_and(|temp| temp >= lane_max - F2_ENDURANCE_HOT_BAND_C)).count()
+        });
     let (verdict, reason) = if let Some(reason) = inconclusive_reason {
         (
             F2QualificationVerdict::Inconclusive,
@@ -3696,6 +3725,11 @@ fn qualification_coverage_from_run_with_context(
         (
             F2QualificationVerdict::Inconclusive,
             Some("target_residency_low".to_string()),
+        )
+    } else if hot_target_samples.is_some_and(|n| n < F2_ENDURANCE_HOT_TARGET_MIN_SAMPLES) {
+        (
+            F2QualificationVerdict::Inconclusive,
+            Some("thermal_target_coverage_low".to_string()),
         )
     } else if current_texture_contract && boost_samples < F2_QUALIFIER_BOOST_EDGE_MIN_SAMPLES {
         (
@@ -3840,6 +3874,7 @@ fn dx11_qualification_coverage_from_run(
             temperature_avg: avg_f32(&temperatures),
             temperature_max: pct_f32(temperatures, 1.0),
             coverage_status: coverage_status.into(),
+            clock_temp: f2_clock_temp_cells(&phase_samples),
         }],
     }
 }
@@ -4220,7 +4255,7 @@ fn load_and_measure_for_with_phase_hook(
                 } else { None };
                 if let Ok(mut samples) = dx11_samples_thread.lock() {
                     let power_limited = f2_power_limited_sample(
-                        r.power_capped() == Some(true), r.thermal_throttled() == Some(true));
+                        r.power_capped() == Some(true), r.hw_thermal_slowdown() == Some(true));
                     samples.push(dx11_residency::Sample { start_us: dx11_start_us,
                         end_us, clock_mhz, voltage_mv: dx11_voltage,
                         temperature_c: r.temp_c, curve, power_limited });
@@ -4250,7 +4285,9 @@ fn load_and_measure_for_with_phase_hook(
                             r.power_capped() == Some(true),
                             r.temp_c.map(|t| t as f32),
                             sample_phase,
-                            r.thermal_throttled() == Some(true),
+                            // F2 "thermal" = hardware slowdown only (2026-09-27): the software bit
+                            // fired at 70 °C with clocks held and ended run 1790537155912.
+                            r.hw_thermal_slowdown() == Some(true),
                         ));
                     }
                 }
@@ -8556,6 +8593,22 @@ fn f2_set_run_points(prog: &mut PowerSweepProgress, points: &[(PowerSweepPoint, 
         .max();
 }
 
+/// Margin (2026-09-27): a pair is publishable only when a lower voltage at the same clock also
+/// holds a complete proof in this run, so no profile sits on the lowest bin that passed.
+#[cfg(windows)]
+fn f2_margin_proven(points: &[(PowerSweepPoint, f64)]) -> Vec<(PowerSweepPoint, f64)> {
+    points
+        .iter()
+        .copied()
+        .filter(|(p, _)| {
+            points.iter().any(|(q, _)| {
+                q.target_clock_mhz == p.target_clock_mhz
+                    && q.vf_table_voltage_mv.zip(p.vf_table_voltage_mv).is_some_and(|(lower, mv)| lower < mv)
+            })
+        })
+        .collect()
+}
+
 /// Name the three profiles from proven points; Apply readiness follows the run's mode policy.
 #[cfg(windows)]
 fn f2_publish_run_profiles(
@@ -8565,7 +8618,14 @@ fn f2_publish_run_profiles(
     mode_policy: F2ForgeModePolicy,
 ) {
     f2_set_run_points(prog, points);
-    let profiles = synthesize_forge_profiles_capped(points, &ForgePolicy::balanced(), cap);
+    let proven = f2_margin_proven(points);
+    if proven.len() < points.len() {
+        prog.log.push(format!(
+            "FORGE: {} par(es) no bin mais baixo aprovado do seu clock ficaram fora dos perfis (margem de 1 bin).",
+            points.len() - proven.len()
+        ));
+    }
+    let profiles = synthesize_forge_profiles_capped(&proven, &ForgePolicy::balanced(), cap);
     prog.log.extend(profiles.log);
     prog.godforge = profiles.godforge;
     prog.brokkrs = profiles.brokkrs;
@@ -9725,6 +9785,13 @@ fn measure_multiclock_undervolt_forge(
                 ));
             }
         }
+        let next = &discovery.bands[band_index];
+        if recorded == Outcome::Qualified && next.id == "performance" && next.margin_probe_used && next.status == "margin_probe_waiting" {
+            prog.log.push(format!(
+                "Topo {target} MHz @ {mv} mV qualificado. Teste de margem único em {} MHz @ {} mV reservado para a última admissão, depois das bandas econômicas; o topo só entra nos perfis se essa margem for provada.",
+                next.target_clock_mhz, next.voltage_mv
+            ));
+        }
         prog.last_outcome = Some(
             match outcome {
                 Outcome::Qualified => "CandidateQualified",
@@ -10090,8 +10157,8 @@ mod tests {
         let c = first.qualification_coverage.as_mut().unwrap();
         c.reason = Some("dx11_upper_clock_exceeded".into());
         c.active_target = Some(F2ActiveTargetCoverage { observed_active_ms: 76_524,
-            target_active_ms: 30_007, power_limited_active_ms: 0, required_target_ms: 30_000, sample_count: 3707,
-            phases_completed: 5, upper_clock_exceeded: true, heavy_target_proven: true, diagnostics: None });
+            target_active_ms: 30_007, power_limited_active_ms: 0, light_target_active_ms: 30_000, required_target_ms: 30_000, sample_count: 3707,
+            phases_completed: 6, upper_clock_exceeded: true, heavy_target_proven: true, diagnostics: None });
         first.power_p99_w = Some(200.006); // Concurrent energy refusal must not hide this budget.
         let mut other_run = first.clone(); other_run.run_id = "other".into();
         let mut other_gpu = first.clone(); other_gpu.gpu_key = Some("other".into());
@@ -10171,6 +10238,46 @@ mod tests {
         assert!(
             f2_completely_qualified_point(&observations, "qualified-run", "gpu", 1740, 925).is_none()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn endurance_holds_one_hot_bin_but_needs_the_target_near_the_lane_max_temperature() {
+        let phases = [
+            VfQualifierPhase::PowerOpening, VfQualifierPhase::BoostEdge, VfQualifierPhase::HeavySpike,
+            VfQualifierPhase::TextureRop, VfQualifierPhase::ComputeBurst, VfQualifierPhase::IdlePulse,
+            VfQualifierPhase::MixedGame, VfQualifierPhase::PowerClosing, VfQualifierPhase::FrameCadence,
+            VfQualifierPhase::VramPressure, VfQualifierPhase::CompositeGameLoad, VfQualifierPhase::TextureStream,
+        ];
+        let reports: Vec<_> = phases.iter().map(|&phase| nidavellir_gpu_stress::VfPhaseReport {
+            phase, result: StabilityResult::Stable, frames: 10, checksum_count: 1, elapsed_ms: 1_000,
+        }).collect();
+        // Run 1790537155912 Endurance shape: hot texture-rop one bin down, heavy-spike power-capped.
+        let run = |target_temp: f32| phases.iter().flat_map(|&phase| (0..24).map(move |i| match phase {
+            VfQualifierPhase::TextureRop if i % 4 == 0 => (1785, 198.0, false, Some(79.0), phase.code(), false),
+            VfQualifierPhase::HeavySpike => (1740, 199.5, true, Some(79.0), phase.code(), false),
+            VfQualifierPhase::BoostEdge => (1800, 100.0, false, Some(target_temp), phase.code(), false),
+            _ => (1800, 160.0, false, Some(target_temp), phase.code(), false),
+        })).collect::<Vec<_>>();
+        let endurance = |samples: &[PhaseSample]| qualification_coverage_from_run(StabilityResult::Stable,
+            &reports, samples, Some(1800), VfQualifierPattern::Endurance, Some(200.0), None);
+        let pass = endurance(&run(78.0));
+        assert_eq!(pass.verdict, F2QualificationVerdict::Pass);
+        let rop = pass.phase_metrics.iter()
+            .find(|metric| metric.phase_name == VfQualifierPhase::TextureRop.label()).unwrap();
+        assert_eq!(rop.clock_temp, [[1785, 79, 6, 0], [1800, 78, 18, 0]], "the hot bin drop stays visible");
+        assert_eq!(endurance(&run(70.0)).reason.as_deref(), Some("thermal_target_coverage_low"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn margin_publishes_only_pairs_with_a_proven_lower_bin() {
+        let pair = |clock, mv| (PowerSweepPoint {
+            target_clock_mhz: Some(clock), vf_table_voltage_mv: Some(mv), ..Default::default()
+        }, 0.95);
+        let kept: Vec<_> = f2_margin_proven(&[pair(1920, 937), pair(1830, 893), pair(1830, 887), pair(1830, 881)])
+            .iter().map(|(point, _)| (point.target_clock_mhz.unwrap(), point.vf_table_voltage_mv.unwrap())).collect();
+        assert_eq!(kept, [(1830, 893), (1830, 887)], "unprobed top and the lowest pass stay out");
     }
 
     #[cfg(windows)]
@@ -11486,7 +11593,8 @@ mod tests {
             .iter()
             .map(|sample| (1785, sample.1, sample.2, sample.3, sample.4, sample.5))
             .collect::<Vec<_>>();
-        // Exact-Apply remains strict: a whole dwell at target-15 is not exact residency.
+        // Exact-Apply remains strict: a whole dwell at target-15 is not exact residency. Heavy
+        // sustain holds that one bin (boost management), so residency is what refuses it.
         let adjacent_lower_bin = qualification_coverage_from_run(
             StabilityResult::Stable,
             &reports,
@@ -11502,7 +11610,7 @@ mod tests {
         );
         assert_eq!(
             adjacent_lower_bin.reason.as_deref(),
-            Some("heavy_clock_not_sustained")
+            Some("target_residency_low")
         );
         assert_eq!(adjacent_lower_bin.target_residency_frac, Some(0.0));
 
@@ -11548,12 +11656,12 @@ mod tests {
         );
         assert_eq!(frontier_two_bins_lower.target_residency_frac, Some(0.0));
 
-        // Representative-load contract: a droop NVML attributes to the SW power cap is held whatever
-        // the 1 s-averaged power reads (these samples read <=180 W); the same droop without the cap
-        // bit, or with thermal slowdown, is not.
-        let droop = |capped: bool, thermal: bool| samples.iter().enumerate().map(|(index, sample)| {
-            let clock = if index % 5 == 0 { 1800 } else { 1785 };
-            (clock, sample.1, capped, sample.3, sample.4, thermal)
+        // Representative-load contract: a two-bin droop NVML attributes to the SW power cap is held
+        // whatever the 1 s-averaged power reads (these samples read <=180 W); the same droop without
+        // the cap bit, or during hardware thermal slowdown, is not.
+        let droop = |capped: bool, hw_thermal: bool| samples.iter().enumerate().map(|(index, sample)| {
+            let clock = if index % 5 == 0 { 1800 } else { 1770 };
+            (clock, sample.1, capped, sample.3, sample.4, hw_thermal)
         }).collect::<Vec<_>>();
         let texture = |samples: &[PhaseSample]| qualification_coverage_from_run(StabilityResult::Stable,
             &reports, samples, Some(1800), VfQualifierPattern::V8Texture, Some(200.0), None);
@@ -15612,8 +15720,8 @@ mod tests {
         observation.outcome = F2ObsOutcome::Validated;
         observation.qualification_coverage = Some(F2QualificationCoverage {
             active_target: Some(nidavellir_core::f2_observation::F2ActiveTargetCoverage {
-                observed_active_ms: 80_000, target_active_ms: 40_000, power_limited_active_ms: 0, required_target_ms: 30_000,
-                sample_count: 3000, phases_completed: 5, upper_clock_exceeded: false, heavy_target_proven: true,
+                observed_active_ms: 80_000, target_active_ms: 40_000, power_limited_active_ms: 0, light_target_active_ms: 30_000, required_target_ms: 30_000,
+                sample_count: 3000, phases_completed: 6, upper_clock_exceeded: false, heavy_target_proven: true,
                 diagnostics: None,
             }),
             strength: F2QualificationStrength::Fsgl4,

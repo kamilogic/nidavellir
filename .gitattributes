@@ -1,0 +1,7 @@
+# Repository text is LF. Build tools here write LF while autocrlf checkouts write CRLF, which left
+# files such as apps/ui/src-tauri/Cargo.toml "modified" with no content change.
+* text=auto eol=lf
+# cmd.exe and NSIS parse CRLF reliably.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.nsh text eol=crlf

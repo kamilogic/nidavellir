@@ -1,6 +1,29 @@
 \# UI ↔ Backend Contract
 
-## 2026-09-26 (evening): representative-load power contract (current)
+## 2026-09-27 (b): margin probe last, light DX11, clock×temp cells (current)
+
+ExactApply36 (Frontier32, Discovery9, search7 unchanged). Additive, legacy defaults:
+- `ForgeDiscoveryBand.status` may be `margin_probe_waiting`: the performance band's single margin
+  probe holds the last admission and runs after the economic bands.
+- `F2ActiveTargetCoverage.light_target_active_ms` (0) and `F2ActiveClockPhase.light` (false): the
+  DX11 lane has 6 phases; the continuous light phase must hold the exact target >= 30 s.
+  New refusal `dx11_light_target_unexercised`. DX11 fingerprint `dx11-game-v5/...-light`.
+- `F2QualificationPhaseMetric.clock_temp`: `[clock MHz, whole °C, samples, cap samples]` cells,
+  omitted when empty.
+
+## 2026-09-27: hot-load bin, thermal semantics and publication margin
+
+Same contract versions. Additive, legacy defaults:
+- `F2ActiveClockPhase.one_bin_below_active_us` (0): heavy-phase time one bin below target without
+  the power-cap bit; held for heavy sustain only, never exposure.
+- `ForgeDiscoveryBand.margin_probe_used` (false): the performance band admitted its single probe one
+  bin below the qualified top. New band stop reasons: `top_margin_proven`, `top_margin_edge`,
+  `top_margin_unproven`. New qualification reason: `thermal_target_coverage_low`.
+- Observation `thermal_throttled` now means NVML HW thermal slowdown for new F2 dwells (was SW|HW).
+- Published `godforge`/`brokkrs`/`deep_calm` come only from pairs with a lower proven voltage at the
+  same clock; `points` still lists every qualified pair.
+
+## 2026-09-26 (evening): representative-load power contract
 
 Frontier32 / ExactApply35 / search7; Discovery9 and matrix27 unchanged. Supersedes the worst-load
 energy rule in the section below; everything else there still applies.

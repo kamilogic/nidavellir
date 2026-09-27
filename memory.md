@@ -1,5 +1,19 @@
 # Nidavellir — Project Memory
 
+## Current — thermal/margin package (2026-09-27)
+
+- Run1790537155912: top 1920@937 passed DX11 (98% power-limited, fix works), Vulkan, DX12; Endurance
+  stopped the run: heavy near-limit phases drop one bin when hot (texture-rop 1905), SW thermal bit
+  (fires at 70 °C) blocked the power-cap excuse. Light/medium phases held 1920 up to 79 °C.
+- Now: heavy sustain holds one bin below (exposure/residency/discovery stay exact); F2 thermal =
+  HW slowdown; Endurance needs the exact target within 3 °C of lane max; profiles need a proven
+  lower voltage at the same clock; one margin probe below the top before economics.
+- Acceptance: play the chosen profile with Safe Loop active (field TDR ladder: +1 bin, then stock;
+  boot reconcile after wedge/BSOD). Open suggestions are listed in the 27/09 report to the user.
+- Follow-up (27/09 b): margin probe last on a reserved, uncounted admission; DX11 light phase
+  (ExactApply36, 6 phases); `clock_temp` cells in phase metrics; `.gitattributes`. User rejected
+  cooling before discovery: tests must reflect continuous hot gaming.
+
 ## Current — representative-load power contract, search7 (2026-09-26 evening)
 
 - Run1790448315552 (search5) spent 24/24 admissions in 11 min stepping 1920 from 1081 to 937 mV;

@@ -8,7 +8,11 @@ use nidavellir_gpu_stress::{Dx11Golden, Dx11QualificationResult, Dx11Qualifier};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const DUTIES: [u32; 5] = [100, 75, 50, 25, 100];
+/// (duty %, light frame). Heavy opening/closing and heavy duty bursts stay; the continuous light
+/// phase runs the pair below the power cap, like a light game (ExactApply36).
+const PHASES: [(u32, bool); 6] =
+    [(100, false), (75, false), (50, false), (25, false), (100, true), (100, false)];
+const _: () = assert!(PHASES.len() as u32 == nidavellir_core::f2_observation::F2_DX11_PHASES);
 const TARGET_EXPOSURE_MS: u64 = 30_000;
 const ACTIVE_COVERAGE_MS: u64 = 60_000;
 const SAMPLE_HALF_WIDTH_US: u64 = 15_000;
@@ -39,8 +43,9 @@ pub(super) struct Evidence {
     completed: u32,
 }
 
-/// Keeps the existing total lane budget. Heavy opening/closing check integrity and power;
-/// middle phases provide several work/idle ratios without changing the applied VF configuration.
+/// Keeps the existing total lane budget. Heavy opening/closing check integrity and power; duty
+/// phases provide several work/idle ratios; the light phase exercises the target below the cap.
+/// None of them changes the applied VF configuration.
 pub(super) fn run(
     ctx: &Dx11Qualifier,
     duration_ms: u64,
@@ -62,9 +67,10 @@ pub(super) fn run(
         inconclusive_reason: None,
     };
     let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
-    for (index, duty) in DUTIES.into_iter().enumerate() {
-        phase_changed(duty == 100);
-        let deadline = started + Duration::from_millis(duration_ms * (index as u64 + 1) / 5);
+    for (index, (duty, light)) in PHASES.into_iter().enumerate() {
+        phase_changed(duty == 100 && !light);
+        let deadline = started
+            + Duration::from_millis(duration_ms * (index as u64 + 1) / PHASES.len() as u64);
         let mut phase_checks = 0;
         while Instant::now() < deadline && !cancelled() {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -78,24 +84,25 @@ pub(super) fn run(
             }
             let active_started = Instant::now();
             let mut work_started = None;
-            let run = ctx.run_with_golden_observed(
-                window.as_millis() as u64,
-                golden,
-                cancel,
-                &mut |active| {
-                    let now = origin.elapsed().as_micros() as u64;
-                    if active {
-                        work_started = Some(now);
-                    } else if let Some(start_us) = work_started.take() {
-                        evidence.work.push(Work {
-                            start_us,
-                            end_us: now,
-                            exposure: duty != 100,
-                            phase_index: index,
-                        });
-                    }
-                },
-            );
+            let mut on_activity = |active| {
+                let now = origin.elapsed().as_micros() as u64;
+                if active {
+                    work_started = Some(now);
+                } else if let Some(start_us) = work_started.take() {
+                    evidence.work.push(Work {
+                        start_us,
+                        end_us: now,
+                        exposure: duty != 100 || light,
+                        phase_index: index,
+                    });
+                }
+            };
+            let window_ms = window.as_millis() as u64;
+            let run = if light {
+                ctx.run_light_with_golden_observed(window_ms, golden, cancel, &mut on_activity)
+            } else {
+                ctx.run_with_golden_observed(window_ms, golden, cancel, &mut on_activity)
+            };
             total.frames += run.frames;
             total.checks += run.checks;
             total.compute_checks += run.compute_checks;
@@ -148,10 +155,10 @@ pub(super) fn coverage(
     let mut count = 0;
     let mut window_index = 0;
     let upper_clock_exceeded = samples.iter().any(|s| s.clock_mhz > nidavellir_core::f2_observation::f2_clock_ceiling_mhz(target));
-    let mut phases: Vec<_> = DUTIES.iter().enumerate().map(|(index, duty)| F2ActiveClockPhase {
-        phase_index: index as u32 + 1, requested_duty_pct: *duty,
+    let mut phases: Vec<_> = PHASES.iter().enumerate().map(|(index, (duty, light))| F2ActiveClockPhase {
+        phase_index: index as u32 + 1, requested_duty_pct: *duty, light: *light,
         active_sample_count: 0, active_clock_max_mhz: None,
-        observed_active_us: 0, target_active_us: 0, power_limited_active_us: 0,
+        observed_active_us: 0, target_active_us: 0, power_limited_active_us: 0, one_bin_below_active_us: 0,
         upper_sample_count: 0, upper_observed_us: 0, first_upper: None,
     }).collect();
     for (index, sample) in samples.iter().enumerate() {
@@ -199,10 +206,13 @@ pub(super) fn coverage(
         }
         let in_band = nidavellir_core::f2_observation::f2_clock_in_target_band(sample.clock_mhz, target);
         let limited = sample.clock_mhz < target && sample.power_limited;
+        let one_below = !in_band && !limited
+            && nidavellir_core::f2_observation::f2_clock_held(sample.clock_mhz, target);
         if credit > 0 && sample.voltage_mv.is_some_and(|mv| (500..=anchor).contains(&mv)) {
             phase.observed_active_us += credit;
             if in_band { phase.target_active_us += credit; }
             if limited { phase.power_limited_active_us += credit; }
+            if one_below { phase.one_bin_below_active_us += credit; }
         }
         // Clock containment covers all work even when voltage telemetry is unavailable.
         // Target exposure still requires the original middle-phase voltage authority.
@@ -225,13 +235,13 @@ pub(super) fn coverage(
         observed_active_ms: active_us / 1000,
         target_active_ms: target_us / 1000,
         power_limited_active_ms: limited_us / 1000,
+        light_target_active_ms: phases.iter().filter(|p| p.light).map(|p| p.target_active_us).sum::<u64>() / 1000,
         required_target_ms: TARGET_EXPOSURE_MS,
         sample_count: count,
         phases_completed: evidence.completed,
         upper_clock_exceeded,
-        heavy_target_proven: [0usize, 4].into_iter().all(|i| {
-            let p = &phases[i];
-            let held = p.target_active_us + p.power_limited_active_us;
+        heavy_target_proven: phases.iter().filter(|p| p.requested_duty_pct == 100 && !p.light).all(|p| {
+            let held = p.target_active_us + p.power_limited_active_us + p.one_bin_below_active_us;
             p.observed_active_us >= 30_000_000 && held as f64 / p.observed_active_us as f64 >= 0.95
         }),
         diagnostics: None,
@@ -253,7 +263,7 @@ fn refusals(c: &F2ActiveTargetCoverage) -> Vec<&'static str> {
     if c.upper_clock_exceeded {
         reasons.push("dx11_upper_clock_exceeded");
     }
-    if c.phases_completed != 5 { reasons.push("dx11_phases_incomplete"); }
+    if c.phases_completed != nidavellir_core::f2_observation::F2_DX11_PHASES { reasons.push("dx11_phases_incomplete"); }
     if c.observed_active_ms < ACTIVE_COVERAGE_MS { reasons.push("dx11_active_telemetry_low"); }
     let held = c.held_active_ms();
     if c.required_target_ms != TARGET_EXPOSURE_MS || held < TARGET_EXPOSURE_MS || held > c.observed_active_ms
@@ -262,6 +272,7 @@ fn refusals(c: &F2ActiveTargetCoverage) -> Vec<&'static str> {
         reasons.push("dx11_target_unexercised");
     }
     if !c.heavy_target_proven { reasons.push("heavy_clock_not_sustained"); }
+    if c.light_target_active_ms < TARGET_EXPOSURE_MS { reasons.push("dx11_light_target_unexercised"); }
     reasons
 }
 
@@ -281,29 +292,35 @@ mod tests {
     }
     #[test]
     fn power_limited_drops_are_held_but_reported_apart_from_target_exposure() {
-        let evidence = Evidence { completed: 5, work: vec![
+        let evidence = Evidence { completed: 6, work: vec![
             Work { start_us: 0, end_us: 40_000_000, exposure: false, phase_index: 0 },
             Work { start_us: 40_000_000, end_us: 120_000_000, exposure: true, phase_index: 2 },
-            Work { start_us: 120_000_000, end_us: 160_000_000, exposure: false, phase_index: 4 },
+            Work { start_us: 120_000_000, end_us: 160_000_000, exposure: false, phase_index: 5 },
+            Work { start_us: 160_000_000, end_us: 200_000_000, exposure: true, phase_index: 4 },
         ]};
         // Run 1790466472114, DX11 at 1920@937: the SW power cap was set on every sample and the
         // limiter clamped full-duty and duty-cycled bursts onto stock points (p50 1695 MHz); only
-        // ~1.7 s ran at target. That is power limiting, not an unexercised or unstable pair.
-        let mut reads: Vec<_> = (0..160_000_000).step_by(30_000).map(|t| {
+        // ~1.7 s ran at target. That is power limiting, not an unexercised or unstable pair. The
+        // light phase (ExactApply36) is what exercises the exact target in DX11.
+        let mut reads: Vec<_> = (0..200_000_000).step_by(30_000).map(|t| {
             let mut s = sample(t, 1695);
-            s.power_limited = true;
-            if (40_000_000..42_000_000).contains(&t) { s.clock_mhz = 1920; }
+            s.power_limited = t < 160_000_000;
+            if (40_000_000..42_000_000).contains(&t) || t >= 160_000_000 { s.clock_mhz = 1920; }
             s
         }).collect();
         let held = coverage(&reads, &evidence, 1920, 900);
         assert!(held.proves_target(), "{held:?}");
-        assert!(held.target_active_ms < 3_000 && held.power_limited_active_ms > 70_000, "{held:?}");
+        assert!(held.light_target_active_ms >= 30_000);
+        let duty = &held.diagnostics.as_ref().unwrap().phases[2];
+        assert!(duty.target_active_us < 3_000_000 && duty.power_limited_active_us > 70_000_000);
         for s in &mut reads { s.power_limited = false; }
-        assert_eq!(refusal(&coverage(&reads, &evidence, 1920, 900)), Some("dx11_target_unexercised"));
+        let refused = coverage(&reads, &evidence, 1920, 900);
+        assert!(!refused.proves_target());
+        assert!(refused.diagnostics.unwrap().reasons.iter().any(|r| r == "heavy_clock_not_sustained"));
     }
     #[test]
     fn excursions_report_active_phase_context_without_idle_or_gap_inflation() {
-        let evidence = Evidence { completed: 5, work: vec![
+        let evidence = Evidence { completed: 6, work: vec![
             Work { start_us: 0, end_us: 100_000, exposure: false, phase_index: 0 },
             Work { start_us: 200_000, end_us: 300_000, exposure: true, phase_index: 2 },
         ]};
@@ -326,14 +343,15 @@ mod tests {
         let event = d.phases[2].first_upper.unwrap();
         assert_eq!((event.at_ms, event.voltage_mv, event.temperature_c), (250, Some(900), Some(65)));
         assert_eq!(event.curve, variable.curve);
-        assert_eq!(d.reasons, ["dx11_upper_clock_exceeded", "dx11_active_telemetry_low", "dx11_target_unexercised", "heavy_clock_not_sustained"]);
+        assert_eq!(d.reasons, ["dx11_upper_clock_exceeded", "dx11_active_telemetry_low", "dx11_target_unexercised",
+            "heavy_clock_not_sustained", "dx11_light_target_unexercised"]);
         let restored: F2ActiveTargetDiagnostics = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
         assert_eq!(restored, d);
     }
     #[test]
     fn idle_heavy_and_fence_crossing_samples_cannot_prove_the_target() {
         let evidence = Evidence {
-            completed: 5,
+            completed: 6,
             work: vec![
                 Work {
                     start_us: 0,
@@ -364,7 +382,7 @@ mod tests {
     #[test]
     fn missing_voltage_and_sensor_gaps_do_not_manufacture_time() {
         let evidence = Evidence {
-            completed: 5,
+            completed: 6,
             work: vec![Work {
                 start_us: 0,
                 end_us: 10_000_000,
@@ -397,18 +415,21 @@ mod tests {
             observed_active_ms: 80_000,
             target_active_ms: 30_000,
             power_limited_active_ms: 0,
+            light_target_active_ms: 30_000,
             required_target_ms: 30_000,
             sample_count: 3000,
-            phases_completed: 5,
+            phases_completed: 6,
             upper_clock_exceeded: false, heavy_target_proven: true,
             diagnostics: None,
         };
         assert_eq!(refusal(&pass), None);
+        let light_short = F2ActiveTargetCoverage { light_target_active_ms: 29_999, ..pass.clone() };
+        assert_eq!(refusal(&light_short), Some("dx11_light_target_unexercised"));
         for (active, target, phases, upper, reason) in [
-            (80_000, 29_999, 5, false, "dx11_target_unexercised"),
-            (100_000, 30_000, 5, false, "dx11_target_unexercised"),
-            (80_000, 30_000, 4, false, "dx11_phases_incomplete"),
-            (80_000, 30_000, 5, true, "dx11_upper_clock_exceeded"),
+            (80_000, 29_999, 6, false, "dx11_target_unexercised"),
+            (100_000, 30_000, 6, false, "dx11_target_unexercised"),
+            (80_000, 30_000, 5, false, "dx11_phases_incomplete"),
+            (80_000, 30_000, 6, true, "dx11_upper_clock_exceeded"),
         ] {
             let c = F2ActiveTargetCoverage {
                 observed_active_ms: active,
@@ -422,18 +443,20 @@ mod tests {
     }
     #[test]
     fn heavy_target_proof_cannot_be_replaced_by_light_phase_visits() {
-        let evidence = Evidence { completed: 5, work: vec![
+        let evidence = Evidence { completed: 6, work: vec![
             Work { start_us: 0, end_us: 40_000_000, exposure: false, phase_index: 0 },
             Work { start_us: 40_000_000, end_us: 120_000_000, exposure: true, phase_index: 2 },
-            Work { start_us: 120_000_000, end_us: 160_000_000, exposure: false, phase_index: 4 },
+            Work { start_us: 120_000_000, end_us: 160_000_000, exposure: false, phase_index: 5 },
+            Work { start_us: 160_000_000, end_us: 200_000_000, exposure: true, phase_index: 4 },
         ]};
-        let mut reads: Vec<_> = (0..160_000_000).step_by(30_000).map(|t| sample(t,1740)).collect();
+        let mut reads: Vec<_> = (0..200_000_000).step_by(30_000).map(|t| sample(t,1740)).collect();
         assert!(coverage(&reads,&evidence,1740,900).proves_target());
         for (i,s) in reads.iter_mut().enumerate() { if i % 2 == 0 { s.clock_mhz=1755; } }
         let envelope = coverage(&reads,&evidence,1740,900);
         assert!(envelope.proves_target(), "nominal/+15 mixture must credit actual heavy work");
         assert!(!envelope.upper_clock_exceeded);
-        assert!(!coverage(&reads,&evidence,1755,900).proves_target(), "brief peaks cannot qualify the higher nominal clock");
+        // Heavy sustain holds one bin below target, never two: 1740/1755 cannot qualify 1770.
+        assert!(!coverage(&reads,&evidence,1770,900).proves_target(), "peaks cannot qualify a clock two bins up");
         for s in &mut reads { if s.start_us < 40_000_000 { s.clock_mhz=1680; } }
         let refused=coverage(&reads,&evidence,1740,900);
         assert!(!refused.proves_target());
@@ -444,7 +467,7 @@ mod tests {
     #[test]
     fn reconstructed_work_trace_passes_but_idle_only_target_trace_does_not() {
         let evidence = Evidence {
-            completed: 5,
+            completed: 6,
             work: (0..1000)
                 .map(|i| Work {
                     start_us: i * 200_000,

@@ -1,5 +1,23 @@
 # Nidavellir — Session Handoff
 
+## LATEST — margin probe last + light DX11 + diagnostics (2026-09-27 b)
+
+Per user answers: margin probe runs last on a reserved admission and is not counted in the
+integrity budget; DX11 lane adds a continuous light phase (own stock checksum, >=30 s exact target,
+ExactApply36); phase metrics persist clock×temperature cells; `.gitattributes` added. Cool-down
+before discovery was rejected (unrealistic). 706 Rust tests passed/3 hardware ignored, release
+clean, UI 18/18 + build. Uncommitted. The light DX11 frame is untested on hardware: the ignored
+`stock_golden_and_candidate_readback_are_stable` test covers it when run on the GPU.
+
+## LATEST — thermal/margin package after Endurance stop (2026-09-27)
+
+Run1790537155912 qualified 1920@937 through DX11/Vulkan/DX12 and stopped at Endurance
+`thermal_clock_drop` (one-bin drop in hot near-limit phases + SW thermal bit refusing power-capped
+samples). Implemented (no version bumps): one-bin heavy sustain, HW-only F2 thermal, Endurance hot
+target coverage, publication margin + one top margin probe. 705 Rust tests passed/3 hardware
+ignored, release check clean. Uncommitted. Next: BAT rebuild, Full Reset → Clean (~6.5 h), then
+apply the chosen profile and play with Safe Loop active before accepting. See decisions.md 27/09.
+
 ## LATEST — publish after crash (B) + band-only inconclusive (2026-09-26 night)
 
 User chose B: an attributed in-process CandidateCrash still stops the run, but the terminal close
