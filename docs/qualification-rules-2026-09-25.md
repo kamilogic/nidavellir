@@ -1,8 +1,38 @@
 # Descoberta e desqualificação de pontos — contrato de 25/09/2026
 
-Implementação: Discovery 9, Frontier 32, Exact Apply 35, busca 7 (revisada em 26/09 à noite). Este
-documento substitui as regras de residência/energia e a ordem de busca de 24/09. A matriz de cargas
-continua 27. Não houve execução física de carga nesta alteração; a aceitação no hardware continua pendente.
+Implementação atual: Discovery 10, Frontier 33, Exact Apply 38, busca 8 (28/09). Este documento
+substitui as regras de residência/energia e a ordem de busca de 24/09. A matriz de cargas continua 27.
+
+## Escada de descida e bin térmico (28/09)
+
+Decisões do usuário após a run f2-forge-1790617016985. Essa run qualificou 1920/1830/1740 todos a
+937 mV e parou em 58 min sem perfil: 931 mV deu ClockDrop de um bin nos três clocks, quente.
+- **Escada:**
+  - O topo é achado como antes. Depois a busca desce a tensão no clock do topo até a primeira
+    instabilidade.
+  - O degrau seguinte (−5%, depois −10% do topo) começa na menor tensão aprovada no degrau
+    anterior, um bin acima da falha, e desce de novo. Os degraus rodam um de cada vez.
+  - Substitui os itens 4–5 da busca abaixo e o teste de margem único de 27/09. A regra de margem da
+    publicação continua: publica-se no mínimo um bin acima da menor tensão aprovada no clock.
+- **Fim de cada degrau:**
+  - A primeira falha de integridade, TDR ou prova incompleta encerra só o degrau (`integrity_edge`,
+    `tdr_edge`, `evidence_boundary`) e não conta no orçamento de 2 erros.
+  - O primeiro par de um degrau inferior repete uma tensão já aprovada num clock maior. Se ele
+    falhar, a evidência é inconsistente e a busca para (`dominated_pair_failed`).
+- **Bin térmico:**
+  - Quente, a GPU perde um bin de clock na tensão travada da âncora, e mais cedo quanto menor a
+    tensão: 937 mV por volta de 78 °C; 931 mV já a 71 °C, em 1920, 1830 e 1740.
+  - Clock ≥ alvo − 15 MHz conta como mantido em toda a matriz: descoberta, residência, exposição
+    DX11 (inclusive a fase leve) e alvo quente do Endurance.
+  - Dois bins abaixo continuam falhando. O rótulo exato já não é provado quando quente.
+- **TDR no limite do degrau:**
+  - A run pausa com o par condenado e o cone aplicado.
+  - Reinicie o Windows, reconheça o incidente e use Retomar: a mesma run continua no próximo degrau.
+  - Continuar no mesmo boot é proibido (22/07: depois de um TDR, até o 1800@875 estável falhou).
+  - No último degrau, ou se o orçamento de crashes recusaria a retomada, a run publica os pares já
+    provados.
+- **Orçamento de crashes:** bloqueia só nova exploração (Start/Retomar). O cone de TDR continua
+  valendo para Apply, restauração de perfis e publicação após crash.
 
 ## Calor, margem e aceite em jogo (27/09)
 

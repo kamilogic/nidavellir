@@ -392,7 +392,7 @@ pub struct ForgeDiscoveryBand {
     /// Failed voltage at the current clock; power jumps never land at/below it. Not a stability bound.
     #[serde(default)]
     pub integrity_floor_voltage_mv: Option<u32>,
-    /// Performance only: the single one-bin-lower margin probe of the qualified top was admitted.
+    /// Search 7 only (margin probe of the top). Search 8 descends every level and never sets it.
     #[serde(default)]
     pub margin_probe_used: bool,
     /// Performance only: an Inconclusive unqualified top already took its one clock-bin descent.

@@ -230,10 +230,11 @@ pub(super) fn coverage(
                 curve: sample.curve,
             });
         }
-        let in_band = nidavellir_core::f2_observation::f2_clock_in_target_band(sample.clock_mhz, target);
-        let limited = sample.clock_mhz < target && sample.power_limited;
-        let one_below = !in_band && !limited
-            && nidavellir_core::f2_observation::f2_clock_held(sample.clock_mhz, target);
+        // Target exposure includes the GPU's one hot bin below the target (2026-09-28);
+        // `one_below` reports that share of it.
+        let in_band = nidavellir_core::f2_observation::f2_clock_held(sample.clock_mhz, target);
+        let limited = !in_band && sample.clock_mhz < target && sample.power_limited;
+        let one_below = in_band && sample.clock_mhz < target;
         if credit > 0 && sample.voltage_mv.is_some_and(|mv| (500..=anchor).contains(&mv)) {
             phase.observed_active_us += credit;
             if in_band { phase.target_active_us += credit; }
@@ -267,7 +268,7 @@ pub(super) fn coverage(
         phases_completed: evidence.completed,
         upper_clock_exceeded,
         heavy_target_proven: phases.iter().filter(|p| p.requested_duty_pct == 100 && !p.light).all(|p| {
-            let held = p.target_active_us + p.power_limited_active_us + p.one_bin_below_active_us;
+            let held = p.target_active_us + p.power_limited_active_us;
             p.observed_active_us >= 30_000_000 && held as f64 / p.observed_active_us as f64 >= 0.95
         }),
         diagnostics: None,
@@ -397,7 +398,7 @@ mod tests {
             sample(50_000, 1800),
             sample(150_000, 1800),
             sample(199_500, 1800),
-            sample(250_000, 1785),
+            sample(250_000, 1770),
             sample(350_000, 1800),
         ];
         let c = coverage(&reads, &evidence, 1800, 900);

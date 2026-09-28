@@ -1,13 +1,18 @@
 //! Pure, durable admission policy for qualification-first discovery. The caller owns all hardware,
 //! evidence validation and persistence: save a successful admission BEFORE arming a candidate.
+//!
+//! Staircase (user decision 2026-09-28): find the top below the power limit, then descend its
+//! voltage until the first failure. The next clock level (-5%, then -10%) starts at the lowest
+//! voltage the previous level passed (one bin above that failure) and descends again. Levels run
+//! one at a time.
 
 use nidavellir_core::ipc::{ForgeDiscoveryBand, ForgeDiscoverySearch};
 
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 pub const STANDARD_ATTEMPTS: u32 = 24;
 pub const STANDARD_BUDGET_MS: u64 = 8 * 60 * 60 * 1_000;
-/// The qualified top's single margin probe waits here for the last, reserved admission.
-const MARGIN_PROBE_WAITING: &str = "margin_probe_waiting";
+/// Lower clock levels after the top, as (band id, percent of the qualified top clock).
+const LEVELS: [(&str, u64); 2] = [("balanced", 95), ("efficiency", 90)];
 
 #[derive(Debug, Clone, Copy)]
 pub struct Seed<'a> {
@@ -131,19 +136,10 @@ pub fn next_band(search: &ForgeDiscoverySearch) -> Option<usize> {
     {
         return None;
     }
-    // The top margin probe runs last on an admission reserved for it (2026-09-27), so a probe TDR
-    // cannot cost the economic evidence already gathered. Time is not reserved: if the clock runs
-    // out first, the top simply stays unpublished.
-    let probe = search.bands.iter().position(|band| band.status == MARGIN_PROBE_WAITING);
     let start = search.next_band_index % search.bands.len();
-    (search.attempts_used + u32::from(probe.is_some()) < search.attempts_limit)
-        .then(|| {
-            (0..search.bands.len())
-                .map(|offset| (start + offset) % search.bands.len())
-                .find(|&index| search.bands[index].status == "pending")
-        })
-        .flatten()
-        .or(probe)
+    (0..search.bands.len())
+        .map(|offset| (start + offset) % search.bands.len())
+        .find(|&index| search.bands[index].status == "pending")
 }
 
 /// Counts even cancelled/failed attempts. `elapsed_ms` is cumulative across service sessions.
@@ -187,7 +183,7 @@ fn close_band(band: &mut ForgeDiscoveryBand, reason: &str) {
     band.stop_reason = Some(reason.into());
 }
 
-fn close_all(search: &mut ForgeDiscoverySearch, reason: &str) {
+pub fn close_all(search: &mut ForgeDiscoverySearch, reason: &str) {
     search.stop_reason = Some(reason.into());
     for band in &mut search.bands {
         if band.status != "closed" {
@@ -196,51 +192,44 @@ fn close_all(search: &mut ForgeDiscoverySearch, reason: &str) {
     }
 }
 
-/// The integrity budget ends exploration, but the single planned margin probe still runs last.
-fn close_exploration(search: &mut ForgeDiscoverySearch, reason: &str) {
-    if !search.bands.iter().any(|band| band.status == MARGIN_PROBE_WAITING) {
-        return close_all(search, reason);
+/// A lower clock level starts only after the previous level closes, at the lowest voltage that level
+/// passed. That start is dominated by the previous level's pair (lower clock, same voltage), so it
+/// must pass; it still gets its own matrix. Nothing here is a predeclared profile result.
+fn start_next_level(search: &mut ForgeDiscoverySearch, clock_bins: &[u32]) {
+    let Some(mut previous) = search.bands.iter().position(|b| b.id == "performance") else { return };
+    let top = &search.bands[previous];
+    if top.status != "closed" {
+        return;
     }
-    for band in &mut search.bands {
-        if band.status != "closed" && band.status != MARGIN_PROBE_WAITING {
-            close_band(band, reason);
-        }
-    }
-}
-
-/// Retry after a cancel/control retry: the margin probe goes back to its reserved slot.
-fn requeue(band: &mut ForgeDiscoveryBand) {
-    band.status = if band.id == "performance" && band.margin_probe_used {
-        MARGIN_PROBE_WAITING
-    } else {
-        "pending"
-    }
-    .into();
-}
-
-fn below_economic_floor(clock_mhz: u32, performance_clock_mhz: Option<u32>) -> bool {
-    performance_clock_mhz
-        .is_some_and(|performance| u64::from(clock_mhz) * 100 < u64::from(performance) * 90)
-}
-
-/// Economic exploration starts only after the performance search closes with complete proof.
-/// These are starting candidates, never predeclared profile results. Every pair needs its own matrix.
-fn start_economic_bands(search: &mut ForgeDiscoverySearch, clock_bins: &[u32]) {
-    let Some(top) = search.bands.iter().find(|b| b.id == "performance"
-        && (b.status == "closed" || b.status == MARGIN_PROBE_WAITING)) else { return; };
-    let (Some(clock), Some(voltage)) = (top.last_qualified_clock_mhz, top.last_qualified_voltage_mv) else {
+    let Some(top_clock) = top.last_qualified_clock_mhz.filter(|_| top.last_qualified_voltage_mv.is_some()) else {
         close_all(search, "qualified_top_unavailable");
         return;
     };
-    let floor = clock_bins.iter().copied().filter(|c| *c <= clock && u64::from(*c) * 100 >= u64::from(clock) * 90).min().unwrap_or(clock);
-    for band in &mut search.bands {
-        if band.status != "waiting_for_top" { continue; }
-        band.target_clock_mhz = if band.id == "balanced" {
-            clock_bins.iter().copied().filter(|c| *c <= clock && u64::from(*c) * 100 >= u64::from(clock) * 95).min().unwrap_or(clock)
-        } else { floor };
+    for (id, percent) in LEVELS {
+        let Some(next) = search.bands.iter().position(|b| b.id == id) else { continue };
+        match search.bands[next].status.as_str() {
+            "closed" => { previous = next; continue; }
+            "waiting_for_top" => {}
+            _ => return,
+        }
+        let prev = &search.bands[previous];
+        let voltage = prev.last_qualified_voltage_mv.unwrap_or(prev.voltage_mv);
+        let prev_clock = prev.last_qualified_clock_mhz.unwrap_or(prev.target_clock_mhz);
+        let clock = clock_bins.iter().copied()
+            .filter(|c| *c <= top_clock && u64::from(*c) * 100 >= u64::from(top_clock) * percent)
+            .min()
+            .filter(|c| *c < prev_clock);
+        let band = &mut search.bands[next];
         band.voltage_mv = voltage;
-        band.clock_ceiling_mhz = clock;
-        band.status = "pending".into();
+        band.target_clock_mhz = clock.unwrap_or(prev_clock);
+        band.clock_ceiling_mhz = band.target_clock_mhz;
+        if clock.is_some() {
+            band.status = "pending".into();
+            return;
+        }
+        // No bin strictly below the previous level: pass its clock/voltage through to the next one.
+        close_band(band, "clock_level_exhausted");
+        previous = next;
     }
 }
 
@@ -261,19 +250,34 @@ pub fn record(
     {
         return Err("no_admitted_candidate".into());
     }
+    let band = &search.bands[index];
+    // The level already passed its clock at a higher voltage and now tests a lower one: its first
+    // failure is the expected edge of the staircase, not an anomaly.
+    let descending = band.last_qualified_clock_mhz == Some(band.target_clock_mhz)
+        && band.last_qualified_voltage_mv.is_some_and(|mv| band.voltage_mv < mv);
+    // A lower level's first pair repeats a voltage the higher clock passed, so it must pass.
+    let dominated_start = band.id != "performance" && band.last_qualified_clock_mhz.is_none();
     if outcome == Outcome::DriverFailure {
-        close_all(search, "driver_failure_recovery_required");
+        if descending {
+            // The boot is dirty after a TDR (2026-07-22), so the caller stops this session. The
+            // search stays open: after reboot and acknowledgement, Resume starts the next level.
+            close_band(&mut search.bands[index], "tdr_edge");
+            start_next_level(search, clock_bins);
+            finish_transition(search);
+        } else {
+            close_all(search, "driver_failure_recovery_required");
+        }
         return Ok(());
     }
     if outcome == Outcome::OperationalFailure {
         close_all(search, "operational_failure");
         return Ok(());
     }
-    let performance_clock = search
-        .bands
-        .iter()
-        .find(|band| band.id == "performance")
-        .and_then(|band| band.last_qualified_clock_mhz);
+    if outcome == Outcome::IntegrityError && dominated_start {
+        search.integrity_errors += 1;
+        close_all(search, "dominated_pair_failed");
+        return Ok(());
+    }
     let band = &mut search.bands[index];
     let lower_voltage = voltage_bins
         .iter()
@@ -282,17 +286,6 @@ pub fn record(
         .max();
     let lower_power_voltage = lower_power_voltage(band, voltage_bins, power_hint);
     match outcome {
-        // Margin probe result (2026-09-27): it only decides whether the top may be published;
-        // it never replaces the qualified top or descends further. By user decision its
-        // integrity failure does not count toward the two-error exploration budget.
-        _ if band.id == "performance" && band.margin_probe_used
-            && !matches!(outcome, Outcome::ControlMismatch | Outcome::Cancelled) => {
-            close_band(band, match outcome {
-                Outcome::Qualified => "top_margin_proven",
-                Outcome::IntegrityError => "top_margin_edge",
-                _ => "top_margin_unproven",
-            });
-        }
         Outcome::Qualified => {
             band.power_preparation_used = false;
             clear_power_bracket(band);
@@ -303,36 +296,20 @@ pub fn record(
                 .copied()
                 .filter(|clock| *clock > band.target_clock_mhz && *clock <= band.clock_ceiling_mhz)
                 .min();
-            if band.id != "performance"
-                && below_economic_floor(band.target_clock_mhz, performance_clock)
-            {
-                if let Some(clock) = higher_clock {
-                    band.target_clock_mhz = clock;
-                    band.status = "pending".into();
-                } else {
-                    close_band(band, "physical_domain_exhausted");
-                }
-            } else if band.id == "performance" && higher_clock.is_some() {
+            if band.id == "performance" && higher_clock.is_some() {
                 band.target_clock_mhz = higher_clock.unwrap();
                 band.next_raise_clock = false;
                 band.status = "pending".into();
-            } else if band.id == "performance" && lower_voltage.is_some() {
-                // Margin (2026-09-27): prove one bin below the top once, after the economic bands;
-                // only then may the top be published. The qualified top used by the economic
-                // bands stays where it is.
-                band.margin_probe_used = true;
-                band.voltage_mv = lower_voltage.unwrap();
-                band.status = MARGIN_PROBE_WAITING.into();
-            } else if band.id == "performance" {
-                close_band(band, "physical_clock_domain_exhausted");
             } else if let Some(voltage) = lower_voltage {
+                // Staircase: keep descending this clock until its first failure.
                 band.voltage_mv = voltage;
-                band.next_raise_clock = band.id == "performance";
                 band.status = "pending".into();
             } else {
-                close_band(band, "physical_domain_exhausted");
+                close_band(band, "voltage_floor_reached");
             }
         }
+        // The level's edge. Expected, so it does not spend the integrity budget.
+        Outcome::IntegrityError if descending => close_band(band, "integrity_edge"),
         Outcome::PowerBound if band.id == "performance"
             && band.last_qualified_voltage_mv.is_some_and(|mv| band.voltage_mv > mv) => {
             close_band(band, "power_integrity_boundary");
@@ -384,8 +361,11 @@ pub fn record(
                 close_band(band, "integrity_error_region_closed");
             }
         }
+        // Missing proof ends only this level's descent; the pair is never claimed, and the next
+        // level starts one bin above it.
+        Outcome::Inconclusive if descending => close_band(band, "evidence_boundary"),
         // Missing proof closes only this band (user decision 2026-09-26); the pair is never
-        // claimed. Without a qualified top the economic bands cannot start and the run ends with no
+        // claimed. Without a qualified top the lower levels cannot start and the run ends with no
         // profile (run f2-forge-1790544997509), so an unqualified top first descends one clock bin
         // at the same voltage, once per run. That is a new hypothesis, not an inferred boundary.
         Outcome::Inconclusive => {
@@ -406,18 +386,23 @@ pub fn record(
         Outcome::ControlMismatch => {
             if search.control_retries_used == 0 {
                 search.control_retries_used += 1;
-                requeue(band);
+                band.status = "pending".into();
             } else {
                 close_all(search, "control_reapplication_failed");
                 return Ok(());
             }
         },
-        Outcome::Cancelled => requeue(band),
+        Outcome::Cancelled => band.status = "pending".into(),
         Outcome::DriverFailure | Outcome::OperationalFailure => unreachable!(),
     }
-    start_economic_bands(search, clock_bins);
+    start_next_level(search, clock_bins);
+    finish_transition(search);
+    Ok(())
+}
+
+fn finish_transition(search: &mut ForgeDiscoverySearch) {
     if search.integrity_errors >= 2 {
-        close_exploration(search, "integrity_error_budget_exhausted");
+        close_all(search, "integrity_error_budget_exhausted");
     } else {
         let elapsed_ms = search.elapsed_ms;
         finalize_budget(search, elapsed_ms);
@@ -425,7 +410,6 @@ pub fn record(
             search.stop_reason = Some("all_regions_closed".into());
         }
     }
-    Ok(())
 }
 
 /// Invoke only after the caller confirms stock and resolves startup recovery. Admission already
@@ -439,7 +423,7 @@ pub fn resume_after_stock(search: &mut ForgeDiscoverySearch) -> Result<(), Strin
     }
     for band in &mut search.bands {
         if band.status == "in_flight" {
-            requeue(band);
+            band.status = "pending".into();
         }
     }
     let elapsed_ms = search.elapsed_ms;
@@ -491,50 +475,61 @@ mod tests {
         assert_eq!((state.bands[0].target_clock_mhz,state.bands[0].voltage_mv), (1725,906));
         assert_eq!(step(&mut state, Outcome::Qualified), 0);
         assert_eq!(step(&mut state, Outcome::Qualified), 0);
-        assert_eq!(state.bands[0].last_qualified_clock_mhz, Some(1740));
-        assert_eq!(state.bands[0].status, MARGIN_PROBE_WAITING, "margin probe waits for the end");
-        assert_eq!(next_band(&state), Some(1));
-        assert_eq!(state.bands[1].target_clock_mhz,1710);
-        assert_eq!(state.bands[2].target_clock_mhz,1605);
+        let top = &state.bands[0];
+        assert_eq!(top.last_qualified_clock_mhz, Some(1740));
+        assert_eq!((top.target_clock_mhz, top.voltage_mv, top.status.as_str()), (1740, 900, "pending"),
+            "the top descends its own voltage before any lower level starts");
+        assert_eq!((next_band(&state), state.bands[1].status.as_str()), (Some(0), "waiting_for_top"));
+    }
+    /// A real 3060 Ti-like grid: 15 MHz clock bins and ~6 mV voltage bins.
+    fn staircase() -> (ForgeDiscoverySearch, Vec<u32>, Vec<u32>) {
+        let seed = |id| Seed { id, target_clock_mhz: 1920, voltage_mv: 937, clock_ceiling_mhz: 1920 };
+        let state = new(&[seed("performance"), seed("balanced"), seed("efficiency")], 24, 10_000);
+        (state, (1695..=1920).step_by(15).collect(), vec![900, 906, 912, 918, 925, 931, 937])
+    }
+    fn walk(state: &mut ForgeDiscoverySearch, clocks: &[u32], volts: &[u32], outcome: Outcome) -> (usize, u32, u32) {
+        let index = next_band(state).unwrap();
+        let pair = admit(state, index, 0, 100).map(|c| (index, c.target_clock_mhz, c.voltage_mv)).unwrap();
+        record(state, index, outcome, clocks, volts, None).unwrap();
+        pair
     }
     #[test]
-    fn top_margin_probe_runs_last_once_uncounted_and_never_moves_the_top() {
-        for (probe, reason) in [
-            (Outcome::Qualified, "top_margin_proven"),
-            (Outcome::IntegrityError, "top_margin_edge"),
-            (Outcome::Inconclusive, "top_margin_unproven"),
-        ] {
-            let mut state = search();
-            state.bands[0].target_clock_mhz = 1740;
-            step(&mut state, Outcome::Qualified);
-            let top = &state.bands[0];
-            assert_eq!((top.target_clock_mhz, top.voltage_mv, top.margin_probe_used), (1740, 900, true));
-            assert_eq!(state.bands[1].voltage_mv, 906, "economics start from the top, not the probe");
-            assert_eq!(step(&mut state, Outcome::Inconclusive), 1);
-            assert_eq!(step(&mut state, Outcome::Inconclusive), 2);
-            assert_eq!(step(&mut state, probe), 0, "the probe runs after the economic bands");
-            let top = &state.bands[0];
-            assert_eq!(top.stop_reason.as_deref(), Some(reason));
-            assert_eq!((top.last_qualified_clock_mhz, top.last_qualified_voltage_mv), (Some(1740), Some(906)));
-            assert_eq!((state.integrity_errors, next_band(&state)), (0, None));
-        }
+    fn staircase_descends_each_level_to_its_first_failure_and_restarts_one_bin_above() {
+        use Outcome::*;
+        let (mut state, clocks, volts) = staircase();
+        let trace: Vec<_> = [Qualified, Qualified, IntegrityError, Qualified, Qualified, IntegrityError,
+            Qualified, Qualified, Inconclusive]
+            .into_iter().map(|outcome| walk(&mut state, &clocks, &volts, outcome)).collect();
+        assert_eq!(trace, [(0, 1920, 937), (0, 1920, 931), (0, 1920, 925),
+            (1, 1830, 931), (1, 1830, 925), (1, 1830, 918),
+            (2, 1740, 925), (2, 1740, 918), (2, 1740, 912)],
+            "-5%/-10% levels start at the lowest voltage the level above passed");
+        let edges: Vec<_> = state.bands.iter().map(|b| (b.stop_reason.as_deref().unwrap(),
+            b.last_qualified_clock_mhz.unwrap(), b.last_qualified_voltage_mv.unwrap())).collect();
+        assert_eq!(edges, [("integrity_edge", 1920, 931), ("integrity_edge", 1830, 925),
+            ("evidence_boundary", 1740, 918)]);
+        assert_eq!((state.integrity_errors, state.stop_reason.as_deref()), (0, Some("all_regions_closed")),
+            "expected edges do not spend the integrity budget");
     }
     #[test]
-    fn margin_probe_keeps_the_last_admission_and_survives_the_integrity_budget() {
-        let mut state = search();
-        state.attempts_limit = 3;
-        state.bands[0].target_clock_mhz = 1740;
-        step(&mut state, Outcome::Qualified);
-        assert_eq!(step(&mut state, Outcome::Qualified), 1);
-        assert_eq!(next_band(&state), Some(0), "last admission is reserved for the probe");
-        let mut state = search();
-        state.bands[0].target_clock_mhz = 1740;
-        step(&mut state, Outcome::Qualified);
-        step(&mut state, Outcome::IntegrityError);
-        step(&mut state, Outcome::IntegrityError);
-        assert_eq!((state.integrity_errors, state.stop_reason.as_deref()), (2, None));
-        assert_eq!(step(&mut state, Outcome::Qualified), 0);
-        assert_eq!(state.stop_reason.as_deref(), Some("integrity_error_budget_exhausted"));
+    fn tdr_edge_keeps_the_search_open_for_resume_but_a_dominated_start_failure_stops_it() {
+        let (mut state, clocks, volts) = staircase();
+        walk(&mut state, &clocks, &volts, Outcome::Qualified);
+        walk(&mut state, &clocks, &volts, Outcome::DriverFailure);
+        assert_eq!(state.bands[0].stop_reason.as_deref(), Some("tdr_edge"));
+        assert_eq!(state.stop_reason, None, "Resume after reboot continues with the next level");
+        let mut restored: ForgeDiscoverySearch = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        resume_after_stock(&mut restored).unwrap();
+        let mut dominated = restored.clone();
+        assert_eq!(walk(&mut restored, &clocks, &volts, Outcome::IntegrityError), (1, 1830, 937));
+        assert_eq!((restored.stop_reason.as_deref(), restored.integrity_errors), (Some("dominated_pair_failed"), 1));
+        assert_eq!(next_band(&restored), None);
+        walk(&mut dominated, &clocks, &volts, Outcome::DriverFailure);
+        assert_eq!(dominated.stop_reason.as_deref(), Some("driver_failure_recovery_required"));
+        // Before any pair qualified, a TDR still ends the search.
+        let (mut top, clocks, volts) = staircase();
+        walk(&mut top, &clocks, &volts, Outcome::DriverFailure);
+        assert_eq!(top.stop_reason.as_deref(), Some("driver_failure_recovery_required"));
     }
     #[test]
     fn power_bound_lowers_voltage_at_same_clock_without_promoting_evidence() {
@@ -598,9 +593,8 @@ mod tests {
         resume_after_stock(&mut restored).unwrap();
         step(&mut restored, Outcome::Qualified);
         assert_eq!(restored.bands[0].last_qualified_clock_mhz,Some(1725));
-        assert_eq!((restored.bands[0].voltage_mv, restored.bands[0].margin_probe_used), (900, true));
-        assert_eq!(restored.bands[0].status, MARGIN_PROBE_WAITING);
-        assert_eq!(next_band(&restored),Some(1));
+        assert_eq!((restored.bands[0].voltage_mv, restored.bands[0].status.as_str()), (900, "pending"));
+        assert_eq!(next_band(&restored),Some(0));
         assert_eq!(restored.attempts_used,3);
     }
     #[test]
@@ -657,9 +651,12 @@ mod tests {
         step(&mut state,Outcome::Inconclusive);
         assert_eq!(state.bands[0].last_qualified_clock_mhz,Some(1710), "1725 stays unproven");
         assert_eq!(state.bands[0].stop_reason.as_deref(),Some("evidence_incomplete_no_boundary_inferred"));
-        assert_eq!((state.stop_reason.as_deref(),next_band(&state)),(None,Some(1)));
+        // No bin lies in [95% of 1710, 1710), so balanced passes through to efficiency.
+        assert_eq!(state.bands[1].stop_reason.as_deref(),Some("clock_level_exhausted"));
+        assert_eq!((state.stop_reason.as_deref(),next_band(&state)),(None,Some(2)));
+        assert_eq!((state.bands[2].target_clock_mhz,state.bands[2].voltage_mv),(1605,906));
         step(&mut state,Outcome::Inconclusive);
-        assert_eq!((state.bands[1].status.as_str(),next_band(&state)),("closed",Some(2)));
+        assert_eq!((state.bands[2].status.as_str(),next_band(&state)),("closed",None));
         // An unqualified top descends one clock bin at the same voltage, once; the next
         // Inconclusive still ends the search without a top.
         let mut no_top=search();
@@ -686,9 +683,10 @@ mod tests {
         step(&mut state,Outcome::Qualified);
         step(&mut state,Outcome::IntegrityError);
         assert_eq!(state.bands[0].last_qualified_clock_mhz,Some(1710));
-        assert_eq!(next_band(&state),Some(1));
+        assert_eq!(next_band(&state),Some(2));
         step(&mut state,Outcome::IntegrityError);
         assert_eq!(state.integrity_errors,2);
+        assert_eq!(state.stop_reason.as_deref(),Some("dominated_pair_failed"));
         assert_eq!(next_band(&state),None);
     }
     #[test]
@@ -702,7 +700,8 @@ mod tests {
         step(&mut state,Outcome::PowerBound);
         assert_eq!(state.bands[0].voltage_mv,906);
         assert_eq!(state.bands[0].stop_reason.as_deref(),Some("power_integrity_boundary"));
-        assert_eq!(next_band(&state),Some(1));
+        assert_eq!(next_band(&state),Some(2));
+        assert_eq!((state.bands[2].target_clock_mhz,state.bands[2].voltage_mv),(1605,900));
     }
     #[test]
     fn driver_failure_closes_every_band_immediately() {

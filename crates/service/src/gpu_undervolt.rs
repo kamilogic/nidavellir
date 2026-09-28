@@ -95,9 +95,10 @@ const F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ: i32 = 250;
 #[cfg(windows)]
 const F2_VERIFY_TOL_MHZ: u32 = 15;
 
-/// PowerRender must sustain the advertised target; idle/transition exemption belongs to phase coverage.
+/// PowerRender must sustain the advertised target or the GPU's one hot bin below it (2026-09-28:
+/// 1920/1830/1740@931 at 71 °C all ran one bin low, unlimited). Two bins is a ClockDrop.
 #[cfg(windows)]
-const F2_CLOCK_DROP_TOL_MHZ: u32 = 0;
+const F2_CLOCK_DROP_TOL_MHZ: u32 = nidavellir_core::f2_observation::F2_HELD_BIN_BELOW_MHZ;
 
 
 /// No sampled over-target excursion is admissible, including one physical boost bin.
@@ -5553,8 +5554,7 @@ mod tests {
             classify_f2_stress_dwell(&base, 1935, F2StressPurpose::PowerDiscovery).0,
             F2DwellOutcome::Inconclusive
         );
-        // Qualification remains exact: even the one-bin elasticity accepted by Discovery is not
-        // enough to certify an exact-Apply pair.
+        // Qualification is decided by its phase coverage (residency, heavy sustain), not by p5.
         let mut dropped = base;
         dropped.p5_clock_mhz = 1920;
         assert_eq!(
@@ -5582,8 +5582,8 @@ mod tests {
         dropped.thermal_throttled = false;
         assert_eq!(
             classify_f2_stress_dwell(&dropped, 1935, F2StressPurpose::PowerDiscovery).0,
-            F2DwellOutcome::ClockDrop,
-            "Discovery must prove the advertised clock, not the adjacent bin"
+            F2DwellOutcome::Stable,
+            "Discovery10 holds the GPU's one hot bin below the advertised clock"
         );
         dropped.p5_clock_mhz -= 1;
         assert_eq!(

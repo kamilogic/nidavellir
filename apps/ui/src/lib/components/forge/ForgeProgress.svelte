@@ -286,7 +286,7 @@
   }
 
   function bandStatus(status) {
-    return { waiting_for_top: "Waiting for qualified top", margin_probe_waiting: "Margin check at end", pending: "Pending", in_flight: "Testing", closed: "Closed" }[status] ?? "Pending";
+    return { waiting_for_top: "Waiting for the level above", pending: "Pending", in_flight: "Testing", closed: "Closed" }[status] ?? "Pending";
   }
 
   function searchStopReason(reason) {
@@ -306,6 +306,13 @@
       power_preparation_exhausted: "Power-limited preparation reached its allowed limit.",
       integrity_error_region_closed: "An integrity error ended exploration of this region.",
       inconclusive_region_closed: "The available evidence could not support further exploration.",
+      integrity_edge: "Voltage descent reached this clock's first integrity error. The lowest passing voltage is its edge.",
+      tdr_edge: "Voltage descent reached this clock's first driver reset. Restart Windows, acknowledge the incident, then Resume to continue at the next clock.",
+      evidence_boundary: "Voltage descent stopped where proof was incomplete. The next clock starts at the lowest passing voltage.",
+      voltage_floor_reached: "Reached the lowest voltage bin at this clock.",
+      dominated_pair_failed: "A pair already covered by a higher clock failed. The evidence is inconsistent, so the search stopped.",
+      clock_level_exhausted: "No clock bin lies below the previous level at this step.",
+      tdr_budget_exhausted: "Another Resume would exceed the driver-reset limit, so the run published its proven pairs.",
       invalid_search_plan: "The candidate search plan is incomplete or invalid. A new compatible run is required.",
       incompatible_search_version: "This saved search uses a different discovery version. Start a new run.",
     };

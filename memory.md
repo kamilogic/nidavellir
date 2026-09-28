@@ -1,6 +1,20 @@
 # Nidavellir — Project Memory
 
-## Current — thermal/margin package (2026-09-27)
+## Current — staircase descent (2026-09-28, search 8, ExactApply38)
+
+- Run 1790617016985: the DX11 fix worked (1920@937 qualified).
+  - The old bands then wasted admissions at 937 and died at 931: a one-bin hot ClockDrop at all
+    clocks, which is the GPU's thermal boost, not instability. No profile.
+- **Now:**
+  - The top descends voltage to its first failure. −5% and −10% levels start at the previous
+    level's lowest pass and descend again.
+  - One hot bin below target is held everywhere.
+  - A TDR at a level edge pauses: reboot + acknowledge + Resume continues the same run.
+  - The crash budget blocks only exploration, not Apply/publication.
+- **Budget:** ~18–21 admissions expected (24 limit). Each TDR edge costs a reboot.
+- **Open:** the NVML power-cap bit is uninformative in DX11. Nothing in this package ran on hardware.
+
+## Previous — thermal/margin package (2026-09-27)
 
 - Run1790537155912: top 1920@937 passed DX11 (98% power-limited, fix works), Vulkan, DX12; Endurance
   stopped the run: heavy near-limit phases drop one bin when hot (texture-rop 1905), SW thermal bit

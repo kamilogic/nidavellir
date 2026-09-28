@@ -1,5 +1,39 @@
 # Nidavellir — Decision Log
 
+## 2026-09-28 — staircase descent, one hot bin held, TDR pause/resume (search 8)
+
+Run f2-forge-1790617016985 qualified 1920@937 (the DX11 fix held), then 1830@937 and 1740@937. All
+three bands then tried 931: ClockDrop exactly one bin (1905/1815/1725) at 71 °C, 191–195 W, voltage
+locked at 931 mV, no HW slowdown. The run ended in 58 min at 8/24 admissions, and the margin rule held
+back all three pairs. The previous run held 1920@931 at ~61 °C, and 937 drops one bin only near 78 °C.
+Conclusion: the GPU's boost drops one bin at the locked anchor when hot, earlier at lower voltage.
+The user called the descent "dumb": economic bands started at the top's voltage, which is obviously
+stable at a lower clock, and nothing descended to instability.
+
+User decisions (asked, with trade-offs):
+- **Staircase:**
+  - The top descends voltage until its first failure.
+  - The next level (95%, then 90% of the top) starts at the lowest voltage the previous level passed
+    (+1 bin from the failure) and descends again. Levels run sequentially.
+  - The single margin probe and the economic floor climb are removed.
+  - Edges (`integrity_edge`, `tdr_edge`, `evidence_boundary`) do not spend the integrity budget.
+    A failure at a level's dominated start stops the search (`dominated_pair_failed`).
+  - Search VERSION 8.
+- **One hot bin held everywhere:** clock ≥ target − 15 at the anchor voltage (discovery, residency,
+  DX11 exposure including the light phase, Endurance hot target). Two bins still fail.
+  Discovery10/Frontier33/ExactApply38. Trade-off accepted: the exact label is no longer proven hot.
+- **TDR at a level edge:**
+  - The user first chose "continue in the same boot" on my recommendation. I withdrew it: the
+    2026-07-22 evidence shows a TDR dirties the boot (1800@875 then failed twice).
+  - Final choice: pause with the pair condemned; reboot, acknowledge, Resume the same run at the
+    next level. `validate_tdr_resume_checkpoint` now accepts an open search.
+  - The last level, or a crash count that would refuse Resume (`tdr_budget_exhausted`), publishes
+    the proven pairs (B).
+- **Crash budget scope:** it blocks new exploration (Start/Resume) only. `current_f2_tdr_safety_policy`
+  now projects the cone without the budget check, so Apply, restoration and crash publication keep
+  working after a third staircase TDR. Before, a third TDR would have locked every proven profile.
+  The finite-budget decision of 2026-08-14 already said "before further exploration".
+
 ## 2026-09-27 (c) — paced light DX11 phase, contiguous batch credit (ExactApply37)
 
 Run f2-forge-1790544997509 stopped at 1920@931 DX11 `dx11_light_target_unexercised`: 6.5 s at the

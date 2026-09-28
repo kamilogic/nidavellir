@@ -63,15 +63,15 @@ const POWER_PEAK_MIN_SAMPLES: usize = 100;
 /// measured-voltage stats as sensor glitches (a 0 mV / out-of-range read is noise).
 const VOLT_SANE_MIN_MV: u32 = 500;
 const VOLT_SANE_MAX_MV: u32 = 1250;
+/// Residency counts the GPU's one hot bin below the target as held (2026-09-28, user decision).
 #[cfg(windows)]
-const F2_QUALIFIER_TARGET_TOL_MHZ: u32 = 0;
+const F2_QUALIFIER_TARGET_TOL_MHZ: u32 = nidavellir_core::f2_observation::F2_HELD_BIN_BELOW_MHZ;
 #[cfg(windows)]
 #[path = "dx11_residency.rs"]
 mod dx11_residency;
-/// Frontier Texture coverage accepts one adjacent NVIDIA boost bin. This never applies to the
-/// exact-Apply Vulkan/DX11/DX12/Endurance matrix, which retains the zero-bin tolerance above.
+/// Frontier Texture screening uses the same one-bin hold as the exact-Apply matrix.
 #[cfg(windows)]
-const F2_FRONTIER_TEXTURE_TARGET_TOL_MHZ: u32 = 0;
+const F2_FRONTIER_TEXTURE_TARGET_TOL_MHZ: u32 = F2_QUALIFIER_TARGET_TOL_MHZ;
 #[cfg(windows)]
 const F2_QUALIFIER_TARGET_RESIDENCY_MIN: f32 = 0.35;
 #[cfg(windows)]
@@ -233,6 +233,19 @@ fn f2_tdr_safety_policy(
     if let Some(reason) = f2_current_crash_budget_error(&crashes, gpu_key) {
         return Err(reason);
     }
+    f2_tdr_cone(crashes, gpu_key, targets_descending, voltage_bins_ascending)
+}
+
+/// The physical TDR cone alone. The crash budget blocks new exploration (Start/Resume); it never
+/// blocks the cone check that Apply, profile restoration and crash publication need. Before
+/// 2026-09-28 it did, so a third staircase TDR would have locked every proven profile.
+#[cfg(windows)]
+fn f2_tdr_cone(
+    crashes: Vec<nidavellir_core::condemnation::CondemnationEvent>,
+    gpu_key: &str,
+    targets_descending: &[u32],
+    voltage_bins_ascending: &[u32],
+) -> Result<F2TdrSafetyPolicy, String> {
     if let Some(unmapped) = crashes.iter().find(|event| {
         !targets_descending.contains(&event.target_mhz)
             || !voltage_bins_ascending.contains(&event.vf_bin_mv)
@@ -263,9 +276,6 @@ fn current_f2_tdr_safety_policy(
         .load_all_checked()
         .map_err(|error| format!("cone TDR: ledger durável ilegível: {error}"))?;
     let crashes = f2_effective_candidate_crashes(&events, gpu_key);
-    if let Some(reason) = f2_current_crash_budget_error(&crashes, gpu_key) {
-        return Err(reason);
-    }
     if crashes.is_empty() {
         return Ok(F2TdrSafetyPolicy {
             crashes,
@@ -290,7 +300,7 @@ fn current_f2_tdr_safety_policy(
         .collect::<Vec<_>>();
     voltage_bins.sort_unstable();
     voltage_bins.dedup();
-    f2_tdr_safety_policy(&events, gpu_key, &targets, &voltage_bins)
+    f2_tdr_cone(crashes, gpu_key, &targets, &voltage_bins)
 }
 
 #[cfg(windows)]
@@ -876,7 +886,9 @@ fn validate_tdr_resume_checkpoint(
     record: &nidavellir_core::safe_loop::SafeLoopRecord,
     condemnation_events: &[nidavellir_core::condemnation::CondemnationEvent],
 ) -> Result<(PowerSweepMode, ForgeLearning), String> {
-    if progress.discovery_search.is_some() {
+    // A staircase TDR edge leaves the search open for its next level (2026-09-28); any other TDR
+    // closes it.
+    if progress.discovery_search.as_ref().is_some_and(|search| search.stop_reason.is_some()) {
         return Err("TDR encerrou esta busca; reconheça a recuperação e inicie outra run explicitamente".into());
     }
     if progress.running
@@ -3684,14 +3696,14 @@ fn qualification_coverage_from_run_with_context(
             });
         refusal.or((!evaluated).then_some("heavy_phase_telemetry_low"))
     });
-    // Endurance is the thermal soak: the nominal target itself must run near the hottest
-    // temperature the lane reached, or the pair was never proven hot (2026-09-27).
+    // Endurance is the thermal soak: the pair must hold its target (or the GPU's one hot bin below
+    // it) near the hottest temperature the lane reached, or it was never proven hot (2026-09-27).
     let hot_target_samples = target_mhz
         .filter(|_| matches!(pattern, VfQualifierPattern::Endurance))
         .map(|target| {
             let lane = || samples.iter().filter(|s| VfQualifierPhase::from_code(s.4).is_some());
             let lane_max = lane().filter_map(|s| s.3).fold(f32::MIN, f32::max);
-            lane().filter(|s| nidavellir_core::f2_observation::f2_clock_in_target_band(s.0, target)
+            lane().filter(|s| nidavellir_core::f2_observation::f2_clock_held(s.0, target)
                 && s.3.is_some_and(|temp| temp >= lane_max - F2_ENDURANCE_HOT_BAND_C)).count()
         });
     let (verdict, reason) = if let Some(reason) = inconclusive_reason {
@@ -9786,11 +9798,25 @@ fn measure_multiclock_undervolt_forge(
             }
         }
         let next = &discovery.bands[band_index];
-        if recorded == Outcome::Qualified && next.id == "performance" && next.margin_probe_used && next.status == "margin_probe_waiting" {
+        if recorded == Outcome::Qualified && next.status == "pending" && next.target_clock_mhz == target && next.voltage_mv < mv {
             prog.log.push(format!(
-                "Topo {target} MHz @ {mv} mV qualificado. Teste de margem único em {} MHz @ {} mV reservado para a última admissão, depois das bandas econômicas; o topo só entra nos perfis se essa margem for provada.",
-                next.target_clock_mhz, next.voltage_mv
+                "{target} MHz @ {mv} mV qualificado; descendo a tensão neste clock até a primeira instabilidade: próximo {target} MHz @ {} mV.",
+                next.voltage_mv
             ));
+        }
+        if let Some(edge @ ("integrity_edge" | "tdr_edge" | "evidence_boundary" | "voltage_floor_reached")) =
+            next.stop_reason.as_deref().filter(|_| next.status == "closed")
+        {
+            prog.log.push(format!(
+                "Degrau {target} MHz encerrado em {mv} mV ({edge}); menor tensão aprovada neste clock: {}.",
+                next.last_qualified_voltage_mv.map_or("nenhuma".into(), |v| format!("{v} mV"))
+            ));
+            if let Some(level) = discovery.bands.iter().find(|b| b.status == "pending") {
+                prog.log.push(format!(
+                    "Próximo degrau: {} MHz @ {} mV (menor tensão aprovada no degrau anterior).",
+                    level.target_clock_mhz, level.voltage_mv
+                ));
+            }
         }
         if recorded == Outcome::Inconclusive && next.id == "performance" && next.status == "pending"
             && next.target_clock_mhz < target {
@@ -9963,15 +9989,30 @@ fn measure_multiclock_undervolt_forge(
     } else {
         false
     };
+    // Staircase TDR edge (2026-09-28): the search stays open so Resume, after reboot and
+    // acknowledgement, starts the next level. If the crash budget would refuse that Resume, close
+    // the search now so the proven pairs still publish.
+    if candidate_crash_durable && discovery.stop_reason.is_none() {
+        let resume_refused = nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir())
+            .load_all_checked()
+            .map_or(true, |events| {
+                f2_current_crash_budget_error(&f2_effective_candidate_crashes(&events, &gpu_key), &gpu_key).is_some()
+            });
+        if resume_refused {
+            search::close_all(&mut discovery, "tdr_budget_exhausted");
+            prog.discovery_search = Some(discovery.clone());
+        }
+    }
     // User decision 2026-09-26 (B): a candidate crash stops the run but does not erase pairs that
     // already hold complete current-run proof. Publish them only after the crash is durably
     // condemned and stock is restored, excluding the TDR cone recomputed from the ledger. The
     // pending incident keeps Apply latched until acknowledgement; Apply re-checks the cone.
+    // An open staircase search publishes at its final level instead.
     let crash_profiles_published = candidate_crash_durable
         && stock_restored
         && terminal_integrity_error.is_none()
         && !clock_control_blocked
-        && discovery.stop_reason.as_deref() == Some("driver_failure_recovery_required")
+        && discovery.stop_reason.is_some()
         && match current_f2_condemned_pairs(store, &gpu_key).and_then(|condemned| {
             let observations = obs_store.load_all_checked().map_err(|e| e.to_string())?;
             f2_run_profile_points(store, &observations, &run_id, &gpu_key, &condemned)
@@ -10072,16 +10113,32 @@ fn measure_multiclock_undervolt_forge(
         }
         prog.last_outcome = Some("TdrOrCrash".into());
         prog.resume_available = false;
-        prog.resume_block_reason =
-            Some("TDR encerrou esta busca; recuperação e nova run exigem ação explícita".into());
-        let published = if crash_profiles_published {
-            " Perfis publicados só com pares que já tinham prova completa antes do crash; o cone TDR foi excluído e o Apply fica bloqueado até o incidente ser reconhecido."
+        let next_level = discovery
+            .stop_reason
+            .is_none()
+            .then(|| discovery.bands.iter().find(|band| band.status == "pending"))
+            .flatten();
+        if let Some(level) = next_level {
+            prog.resume_block_reason = Some(format!(
+                "reinicie o Windows e reconheça o incidente; Retomar continua em {} MHz @ {} mV",
+                level.target_clock_mhz, level.voltage_mv
+            ));
+            prog.note = Some(format!(
+                "TDR no limite do degrau {target_mhz} MHz @ {anchor_mv} mV: par condenado e cone TDR aplicados. Restauração stock confirmada: {final_reset_confirmed}. Reinicie o Windows, reconheça o incidente e use Retomar: a mesma run continua em {} MHz @ {} mV com as provas já feitas.",
+                level.target_clock_mhz, level.voltage_mv
+            ));
         } else {
-            ""
-        };
-        prog.note = Some(format!(
-            "TDR atribuído a {target_mhz} MHz @ {anchor_mv} mV; run encerrada e evidência preservada. Restauração stock confirmada: {final_reset_confirmed}.{published} Reinicie o Windows e reconheça o incidente antes de iniciar outra run."
-        ));
+            prog.resume_block_reason =
+                Some("TDR encerrou esta busca; recuperação e nova run exigem ação explícita".into());
+            let published = if crash_profiles_published {
+                " Perfis publicados só com pares que já tinham prova completa antes do crash; o cone TDR foi excluído e o Apply fica bloqueado até o incidente ser reconhecido."
+            } else {
+                ""
+            };
+            prog.note = Some(format!(
+                "TDR atribuído a {target_mhz} MHz @ {anchor_mv} mV; run encerrada e evidência preservada. Restauração stock confirmada: {final_reset_confirmed}.{published} Reinicie o Windows e reconheça o incidente antes de iniciar outra run."
+            ));
+        }
         prog.log.push(format!(
             "TDR/CRASH: CandidateCrash {target_mhz} MHz @ {anchor_mv} mV reconciliado no terminal; raw dwell preservado sem relabel, run pausada como interrupted."
         ));
@@ -11600,8 +11657,8 @@ mod tests {
             .iter()
             .map(|sample| (1785, sample.1, sample.2, sample.3, sample.4, sample.5))
             .collect::<Vec<_>>();
-        // Exact-Apply remains strict: a whole dwell at target-15 is not exact residency. Heavy
-        // sustain holds that one bin (boost management), so residency is what refuses it.
+        // ExactApply38/Frontier33: a whole dwell one hot bin below the target holds it (the GPU's
+        // boost drops one bin at the locked voltage when hot; run f2-forge-1790617016985).
         let adjacent_lower_bin = qualification_coverage_from_run(
             StabilityResult::Stable,
             &reports,
@@ -11611,17 +11668,7 @@ mod tests {
             Some(200.0),
             None,
         );
-        assert_eq!(
-            adjacent_lower_bin.verdict,
-            F2QualificationVerdict::Inconclusive
-        );
-        assert_eq!(
-            adjacent_lower_bin.reason.as_deref(),
-            Some("target_residency_low")
-        );
-        assert_eq!(adjacent_lower_bin.target_residency_frac, Some(0.0));
-
-        // Frontier Texture treats exactly one physical boost bin as runtime elasticity.
+        assert_eq!(adjacent_lower_bin.target_residency_frac, Some(1.0));
         let frontier_adjacent_lower_bin = qualification_coverage_from_run_with_context(
             StabilityResult::Stable,
             &reports,
@@ -11632,11 +11679,7 @@ mod tests {
             Some(200.0),
             None,
         );
-        assert_eq!(
-            frontier_adjacent_lower_bin.verdict,
-            F2QualificationVerdict::Inconclusive
-        );
-        assert_eq!(frontier_adjacent_lower_bin.target_residency_frac, Some(0.0));
+        assert_eq!(frontier_adjacent_lower_bin.target_residency_frac, Some(1.0));
 
         // A second boost-bin miss is still unproven at the frontier.
         let two_bins_lower_samples = samples

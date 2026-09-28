@@ -1,6 +1,24 @@
 \# UI ↔ Backend Contract
 
-## 2026-09-27 (c): paced light DX11 (current)
+## 2026-09-28: staircase search 8, one hot bin held (current)
+
+Search VERSION 8: a v7 checkpoint cannot resume. Contracts: Discovery10, Frontier33, ExactApply38. No
+field removals.
+- **`ForgeDiscoveryBand`:**
+  - Bands run one at a time: performance, then balanced (95%), then efficiency (90%).
+  - `waiting_for_top` now means "waiting for the level above".
+  - Status `margin_probe_waiting` no longer occurs, and `margin_probe_used` stays false.
+  - New `stop_reason` values: `integrity_edge`, `tdr_edge`, `evidence_boundary`,
+    `voltage_floor_reached`, `dominated_pair_failed`, `clock_level_exhausted`,
+    `tdr_budget_exhausted`.
+- **`F2ActiveClockPhase`:** `target_active_us` includes one bin below the target.
+  `one_bin_below_active_us` is that share of it (diagnostic), no longer added separately.
+- **TDR checkpoint:** after a `tdr_edge`, `phase` is `interrupted` with the search still open.
+  - `resume_block_reason` reads "reinicie o Windows e reconheça o incidente; Retomar continua em X
+    MHz @ Y mV" until reboot + acknowledgement; then `resume_available` becomes true.
+  - Resume continues the same `run_id`.
+
+## 2026-09-27 (c): paced light DX11
 
 ExactApply37, DX11 fingerprint `dx11-game-v6/active-residency-heavy-variable-paced-light`. No field
 changes. The light phase (`F2ActiveClockPhase.light`, index 5) now reports `requested_duty_pct`

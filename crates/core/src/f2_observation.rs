@@ -41,7 +41,9 @@ pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 /// v7 (2026-08-11): discovery permits one adjacent physical boost bin of clock elasticity while
 /// retaining authoritative voltage-lock/readback at the labeled anchor. A miss larger than one bin
 /// remains `ClockDrop`; pre-v7 positives used the stricter clock-residency interpretation.
-pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 9;
+/// v10 (2026-09-28): the one hot bin below the target is held again (it had returned to exact).
+/// Without it, every anchor below 937 mV read as ClockDrop when hot on the test 3060 Ti.
+pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 10;
 
 /// Explicit nominal-clock envelope, not permission to increase voltage or infer a higher profile.
 /// Keep requesting the nominal NVML cap; qualify measured operation through nominal + 15 MHz.
@@ -52,10 +54,13 @@ pub fn f2_clock_ceiling_mhz(target: u32) -> u32 {
 pub fn f2_clock_in_target_band(clock: u32, target: u32) -> bool {
     (target..=f2_clock_ceiling_mhz(target)).contains(&clock)
 }
-/// Qualification sustain also holds one physical bin below the nominal target: under hot,
-/// near-limit heavy load the GPU's own boost management drops one bin at the same voltage (run
-/// 1790537155912 Endurance: texture-rop/mixed-game at 1905 for 1920, cap bit on 3-6%). This is
-/// never target exposure and never promotes or demotes the published nominal clock.
+/// A pair holds its target one physical bin below the nominal clock too. When hot, the GPU's own
+/// boost management drops one bin at the locked anchor voltage, earlier at lower voltages:
+/// - 1920@937 at ~78 °C (run 1790537155912);
+/// - 1920/1830/1740@931 at 71 °C (run f2-forge-1790617016985).
+/// It is not instability. Since the staircase decision (2026-09-28) it counts as held everywhere:
+/// discovery, residency, DX11 exposure and the Endurance hot target. A drop of two bins still
+/// fails. The published nominal clock never moves.
 pub const F2_HELD_BIN_BELOW_MHZ: u32 = 15;
 pub fn f2_clock_held(clock: u32, target: u32) -> bool {
     (target.saturating_sub(F2_HELD_BIN_BELOW_MHZ)..=f2_clock_ceiling_mhz(target)).contains(&clock)
@@ -146,7 +151,8 @@ pub fn f2_clock_held(clock: u32, target: u32) -> bool {
 /// v32 (2026-09-26): representative-load contract. Only PowerRender must stay below the board
 /// limit; qualification samples below target while at the limit count as held. Heavy phases too
 /// short to evaluate are skipped, not refused.
-pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 32;
+/// v33 (2026-09-28): screening residency counts the one hot bin below the target as held.
+pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 33;
 
 /// v29 (2026-08-11): three consecutive, provenance-identical native DX11 v2 exact-Apply dwells that
 /// finish reset-clean and off-cap with at least 95% of clocks below the requested target are a
@@ -165,7 +171,10 @@ pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 32;
 /// v37 (2026-09-27): the light phase is paced at 50% duty with two lane shares, and back-to-back
 /// batches of one phase are credited as one span. Back-to-back light frames kept the GPU busy and
 /// power-limited, and ~8.7 ms batches capped the phase below 30 s.
-pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 37;
+/// v38 (2026-09-28): the one hot bin below the target counts as held target time in residency,
+/// DX11 exposure (the light phase included) and the Endurance hot target (user decision). The
+/// exact label is no longer proven when hot; a two-bin drop still fails.
+pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 38;
 
 /// Backward-compatible alias for callers that expose one latest profile-publication contract.
 /// Frontier qualification has an independent version because exact-Apply policy changes must not
@@ -432,18 +441,19 @@ pub struct F2ActiveTargetDiagnostics {
 pub struct F2ActiveClockPhase {
     pub phase_index: u32,
     pub requested_duty_pct: u32,
-    /// Continuous light frame (one instance) instead of the heavy frame.
+    /// Light frame (one instance, paced) instead of the heavy frame.
     #[serde(default)]
     pub light: bool,
     pub active_sample_count: u32,
     pub active_clock_max_mhz: Option<u32>,
     #[serde(default)]
     pub observed_active_us: u64,
+    /// Held target time: the target, its +15 MHz envelope or the one hot bin below (ExactApply38).
     #[serde(default)]
     pub target_active_us: u64,
     #[serde(default)]
     pub power_limited_active_us: u64,
-    /// One bin below target without the power-cap bit: held for heavy sustain only.
+    /// The part of `target_active_us` spent one bin below the nominal target (diagnostic).
     #[serde(default)]
     pub one_bin_below_active_us: u64,
     pub upper_sample_count: u32,
@@ -1382,11 +1392,9 @@ pub fn current_discovery_observation_at_anchor<'a>(
         })
 }
 
-/// Sustained-clock tolerance (MHz) mirroring the service classifier's `F2_CLOCK_DROP_TOL_MHZ`.
-/// Contract v25 requires the exact target bin: an adjacent lower boost bin is runtime elasticity,
-/// not proof that the labeled point was exercised. Kept in sync with
-/// `gpu_undervolt::F2_CLOCK_DROP_TOL_MHZ` (0).
-pub const F2_APPLY_CLOCK_HOLD_TOL_MHZ: u32 = 0;
+/// Sustained-clock tolerance (MHz) mirroring the service classifier's `F2_CLOCK_DROP_TOL_MHZ`:
+/// one hot boost bin at the anchor voltage (see [`F2_HELD_BIN_BELOW_MHZ`]).
+pub const F2_APPLY_CLOCK_HOLD_TOL_MHZ: u32 = F2_HELD_BIN_BELOW_MHZ;
 
 /// True when an Apply-qualification observation's power/clock telemetry is trustworthy. A
 /// thermal-slowdown flag only invalidates it when the slowdown actually backed the card OFF the

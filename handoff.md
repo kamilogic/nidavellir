@@ -1,6 +1,21 @@
 # Nidavellir — Session Handoff
 
-## LATEST — paced light DX11 + contiguous batch credit (2026-09-27 c)
+## LATEST — staircase descent + one hot bin + TDR pause/resume (2026-09-28)
+
+Run f2-forge-1790617016985 qualified 1920@937 and then stopped at 931: a one-bin hot ClockDrop at
+every clock. The user asked for a staircase.
+- The top descends voltage to its first failure. The −5% and −10% levels start at the lowest
+  passing voltage above them.
+- One hot bin below target counts as held everywhere.
+- A TDR at a level edge pauses for reboot + Resume. The crash budget no longer blocks Apply or
+  publication.
+- Versions: search 8, Discovery10/Frontier33/ExactApply38. See decisions.md 2026-09-28.
+- Rust 708/3 ignored, release check clean, UI 18/18 + build. Uncommitted.
+- Next: BAT rebuild, Full Reset → Clean.
+  - Expected: a descent at 1920 below 937, then 1830 and 1740 levels.
+  - On a TDR: reboot, acknowledge, then Retomar.
+
+## Previous — paced light DX11 + contiguous batch credit (2026-09-27 c)
 
 Run f2-forge-1790544997509 died on the first admission after discovery: DX11 light 6.5 s at target.
 Per-batch clipping capped the ~8.7 ms light batches at ~18.5 s, and back-to-back light frames
