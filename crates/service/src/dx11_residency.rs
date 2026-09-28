@@ -8,14 +8,26 @@ use nidavellir_gpu_stress::{Dx11Golden, Dx11QualificationResult, Dx11Qualifier};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// (duty %, light frame). Heavy opening/closing and heavy duty bursts stay; the continuous light
-/// phase runs the pair below the power cap, like a light game (ExactApply36).
-const PHASES: [(u32, bool); 6] =
-    [(100, false), (75, false), (50, false), (25, false), (100, true), (100, false)];
+/// (duty %, light frame, lane shares). Heavy opening/closing and heavy duty bursts stay. The light
+/// phase paces one-instance frames at 50% duty like a frame-capped light game, so the pair runs
+/// below the power cap (ExactApply37). Run f2-forge-1790544997509 ran it back-to-back: the GPU
+/// stayed busy and was power-limited 65% of the time. It gets two shares because it is busy about
+/// half the time.
+const PHASES: [(u32, bool, u64); 6] =
+    [(100, false, 1), (75, false, 1), (50, false, 1), (25, false, 1), (50, true, 2), (100, false, 1)];
 const _: () = assert!(PHASES.len() as u32 == nidavellir_core::f2_observation::F2_DX11_PHASES);
 const TARGET_EXPOSURE_MS: u64 = 30_000;
 const ACTIVE_COVERAGE_MS: u64 = 60_000;
 const SAMPLE_HALF_WIDTH_US: u64 = 15_000;
+/// Consecutive batches of one phase are one load: their recorded gap is only the next batch's
+/// submission. Duty idle and phase changes are far longer and stay separate.
+const CONTIGUOUS_GAP_US: u64 = 1_000;
+
+/// Phase end, as an offset from the lane start, splitting the lane by shares.
+fn phase_end_ms(duration_ms: u64, index: usize) -> u64 {
+    let shares = |phases: &[(u32, bool, u64)]| phases.iter().map(|p| p.2).sum::<u64>();
+    duration_ms * shares(&PHASES[..=index]) / shares(&PHASES)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Sample {
@@ -67,10 +79,9 @@ pub(super) fn run(
         inconclusive_reason: None,
     };
     let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
-    for (index, (duty, light)) in PHASES.into_iter().enumerate() {
+    for (index, (duty, light, _)) in PHASES.into_iter().enumerate() {
         phase_changed(duty == 100 && !light);
-        let deadline = started
-            + Duration::from_millis(duration_ms * (index as u64 + 1) / PHASES.len() as u64);
+        let deadline = started + Duration::from_millis(phase_end_ms(duration_ms, index));
         let mut phase_checks = 0;
         while Instant::now() < deadline && !cancelled() {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -139,10 +150,26 @@ pub(super) fn run(
     total
 }
 
-/// Sensor reads are sequential, not atomic. Credit only reads wholly inside a submitted-work
-/// interval. Their time support is clipped to that interval, adjacent sample midpoints and ±15 ms.
-/// Consequently idle, checksum work, phase crossings, sensor gaps and duplicate reads cannot
-/// manufacture target exposure. This is a bounded sampled estimate, not continuous HW tracing.
+fn contiguous(work: &[Work]) -> Vec<Work> {
+    let mut spans: Vec<Work> = Vec::with_capacity(work.len());
+    for w in work {
+        match spans.last_mut() {
+            Some(last) if last.phase_index == w.phase_index
+                && w.start_us.saturating_sub(last.end_us) <= CONTIGUOUS_GAP_US =>
+                last.end_us = last.end_us.max(w.end_us),
+            _ => spans.push(*w),
+        }
+    }
+    spans
+}
+
+/// Sensor reads are sequential, not atomic. Credit only reads wholly inside a submitted-work span
+/// (one batch, or back-to-back batches of one phase). Their time support is clipped to that span,
+/// adjacent sample midpoints and ±15 ms. Consequently duty idle, phase crossings, sensor gaps and
+/// duplicate reads cannot manufacture target exposure. A batch that finishes before the previous
+/// checksum is hashed idles inside its interval (at most one checksum). Per-batch clipping capped
+/// short light batches at ~18 s of credit per 70 s (run f2-forge-1790544997509). This is a bounded
+/// sampled estimate, not continuous HW tracing.
 pub(super) fn coverage(
     samples: &[Sample],
     evidence: &Evidence,
@@ -155,19 +182,18 @@ pub(super) fn coverage(
     let mut count = 0;
     let mut window_index = 0;
     let upper_clock_exceeded = samples.iter().any(|s| s.clock_mhz > nidavellir_core::f2_observation::f2_clock_ceiling_mhz(target));
-    let mut phases: Vec<_> = PHASES.iter().enumerate().map(|(index, (duty, light))| F2ActiveClockPhase {
+    let spans = contiguous(&evidence.work);
+    let mut phases: Vec<_> = PHASES.iter().enumerate().map(|(index, (duty, light, _))| F2ActiveClockPhase {
         phase_index: index as u32 + 1, requested_duty_pct: *duty, light: *light,
         active_sample_count: 0, active_clock_max_mhz: None,
         observed_active_us: 0, target_active_us: 0, power_limited_active_us: 0, one_bin_below_active_us: 0,
         upper_sample_count: 0, upper_observed_us: 0, first_upper: None,
     }).collect();
     for (index, sample) in samples.iter().enumerate() {
-        while window_index < evidence.work.len()
-            && evidence.work[window_index].end_us < sample.end_us
-        {
+        while window_index < spans.len() && spans[window_index].end_us < sample.end_us {
             window_index += 1;
         }
-        let Some(work) = evidence.work.get(window_index) else {
+        let Some(work) = spans.get(window_index) else {
             break;
         };
         if sample.start_us < work.start_us || sample.end_us > work.end_us {
@@ -301,7 +327,7 @@ mod tests {
         // Run 1790466472114, DX11 at 1920@937: the SW power cap was set on every sample and the
         // limiter clamped full-duty and duty-cycled bursts onto stock points (p50 1695 MHz); only
         // ~1.7 s ran at target. That is power limiting, not an unexercised or unstable pair. The
-        // light phase (ExactApply36) is what exercises the exact target in DX11.
+        // paced light phase (ExactApply37) is what exercises the exact target in DX11.
         let mut reads: Vec<_> = (0..200_000_000).step_by(30_000).map(|t| {
             let mut s = sample(t, 1695);
             s.power_limited = t < 160_000_000;
@@ -510,5 +536,30 @@ mod tests {
         excursion[1].clock_mhz = 1830;
         let refused = coverage(&excursion, &evidence, 1800, 900);
         assert_eq!(refusal(&refused), Some("dx11_upper_clock_exceeded"));
+    }
+
+    #[test]
+    fn paced_light_batches_credit_their_load_but_never_duty_idle() {
+        // Run f2-forge-1790544997509: light batches lasted ~8.7 ms, and per-batch clipping credited
+        // ~15 s of a phase at target. Paced: 12 back-to-back batches (~105 ms), then duty idle.
+        let work = (0..120_000_000).step_by(220_000).flat_map(|t| (0..12).map(move |b| Work {
+            start_us: t + b * 8_800, end_us: t + b * 8_800 + 8_700, exposure: true, phase_index: 4,
+        }));
+        let evidence = Evidence { completed: 6, work: work.collect() };
+        let busy_ms: u64 = contiguous(&evidence.work).iter().map(|w| w.end_us - w.start_us).sum::<u64>() / 1000;
+        let reads: Vec<_> = (0..120_000_000).step_by(30_500).map(|t| sample(t, 1920)).collect();
+        let light = coverage(&reads, &evidence, 1920, 900).light_target_active_ms;
+        assert!((45_000..=busy_ms).contains(&light), "light {light} ms of {busy_ms} ms load");
+
+        let w = |start_us, end_us, phase_index| Work { start_us, end_us, exposure: true, phase_index };
+        let spans = contiguous(&[w(0, 8_700, 4), w(8_800, 17_500, 4), w(17_500, 20_000, 5), w(60_000, 70_000, 5)]);
+        assert_eq!(spans.iter().map(|s| (s.start_us, s.end_us)).collect::<Vec<_>>(),
+            [(0, 17_500), (17_500, 20_000), (60_000, 70_000)], "phase changes and idle stay apart");
+    }
+
+    #[test]
+    fn light_phase_gets_two_of_seven_lane_shares() {
+        let ends: Vec<_> = (0..PHASES.len()).map(|i| phase_end_ms(420_000, i)).collect();
+        assert_eq!(ends, [60_000, 120_000, 180_000, 240_000, 360_000, 420_000]);
     }
 }

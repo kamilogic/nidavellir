@@ -1,5 +1,37 @@
 # Nidavellir — Decision Log
 
+## 2026-09-27 (c) — paced light DX11 phase, contiguous batch credit (ExactApply37)
+
+Run f2-forge-1790544997509 stopped at 1920@931 DX11 `dx11_light_target_unexercised`: 6.5 s at the
+exact target vs 30 s. The performance band then closed and the economic bands closed as
+`qualified_top_unavailable`. The run used 4 of 24 admissions and published no profile. There were
+two causes, both confirmed in code and data:
+- Credit ceiling: coverage clipped each read to its own batch interval. Light batches (16 frames,
+  CPU-hash bound) lasted ~8.7 ms vs a 30.5 ms sample tick, so the phase earned 8.7 ms per read.
+  That capped it at ~18.5 s even if every read was at target. Heavy batches (~25 ms) earned
+  ~21 ms per read.
+- Power: back-to-back one-instance frames still keep the GPU busy, so the light phase was
+  power-limited 65% of the time. The heavy 50%-duty phase held the target 74% of the time.
+- Fix: the light phase is paced at 50% duty in 100 ms windows, like a frame-capped light game. It
+  gets two lane shares (120 s of 420 s; the other phases get 60 s each). Coverage merges
+  back-to-back batches of one phase (recorded gap <=1 ms) into one span. Duty idle and phase
+  changes never merge.
+- A reconstructed paced trace credits ~52 s of 57.6 s of load; per-batch credit gave ~15 s.
+- ExactApply37, fingerprint dx11-game-v6.
+- Known, unchanged: the NVML SW power-cap bit was set on >99% of DX11 samples, including 2477/2494
+  AT 1920. It carries no information here, so the "power-limited" excuse is effectively any
+  below-target read. The binding DX11 target gate is now the exact-target light phase.
+  - Not tightened: requiring the 1 s power near the limit would also refuse bursty Endurance
+    phases (heavy-spike/idle-pulse) that pass today on this excuse.
+- User approved resolving the premature stop. An Inconclusive performance band with no qualified
+  clock now descends one clock bin at the same voltage, once per run (`inconclusive_descent_used`,
+  additive). It is a new hypothesis, not a claim or a boundary; the Inconclusive pair is neither
+  approved nor condemned.
+  - The next Inconclusive closes the band as before.
+  - It does not count toward the integrity budget.
+  - Safety-history exclusions are re-checked at the descended pair's admission.
+- search VERSION stays 7: the rule is additive and old states resume.
+
 ## 2026-09-27 (b) — margin probe last, light DX11 phase, clock×temp cells, .gitattributes
 
 User answers to the post-analysis suggestions:

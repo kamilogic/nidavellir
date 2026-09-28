@@ -385,8 +385,24 @@ pub fn record(
             }
         }
         // Missing proof closes only this band (user decision 2026-09-26); the pair is never
-        // claimed. Without a qualified top the economic bands cannot start, so the search stops.
-        Outcome::Inconclusive => close_band(band, "evidence_incomplete_no_boundary_inferred"),
+        // claimed. Without a qualified top the economic bands cannot start and the run ends with no
+        // profile (run f2-forge-1790544997509), so an unqualified top first descends one clock bin
+        // at the same voltage, once per run. That is a new hypothesis, not an inferred boundary.
+        Outcome::Inconclusive => {
+            let lower_clock = clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max();
+            match lower_clock {
+                Some(clock) if band.id == "performance" && band.last_qualified_clock_mhz.is_none()
+                    && !band.inconclusive_descent_used => {
+                    band.inconclusive_descent_used = true;
+                    band.target_clock_mhz = clock;
+                    band.clock_ceiling_mhz = clock;
+                    band.power_preparation_used = false;
+                    clear_power_bracket(band);
+                    band.status = "pending".into();
+                }
+                _ => close_band(band, "evidence_incomplete_no_boundary_inferred"),
+            }
+        }
         Outcome::ControlMismatch => {
             if search.control_retries_used == 0 {
                 search.control_retries_used += 1;
@@ -644,10 +660,25 @@ mod tests {
         assert_eq!((state.stop_reason.as_deref(),next_band(&state)),(None,Some(1)));
         step(&mut state,Outcome::Inconclusive);
         assert_eq!((state.bands[1].status.as_str(),next_band(&state)),("closed",Some(2)));
+        // An unqualified top descends one clock bin at the same voltage, once; the next
+        // Inconclusive still ends the search without a top.
         let mut no_top=search();
+        assert_eq!(step(&mut no_top,Outcome::Inconclusive),0);
+        let top=&no_top.bands[0];
+        assert_eq!((top.target_clock_mhz,top.clock_ceiling_mhz,top.voltage_mv),(1605,1605,906));
+        assert_eq!((top.last_qualified_clock_mhz,no_top.integrity_errors),(None,0));
+        assert_eq!(no_top.bands[1].status,"waiting_for_top");
         step(&mut no_top,Outcome::Inconclusive);
         assert_eq!(no_top.stop_reason.as_deref(),Some("qualified_top_unavailable"));
         assert_eq!(next_band(&no_top),None);
+        // The descent is per run: it survives Resume and a later lower-clock Inconclusive closes.
+        let mut resumed=search();
+        step(&mut resumed,Outcome::Inconclusive);
+        let mut resumed:ForgeDiscoverySearch=serde_json::from_str(&serde_json::to_string(&resumed).unwrap()).unwrap();
+        resume_after_stock(&mut resumed).unwrap();
+        step(&mut resumed,Outcome::PowerBound);
+        step(&mut resumed,Outcome::Inconclusive);
+        assert_eq!(resumed.stop_reason.as_deref(),Some("qualified_top_unavailable"));
     }
     #[test]
     fn integrity_failure_does_not_approve_candidate_and_keeps_error_budget() {

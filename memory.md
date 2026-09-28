@@ -13,6 +13,12 @@
 - Follow-up (27/09 b): margin probe last on a reserved, uncounted admission; DX11 light phase
   (ExactApply36, 6 phases); `clock_temp` cells in phase metrics; `.gitattributes`. User rejected
   cooling before discovery: tests must reflect continuous hot gaming.
+- Follow-up (27/09 c): run 1790544997509 died at the top's DX11 light phase (6.5 s of 30 s at
+  target) after 4/24 admissions. Light is now paced at 50% duty on 2/7 of the lane, and coverage
+  merges back-to-back batches of one phase (ExactApply37, dx11-game-v6).
+- An Inconclusive unqualified top now descends one clock bin at the same voltage, once per run
+  (`inconclusive_descent_used`). A second Inconclusive still ends the run with no profile.
+- The NVML power-cap bit is uninformative in DX11: it was set on >99% of samples, even at target.
 
 ## Current — representative-load power contract, search7 (2026-09-26 evening)
 

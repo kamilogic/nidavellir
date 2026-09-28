@@ -395,6 +395,9 @@ pub struct ForgeDiscoveryBand {
     /// Performance only: the single one-bin-lower margin probe of the qualified top was admitted.
     #[serde(default)]
     pub margin_probe_used: bool,
+    /// Performance only: an Inconclusive unqualified top already took its one clock-bin descent.
+    #[serde(default)]
+    pub inconclusive_descent_used: bool,
     pub last_qualified_clock_mhz: Option<u32>,
     pub last_qualified_voltage_mv: Option<u32>,
     /// Performance exploration alternates one lower voltage bin and one higher clock bin.

@@ -1,5 +1,19 @@
 # Nidavellir — Session Handoff
 
+## LATEST — paced light DX11 + contiguous batch credit (2026-09-27 c)
+
+Run f2-forge-1790544997509 died on the first admission after discovery: DX11 light 6.5 s at target.
+Per-batch clipping capped the ~8.7 ms light batches at ~18.5 s, and back-to-back light frames
+were power-limited 65% of the time.
+- Light phase paced at 50% duty with 2 lane shares (120 s).
+- Coverage merges back-to-back batches of one phase.
+- ExactApply37, dx11-game-v6.
+- An Inconclusive unqualified top descends one clock bin at the same voltage, once per run,
+  instead of ending the run (`inconclusive_descent_used`).
+- Uncommitted.
+- Next: BAT rebuild, Full Reset → Clean. Check the light phase's `target_active_us` in the DX11
+  observation; the expected value is ~40–50 s.
+
 ## LATEST — margin probe last + light DX11 + diagnostics (2026-09-27 b)
 
 Per user answers: margin probe runs last on a reserved admission and is not counted in the

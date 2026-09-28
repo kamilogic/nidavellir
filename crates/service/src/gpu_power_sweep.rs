@@ -3291,7 +3291,7 @@ fn f2_evidence_provenance(
             ),
         ),
         RenderStressPurpose::Dx11Qualification(golden, anchor) => (
-            if anchor.is_some() {"dx11-game-v5/active-residency-heavy-variable-light"} else {"dx11-game-v3/offscreen-rgba8-texture-depth-compute-pipelined"}.to_owned(),
+            if anchor.is_some() {"dx11-game-v6/active-residency-heavy-variable-paced-light"} else {"dx11-game-v3/offscreen-rgba8-texture-depth-compute-pipelined"}.to_owned(),
             "stock-golden-fnv1-32/render+compute/readback-every-16-frames-pipelined".to_owned(),
             format!(
                 "source=stock;capture_ms={V8_GOLDEN_SAMPLE_MS};checksum={};compute_checksum={};adapter_luid={};frame_reference_us={}",
@@ -9789,6 +9789,13 @@ fn measure_multiclock_undervolt_forge(
         if recorded == Outcome::Qualified && next.id == "performance" && next.margin_probe_used && next.status == "margin_probe_waiting" {
             prog.log.push(format!(
                 "Topo {target} MHz @ {mv} mV qualificado. Teste de margem único em {} MHz @ {} mV reservado para a última admissão, depois das bandas econômicas; o topo só entra nos perfis se essa margem for provada.",
+                next.target_clock_mhz, next.voltage_mv
+            ));
+        }
+        if recorded == Outcome::Inconclusive && next.id == "performance" && next.status == "pending"
+            && next.target_clock_mhz < target {
+            prog.log.push(format!(
+                "Topo {target} MHz @ {mv} mV inconclusivo: sem prova e sem falha, o par não é aprovado nem condenado. Descida única desta run para {} MHz @ {} mV como nova hipótese de topo.",
                 next.target_clock_mhz, next.voltage_mv
             ));
         }

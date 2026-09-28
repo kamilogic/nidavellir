@@ -24,7 +24,8 @@ const COMPUTE_ELEMENTS: u32 = 65_536;
 const GOLDEN_MIN_CHECKS: u32 = 3;
 const CHECK_INTERVAL_FRAMES: u64 = 16;
 /// Heavy frame: four overlapping full-screen instances. Light frame: one (about a quarter of the
-/// pixel work) with the same compute dispatch, so it runs the target below the power cap.
+/// pixel work) with the same compute dispatch. Back-to-back it still saturates the GPU; the caller
+/// paces it to run the target below the power cap.
 const HEAVY_INSTANCES: u32 = 4;
 const LIGHT_INSTANCES: u32 = 1;
 const GPU_COMPLETION_TIMEOUT: Duration = Duration::from_millis(2_000);
@@ -398,8 +399,10 @@ impl Dx11Qualifier {
         self.run_with_golden_observed(duration_ms, golden, cancel, &mut |_| {})
     }
 
-    /// Reports submitted GPU work until its completion fence. CPU-only checksum work and idle
-    /// are excluded. The callback is diagnostic/coverage only and must not alter GPU settings.
+    /// Reports each batch from submission until its completion fence is observed. That fence is
+    /// issued after the previous batch is hashed, so a batch that finishes sooner idles inside its
+    /// interval (at most one checksum). Idle after the last batch is excluded. The callback is
+    /// diagnostic/coverage only and must not alter GPU settings.
     pub fn run_with_golden_observed(
         &self,
         duration_ms: u64,

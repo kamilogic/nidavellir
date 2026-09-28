@@ -1,6 +1,17 @@
 \# UI ↔ Backend Contract
 
-## 2026-09-27 (b): margin probe last, light DX11, clock×temp cells (current)
+## 2026-09-27 (c): paced light DX11 (current)
+
+ExactApply37, DX11 fingerprint `dx11-game-v6/active-residency-heavy-variable-paced-light`. No field
+changes. The light phase (`F2ActiveClockPhase.light`, index 5) now reports `requested_duty_pct`
+50 instead of 100 and runs 2/7 of the lane. DX11 phase `observed_active_us` counts back-to-back
+batches of one phase as one span, so it is higher than before for the same load.
+
+Additive: `ForgeDiscoveryBand.inconclusive_descent_used` (false). After an Inconclusive with no
+qualified clock, the performance band goes back to `pending` one clock bin lower at the same
+voltage, once per run. The UI can keep showing it as a normal pending band.
+
+## 2026-09-27 (b): margin probe last, light DX11, clock×temp cells
 
 ExactApply36 (Frontier32, Discovery9, search7 unchanged). Additive, legacy defaults:
 - `ForgeDiscoveryBand.status` may be `margin_probe_waiting`: the performance band's single margin

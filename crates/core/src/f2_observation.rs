@@ -162,7 +162,10 @@ pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 32;
 /// counts power-limited active time separately (`power_limited_active_ms`).
 /// v36 (2026-09-27): the DX11 lane adds a continuous light phase (one-instance frame, own stock
 /// golden) that must hold the exact target for 30 s, so DX11 itself exercises the pair.
-pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 36;
+/// v37 (2026-09-27): the light phase is paced at 50% duty with two lane shares, and back-to-back
+/// batches of one phase are credited as one span. Back-to-back light frames kept the GPU busy and
+/// power-limited, and ~8.7 ms batches capped the phase below 30 s.
+pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 37;
 
 /// Backward-compatible alias for callers that expose one latest profile-publication contract.
 /// Frontier qualification has an independent version because exact-Apply policy changes must not
@@ -399,8 +402,8 @@ pub struct F2ActiveTargetCoverage {
     /// held under the representative-load contract, reported apart from real target exposure.
     #[serde(default)]
     pub power_limited_active_ms: u64,
-    /// Exact-target time in the continuous light DX11 phase (ExactApply36): DX11 itself must
-    /// exercise the pair below the power cap, as a light game would.
+    /// Exact-target time in the paced light DX11 phase (ExactApply37): DX11 itself must exercise
+    /// the pair below the power cap, as a frame-capped light game would.
     #[serde(default)]
     pub light_target_active_ms: u64,
     pub required_target_ms: u64,
