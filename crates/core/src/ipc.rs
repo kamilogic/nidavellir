@@ -398,6 +398,14 @@ pub struct ForgeDiscoveryBand {
     /// Performance only: an Inconclusive unqualified top already took its one clock-bin descent.
     #[serde(default)]
     pub inconclusive_descent_used: bool,
+    /// First voltage that qualified at the band's current clock (search 9). For the performance
+    /// band this is the power-free voltage of the top.
+    #[serde(default)]
+    pub first_qualified_voltage_mv: Option<u32>,
+    /// Search 9: the band is testing its publication pair (the game-margin voltage above its
+    /// lowest pass); a pass publishes it without moving `last_qualified_*`.
+    #[serde(default)]
+    pub publishing: bool,
     pub last_qualified_clock_mhz: Option<u32>,
     pub last_qualified_voltage_mv: Option<u32>,
     /// Performance exploration alternates one lower voltage bin and one higher clock bin.

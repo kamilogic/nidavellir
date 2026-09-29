@@ -1,6 +1,21 @@
 # Nidavellir — Session Handoff
 
-## LATEST — staircase descent + one hot bin + TDR pause/resume (2026-09-28)
+## LATEST — game-margin compensation (2026-09-29, search 9)
+
+Godforge 1920@925 from the search-8 run TDR'd in Overwatch. The user's 1800@875 (stable) and
+1815@875 (Overwatch crash) calibrate the matrix as ~6 bins lenient.
+- Implemented, see decisions.md 2026-09-29:
+  - 36 mV game margin for publication;
+  - compensated top band with a verified margin pair;
+  - −5%/−10% levels from the compensated top, two-bin steps;
+  - balanced 2% lower-power tie rule;
+  - restore re-synthesis, so a field failure drops only its own pair.
+- Rust 712/3 ignored, release check clean, UI 18/18 + build. Uncommitted.
+- **After reboot:** the current run re-synthesizes to 1830@893 for all profiles. Apply it and play
+  with Safe Loop.
+- **Next Clean Run:** expect Godforge ≈1890@937, Balanced ≈1800@881, Deep Calm ≈1710@~850.
+
+## Previous — staircase descent + one hot bin + TDR pause/resume (2026-09-28)
 
 Run f2-forge-1790617016985 qualified 1920@937 and then stopped at 931: a one-bin hot ClockDrop at
 every clock. The user asked for a staircase.

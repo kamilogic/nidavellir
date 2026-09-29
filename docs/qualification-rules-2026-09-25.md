@@ -1,7 +1,23 @@
 # Descoberta e desqualificação de pontos — contrato de 25/09/2026
 
-Implementação atual: Discovery 10, Frontier 33, Exact Apply 38, busca 8 (28/09). Este documento
+Implementação atual: Discovery 10, Frontier 33, Exact Apply 38, busca 9 (29/09). Este documento
 substitui as regras de residência/energia e a ordem de busca de 24/09. A matriz de cargas continua 27.
+
+## Margem de jogo e topo compensado (29/09)
+
+O Godforge 1920@925 da busca 8 deu TDR no Overwatch. A calibração com o usuário: 1800@875 é estável
+sempre, e 1815@875 crasha o Overwatch em menos de 30 min. A matriz aprovou 1830@856, então é ~6 bins
+mais branda que jogos.
+- **Margem de jogo:** perfil só com outro par aprovado ≥36 mV abaixo no mesmo clock.
+- **Topo compensado:** se a menor tensão aprovada no topo + 36 mV passa da tensão de potência, o
+  clock desce (~10 mV por bin).
+  - O par de margem (tensão de potência − 36 mV) precisa passar; depois o par publicado recebe a
+    própria matriz.
+  - Se o par de margem falhar, desce um bin, no máximo duas vezes.
+- **Degraus:** −5%/−10% do topo compensado, descendo 2 bins por admissão. O par de publicação acima
+  da faixa testada ganha admissão própria.
+- **Balanceado:** a menos de 2% de clock do escolhido, o de menor potência vence.
+- **Falha de campo:** a restauração ressintetiza os perfis e remove só o par condenado.
 
 ## Escada de descida e bin térmico (28/09)
 

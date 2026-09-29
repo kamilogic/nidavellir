@@ -1,6 +1,24 @@
 \# UI ↔ Backend Contract
 
-## 2026-09-28: staircase search 8, one hot bin held (current)
+## 2026-09-29: game-margin compensation, search 9 (current)
+
+Search VERSION 9: a v8 checkpoint cannot resume. Contracts unchanged (Discovery10, Frontier33,
+ExactApply38). Additive only.
+- **New band `compensated`:** placed after `performance`, labeled "Game-margin top".
+  - First status is `waiting_for_top`.
+  - It then either closes (`compensation_not_needed`, `compensated_top_unavailable`) or tests its
+    margin pair and then its publication pair (`published`).
+- **`ForgeDiscoveryBand.first_qualified_voltage_mv`** (null): the first voltage that qualified at
+  the band's clock. For `performance` it is the power-free voltage.
+- **`ForgeDiscoveryBand.publishing`** (false): the band is testing its publication pair. The UI
+  shows "Publication check".
+- **New stop reasons:** `published`, `publication_unproven`, `compensation_not_needed`,
+  `compensated_top_unavailable`.
+- **Profiles:** a profile needs another pass ≥36 mV lower at its clock. On load, the service may
+  re-synthesize `godforge`/`brokkrs`/`deep_calm` from the run's evidence, so a field-condemned
+  pair no longer blocks the other profiles.
+
+## 2026-09-28: staircase search 8, one hot bin held
 
 Search VERSION 8: a v7 checkpoint cannot resume. Contracts: Discovery10, Frontier33, ExactApply38. No
 field removals.

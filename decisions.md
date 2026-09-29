@@ -1,5 +1,46 @@
 # Nidavellir — Decision Log
 
+## 2026-09-29 — game-margin compensation (search 9)
+
+Run f2-forge-1790664558111 (search 8) published Godforge 1920@925, Brokkr's 1830@862 and Deep Calm
+1740@837, each one bin above the lowest pass. The test edges were Endurance silent errors at
+1920@912 and 1830@850.
+- **Field failure:** Godforge TDR'd in Overwatch after ~23 min (nvlddmkm-153; hang signature:
+  1920 MHz, 100% utilization, power 187 → 61 W). In the trace it held exactly 1920@925 at
+  74–78 °C, 180–190 W, not power-limited.
+- **Same regime in test and use:** qualification and profile Apply both lock the voltage at the
+  anchor with a 1920 MHz ceiling (an earlier "regime mismatch" claim was wrong and withdrawn). The
+  matrix passed 1920@918 exactly at ≥74 °C and still missed what Overwatch triggers at 925.
+- **User's field references:** 1800@875 is permanently stable (daily use, all games); 1815@875
+  crashes Overwatch in under 30 min. The matrix approved 1830@856 and 1830@862, both harsher.
+- **Conclusion:** the matrix is ~5–6 bins less sensitive than real games near 1800–1830 MHz.
+
+Decisions (user asked for a compensation, then for these solutions):
+- **Game margin** `GAME_MARGIN_MV = 36` (six 6.25 mV bins). A pair is publishable only when a pair
+  ≥36 mV lower at the same clock holds a complete proof in the run (replaces the one-bin rule).
+  - Calibration: 1830 must exceed ~885 mV in games (from 1815@875 plus the ~10 mV per clock bin
+    slope). 856 + 36 → 893 lands one bin above that, the same margin as the user's daily undervolt.
+  - Along that slope, 1830@893 ≈ 1800@872.
+- **Compensated top** (new band `compensated`, after the top):
+  - Trigger: the top's lowest pass + 36 mV exceeds its power-free voltage.
+  - Prediction: the clock drops by the deficit at ~10 mV per 15 MHz bin (measured slope).
+  - Verification: the margin pair (power-free − 36 mV) must pass, then the publication pair
+    (power-free voltage) gets its own matrix. It is dominated by the top, so a failure there stops
+    the search.
+  - A failed margin pair steps one clock bin down, at most twice.
+- **Lower levels:** −5%/−10% of the compensated top (1800/1710 here, not 1830/1740). They start at
+  the level above's lowest pass and descend two bins per admission to stay within 24 admissions
+  (~21 expected). A publication pair above the tested range gets its own admission.
+- **Balanced tie rule:** after max R, the lowest-power eligible pair within 2% of that clock wins
+  (1830@893 was +1.7% clock for +3.8% power over 1800@875 in PowerRender).
+- **Field failure scope:** restore re-synthesizes the profile set from the run's proofs under the
+  current rule. A condemned pair drops out alone, and older runs gain the margin. From this run
+  it yields 1830@893 for all three profiles.
+- **Unchanged:** contracts Discovery10/Frontier33/ExactApply38 (the evidence semantics are the
+  same). Search VERSION 9; a v8 checkpoint cannot resume.
+- **Risk:** calibrated on one GPU, one driver and mainly Overwatch. The margin is a conservative
+  default for other GPUs, backed by Safe Loop field protection.
+
 ## 2026-09-28 — staircase descent, one hot bin held, TDR pause/resume (search 8)
 
 Run f2-forge-1790617016985 qualified 1920@937 (the DX11 fix held), then 1830@937 and 1740@937. All

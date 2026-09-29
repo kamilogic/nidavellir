@@ -1,6 +1,23 @@
 # Nidavellir — Project Memory
 
-## Current — staircase descent (2026-09-28, search 8, ExactApply38)
+## Current — game-margin compensation (2026-09-29, search 9)
+
+- **The search-8 run worked, but its profiles were too thin.** Godforge 1920@925 (two bins above
+  the test edge) TDR'd in Overwatch after ~23 min. The user's references: 1800@875 is permanently
+  stable, 1815@875 crashes Overwatch in under 30 min. The matrix approved 1830@856, so it is ~6
+  bins less sensitive than games.
+- **Now:**
+  - Profiles need a pass ≥36 mV lower at the same clock.
+  - Compensated top: the clock drops until the margin fits under the power-free voltage, with
+    the margin pair verified.
+  - The −5%/−10% levels follow the compensated top and use two-bin steps.
+  - Balanced prefers lower power within 2%.
+  - Restore re-synthesizes profiles, so a field failure drops only its own pair.
+- **From the current run's proofs:** 1830@893 for all three profiles (≈ the user's 1800@875).
+- **Expected next run:** Godforge ≈1890@937, Balanced ≈1800@881, Deep Calm ≈1710@~850.
+- **Open:** the margin is calibrated on one GPU; test and field protection remain the backstop.
+
+## Previous — staircase descent (2026-09-28, search 8, ExactApply38)
 
 - Run 1790617016985: the DX11 fix worked (1920@937 qualified).
   - The old bands then wasted admissions at 937 and died at 931: a one-bin hot ClockDrop at all

@@ -282,11 +282,12 @@
   }
 
   function bandLabel(id) {
-    return { performance: "Performance", balanced: "Balance", efficiency: "Efficiency" }[id] ?? id;
+    return { performance: "Performance", compensated: "Game-margin top", balanced: "Balance", efficiency: "Efficiency" }[id] ?? id;
   }
 
-  function bandStatus(status) {
-    return { waiting_for_top: "Waiting for the level above", pending: "Pending", in_flight: "Testing", closed: "Closed" }[status] ?? "Pending";
+  function bandStatus(band) {
+    if (band.publishing && band.status !== "closed") return "Publication check";
+    return { waiting_for_top: "Waiting for the level above", pending: "Pending", in_flight: "Testing", closed: "Closed" }[band.status] ?? "Pending";
   }
 
   function searchStopReason(reason) {
@@ -313,6 +314,10 @@
       dominated_pair_failed: "A pair already covered by a higher clock failed. The evidence is inconsistent, so the search stopped.",
       clock_level_exhausted: "No clock bin lies below the previous level at this step.",
       tdr_budget_exhausted: "Another Resume would exceed the driver-reset limit, so the run published its proven pairs.",
+      compensation_not_needed: "The top already holds the game margin below its power-free voltage.",
+      compensated_top_unavailable: "No lower top clock proved the game margin. The lower levels start from the top's lowest passing voltage.",
+      published: "Its publication pair, a game margin above the lowest passing voltage, passed its own matrix.",
+      publication_unproven: "Its publication pair could not be proven, so this level publishes no profile.",
       invalid_search_plan: "The candidate search plan is incomplete or invalid. A new compatible run is required.",
       incompatible_search_version: "This saved search uses a different discovery version. Start a new run.",
     };
@@ -626,7 +631,7 @@
         <ul class="search-bands">
           {#each searchBands as band}
             <li class:closed={band.status === "closed"}>
-              <strong>{bandLabel(band.id)} <span>· {bandStatus(band.status)}</span></strong>
+              <strong>{bandLabel(band.id)} <span>· {bandStatus(band)}</span></strong>
               {#if band.last_qualified_clock_mhz > 0 && band.last_qualified_voltage_mv > 0}
                 <p>Qualified: {band.last_qualified_clock_mhz} MHz @ {band.last_qualified_voltage_mv} mV</p>
               {:else}

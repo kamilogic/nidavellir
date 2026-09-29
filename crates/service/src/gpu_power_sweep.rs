@@ -2580,26 +2580,13 @@ fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
                     return Some(prog);
                 }
             };
-            let profiles = [prog.godforge, prog.brokkrs, prog.deep_calm];
             let observations =
                 nidavellir_core::f2_observation::F2ObservationStore::system().load_all();
             let current_condemned = if prog.is_undervolt && prog.profiles_qualified {
                 match current_f2_condemned_pairs(&safe_store, gpu_key) {
                     Ok(condemned) => {
-                        if f2_profile_set_has_field_failure(
-                            &safe_record,
-                            &condemned,
-                            &profiles,
-                            &observations,
-                            prog.run_id.as_deref(),
-                            gpu_key,
-                        ) {
-                            prog.profiles_qualified = false;
-                            prog.phase = "field_rejected".into();
-                            prog.note = Some(
-                                "Um perfil restaurado foi condenado por evidência durável/cone TDR atual; execute Forge novamente para ressintetizar acima da fronteira de campo."
-                                    .into(),
-                            );
+                        if f2_resynthesize_restored_profiles(&mut prog, &safe_store, &observations, gpu_key, &condemned) {
+                            save_forge_state(gpu_key, &prog);
                         }
                         Some(condemned)
                     }
@@ -2623,6 +2610,7 @@ fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
                         .into(),
                 );
             }
+            let profiles = [prog.godforge, prog.brokkrs, prog.deep_calm];
             if prog.is_undervolt && prog.profiles_qualified {
                 let restored_proof_ok = prog.run_id.as_deref().is_some_and(|run_id| {
                     current_condemned.as_ref().is_some_and(|condemned| {
@@ -5432,15 +5420,28 @@ fn synthesize_forge_profiles_capped(
             0.0
         }
     };
+    let brokkrs_eligible = |p: &PowerSweepPoint| {
+        let s = sustained(p) as f64;
+        s >= br_floor && s < gc && (profile_power(p) as f64) < gp
+    };
+    let brokkrs = pool
+        .iter()
+        .copied()
+        .filter(|(p, _)| brokkrs_eligible(p))
+        .max_by(|a, b| r_of(&a.0).partial_cmp(&r_of(&b.0)).unwrap_or(Ord::Equal))
+        .unwrap_or(godforge);
+    // User decision 2026-09-29: within 2% of that clock the lower-power pair wins (1830@893 was
+    // +1.7% clock for +3.8% power over 1800@875).
     let brokkrs = pool
         .iter()
         .copied()
         .filter(|(p, _)| {
-            let s = sustained(p) as f64;
-            s >= br_floor && s < gc && (profile_power(p) as f64) < gp
+            brokkrs_eligible(p)
+                && sustained(p) as f64 >= sustained(&brokkrs.0) as f64 * 0.98
+                && profile_power(p) < profile_power(&brokkrs.0)
         })
-        .max_by(|a, b| r_of(&a.0).partial_cmp(&r_of(&b.0)).unwrap_or(Ord::Equal))
-        .unwrap_or(godforge);
+        .min_by(|a, b| profile_power(&a.0).partial_cmp(&profile_power(&b.0)).unwrap_or(Ord::Equal))
+        .unwrap_or(brokkrs);
 
     log.push(format!(
         "FORGE: Godforge {}MHz/{:.0}W · Brokkr's {}MHz/{:.0}W (R={:.2}, floor {:.0}%) · \
@@ -8605,17 +8606,20 @@ fn f2_set_run_points(prog: &mut PowerSweepProgress, points: &[(PowerSweepPoint, 
         .max();
 }
 
-/// Margin (2026-09-27): a pair is publishable only when a lower voltage at the same clock also
-/// holds a complete proof in this run, so no profile sits on the lowest bin that passed.
+/// Game margin (2026-09-29): a pair is publishable only when a pair at least
+/// [`crate::qualified_search::GAME_MARGIN_MV`] lower, at the same clock, also holds a complete proof
+/// in this run. Our matrix approves ~six bins below what games sustain (field calibration).
 #[cfg(windows)]
 fn f2_margin_proven(points: &[(PowerSweepPoint, f64)]) -> Vec<(PowerSweepPoint, f64)> {
+    let margin = crate::qualified_search::GAME_MARGIN_MV;
     points
         .iter()
         .copied()
         .filter(|(p, _)| {
             points.iter().any(|(q, _)| {
                 q.target_clock_mhz == p.target_clock_mhz
-                    && q.vf_table_voltage_mv.zip(p.vf_table_voltage_mv).is_some_and(|(lower, mv)| lower < mv)
+                    && q.vf_table_voltage_mv.zip(p.vf_table_voltage_mv)
+                        .is_some_and(|(lower, mv)| lower + margin <= mv)
             })
         })
         .collect()
@@ -8633,8 +8637,9 @@ fn f2_publish_run_profiles(
     let proven = f2_margin_proven(points);
     if proven.len() < points.len() {
         prog.log.push(format!(
-            "FORGE: {} par(es) no bin mais baixo aprovado do seu clock ficaram fora dos perfis (margem de 1 bin).",
-            points.len() - proven.len()
+            "FORGE: {} par(es) sem margem de jogo ficaram fora dos perfis (é preciso outro par aprovado ≥{} mV abaixo no mesmo clock).",
+            points.len() - proven.len(),
+            crate::qualified_search::GAME_MARGIN_MV
         ));
     }
     let profiles = synthesize_forge_profiles_capped(&proven, &ForgePolicy::balanced(), cap);
@@ -8650,6 +8655,59 @@ fn f2_publish_run_profiles(
         &[prog.godforge, prog.brokkrs, prog.deep_calm],
         ForgePolicy::balanced().confidence_threshold,
     );
+}
+
+/// Restore (2026-09-29): rebuild the profile set from the run's complete proofs under the current
+/// publication rule. A field failure then removes only its own pair and the rest stay applicable;
+/// a run published before the game margin gains it. Stored evidence only, no hardware work.
+/// Returns whether the profile set changed; the caller persists it.
+#[cfg(windows)]
+fn f2_resynthesize_restored_profiles(
+    prog: &mut PowerSweepProgress,
+    store: &SafeLoopStore,
+    observations: &[F2Observation],
+    gpu_key: &str,
+    condemned: &nidavellir_core::condemnation::CondemnedPairs,
+) -> bool {
+    let (Some(run_id), Some(mode)) = (prog.run_id.clone(), prog.mode.as_deref().and_then(PowerSweepMode::from_id))
+    else {
+        return false;
+    };
+    let keys = |prog: &PowerSweepProgress| {
+        [prog.godforge, prog.brokkrs, prog.deep_calm].map(|point| point.as_ref().and_then(f2_apply_key))
+    };
+    let before = keys(prog);
+    let log_len = prog.log.len();
+    match f2_run_profile_points(store, observations, &run_id, gpu_key, condemned) {
+        Ok(points) => {
+            let cap = prog.power_limit_w;
+            f2_publish_run_profiles(prog, &points, cap, mode.f2_policy());
+        }
+        Err(error) => {
+            prog.profiles_qualified = false;
+            prog.phase = "field_rejected".into();
+            prog.note = Some(format!("Perfis restaurados bloqueados: provas da run ilegíveis ({error})."));
+            return false;
+        }
+    }
+    if prog.godforge.is_none() {
+        prog.profiles_qualified = false;
+        prog.phase = "field_rejected".into();
+        prog.note = Some(
+            "Nenhum par desta run tem a margem de jogo fora das falhas de campo; execute uma nova Forge.".into(),
+        );
+    }
+    let after = keys(prog);
+    if after == before {
+        prog.log.truncate(log_len);
+        return false;
+    }
+    let fmt = |key: Option<(u32, u32)>| key.map_or("—".to_string(), |(clock, mv)| format!("{clock}@{mv}"));
+    prog.log.push(format!(
+        "FORGE: perfis ressintetizados das provas da run com a margem de jogo e as falhas de campo atuais: Godforge {} · Brokkr's {} · Deep Calm {}.",
+        fmt(after[0]), fmt(after[1]), fmt(after[2])
+    ));
+    true
 }
 
 /// A short pass cannot create this point. Reconstruct it from the same-run complete matrix and
@@ -9804,18 +9862,51 @@ fn measure_multiclock_undervolt_forge(
                 next.voltage_mv
             ));
         }
-        if let Some(edge @ ("integrity_edge" | "tdr_edge" | "evidence_boundary" | "voltage_floor_reached")) =
-            next.stop_reason.as_deref().filter(|_| next.status == "closed")
-        {
+        let margin = crate::qualified_search::GAME_MARGIN_MV;
+        let lowest = next.last_qualified_voltage_mv.map_or("nenhuma".into(), |v| format!("{v} mV"));
+        if next.status == "pending" && next.publishing {
             prog.log.push(format!(
-                "Degrau {target} MHz encerrado em {mv} mV ({edge}); menor tensão aprovada neste clock: {}.",
-                next.last_qualified_voltage_mv.map_or("nenhuma".into(), |v| format!("{v} mV"))
+                "{target} MHz @ {mv} mV: {recorded:?}. Par de publicação {} MHz @ {} mV (≥{margin} mV acima da menor tensão aprovada, {lowest}) recebe a própria matriz antes de virar perfil.",
+                next.target_clock_mhz, next.voltage_mv
             ));
-            if let Some(level) = discovery.bands.iter().find(|b| b.status == "pending") {
+        } else if next.id == "compensated" && next.status == "pending" && next.target_clock_mhz < target {
+            prog.log.push(format!(
+                "Par de margem {target} MHz @ {mv} mV não foi provado ({recorded:?}); o topo compensado desce para {} MHz @ {} mV.",
+                next.target_clock_mhz, next.voltage_mv
+            ));
+        }
+        if let Some(reason) = next.stop_reason.as_deref().filter(|_| next.status == "closed") {
+            match reason {
+                "integrity_edge" | "tdr_edge" | "evidence_boundary" | "voltage_floor_reached" => prog.log.push(format!(
+                    "Degrau {target} MHz encerrado em {mv} mV ({reason}); menor tensão aprovada neste clock: {lowest}."
+                )),
+                "published" => prog.log.push(format!(
+                    "Par de publicação {target} MHz @ {mv} mV qualificado, com margem de jogo sobre {lowest}."
+                )),
+                "compensated_top_unavailable" => prog.log.push(
+                    "Topo compensado não foi provado; os degraus abaixo partem da menor tensão aprovada no topo.".into(),
+                ),
+                _ => {}
+            }
+            if next.id == "performance"
+                && discovery.bands.iter().any(|b| b.stop_reason.as_deref() == Some("compensation_not_needed"))
+            {
                 prog.log.push(format!(
-                    "Próximo degrau: {} MHz @ {} mV (menor tensão aprovada no degrau anterior).",
-                    level.target_clock_mhz, level.voltage_mv
+                    "O topo {target} MHz já tem margem de jogo abaixo da tensão de potência; sem topo compensado."
                 ));
+            }
+            if let Some(level) = discovery.bands.iter().find(|b| b.status == "pending") {
+                prog.log.push(if level.id == "compensated" {
+                    format!(
+                        "Topo compensado pela margem de jogo: {} MHz; primeiro o par de margem {} mV (tensão de potência − {margin} mV), depois o par publicado.",
+                        level.target_clock_mhz, level.voltage_mv
+                    )
+                } else {
+                    format!(
+                        "Próximo degrau: {} MHz @ {} mV (menor tensão aprovada no degrau anterior).",
+                        level.target_clock_mhz, level.voltage_mv
+                    )
+                });
             }
         }
         if recorded == Outcome::Inconclusive && next.id == "performance" && next.status == "pending"
@@ -10335,13 +10426,16 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn margin_publishes_only_pairs_with_a_proven_lower_bin() {
+    fn margin_publishes_only_pairs_with_the_game_margin_below() {
         let pair = |clock, mv| (PowerSweepPoint {
             target_clock_mhz: Some(clock), vf_table_voltage_mv: Some(mv), ..Default::default()
         }, 0.95);
-        let kept: Vec<_> = f2_margin_proven(&[pair(1920, 937), pair(1830, 893), pair(1830, 887), pair(1830, 881)])
+        let kept: Vec<_> = f2_margin_proven(&[pair(1920, 937), pair(1920, 918), pair(1830, 893),
+            pair(1830, 887), pair(1830, 856)])
             .iter().map(|(point, _)| (point.target_clock_mhz.unwrap(), point.vf_table_voltage_mv.unwrap())).collect();
-        assert_eq!(kept, [(1830, 893), (1830, 887)], "unprobed top and the lowest pass stay out");
+        // Only a pair six bins (>=36 mV) above another pass at its clock: 893 over 856. 1920@937
+        // is only 19 mV above 918, the Godforge that TDR'd in Overwatch had 13 mV.
+        assert_eq!(kept, [(1830, 893)]);
     }
 
     #[cfg(windows)]
@@ -10383,6 +10477,62 @@ mod tests {
         assert_eq!(points(&condemned), [1920, 1830]);
         condemned.rigid.push((1830, 893)); // a cone covering it removes it from publication
         assert_eq!(points(&condemned), [1920]);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_resynthesis_drops_only_the_field_failed_pair_and_applies_the_game_margin() {
+        use nidavellir_core::f2_observation as obs;
+        // Run f2-forge-1790664558111: Godforge 1920@925 TDR'd in Overwatch. The other proofs stay.
+        let proven = |target: u32, mv: u32| {
+            let mut discovery = power_obs(target, mv, Some(170.0), true, Some(171), "gpu");
+            discovery.run_id = "restore-run".into();
+            discovery.outcome = obs::F2ObsOutcome::Validated;
+            discovery.discovery_contract_version = Some(obs::F2_DISCOVERY_CONTRACT_VERSION);
+            discovery.evidence_provenance = exact_apply_pass_obs(
+                "restore-run", "gpu", target, mv, obs::F2QualificationPattern::Texture,
+            ).evidence_provenance;
+            discovery.sample_count = Some(1000);
+            discovery.dwell_duration_ms = Some(10_000);
+            let mut lanes = vec![discovery];
+            for pattern in obs::REQUIRED_EXACT_APPLY_PATTERNS {
+                let mut lane = exact_apply_pass_obs("restore-run", "gpu", target, mv, pattern);
+                lane.dwell_duration_ms = Some(420_000);
+                lane.sample_count = Some(1000);
+                lanes.push(lane);
+            }
+            lanes
+        };
+        let observations: Vec<_> = [(1920, 937), (1920, 931), (1920, 925), (1920, 918), (1830, 893), (1830, 856)]
+            .into_iter().flat_map(|(target, mv)| proven(target, mv)).collect();
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("nidavellir-restore-resynthesis-{}-{unique}", std::process::id()));
+        let store = SafeLoopStore::new(&base);
+        store.save_record(&nidavellir_core::safe_loop::SafeLoopRecord::default()).unwrap();
+        let point = |target, mv| PowerSweepPoint {
+            target_clock_mhz: Some(target), vf_table_voltage_mv: Some(mv), ..Default::default()
+        };
+        let mut prog = idle();
+        prog.run_id = Some("restore-run".into());
+        prog.mode = Some(PowerSweepMode::Standard.id().into());
+        prog.is_undervolt = true;
+        prog.profiles_qualified = true;
+        prog.power_limit_w = 200.0;
+        prog.godforge = Some(point(1920, 925));
+        prog.brokkrs = Some(point(1830, 862));
+        let mut condemned = nidavellir_core::condemnation::CondemnedPairs::default();
+        condemned.rigid.push((1920, 925)); // field TDR floor: 1920 at or below 925 is refused
+        assert!(f2_resynthesize_restored_profiles(&mut prog, &store, &observations, "gpu", &condemned));
+        let key = |p: Option<PowerSweepPoint>| p.as_ref().and_then(f2_apply_key);
+        // 1920@937/931 have no pass 36 mV below them once 925/918 are refused; 1830@893 does (856).
+        assert_eq!([key(prog.godforge), key(prog.brokkrs), key(prog.deep_calm)],
+            [Some((1830, 893)); 3]);
+        assert!(prog.log.last().is_some_and(|line| line.contains("ressintetizados")));
+        // Deterministic: a second restore changes nothing and adds no log noise.
+        let log_len = prog.log.len();
+        assert!(!f2_resynthesize_restored_profiles(&mut prog, &store, &observations, "gpu", &condemned));
+        assert_eq!(prog.log.len(), log_len);
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -12246,11 +12396,12 @@ mod tests {
             1830,
             "Godforge = highest sustainable clock"
         );
-        // Brokkr's floor 0.98*1830 = 1793.4 → only 1815/1800 eligible; max R = 1815.
+        // Brokkr's floor 0.98*1830 = 1793.4 → only 1815/1800 eligible; max R = 1815, and 1800
+        // is within 2% of it with less power, so it wins (tie rule, 2026-09-29).
         assert_eq!(
             p.brokkrs.unwrap().clock_mhz,
-            1815,
-            "Brokkr's = best R within 98% floor"
+            1800,
+            "Brokkr's = best R within 98% floor, then the lower-power pair within 2%"
         );
         // Deep Calm floor 0.90*1830 = 1647 → all eligible; max MHz/W = 1740.
         assert_eq!(
@@ -12285,12 +12436,12 @@ mod tests {
             2880,
             "Godforge = highest sustainable clock"
         );
-        // Floor 0.98*2880 = 2822.4 → 2860/2840 eligible. Max-R rule: 2860 (R≈14.3) beats
-        // 2840 (R≈12.4) → principled choice is 2860 (stays nearest Godforge).
+        // Floor 0.98*2880 = 2822.4 → 2860/2840 eligible. Max R picks 2860 (R≈14.3 vs 12.4), but
+        // 2840 is within 2% with less power, so it wins (tie rule, 2026-09-29).
         assert_eq!(
             p.brokkrs.unwrap().clock_mhz,
-            2860,
-            "Brokkr's = max R within 98% floor"
+            2840,
+            "Brokkr's = max R within 98% floor, then the lower-power pair within 2%"
         );
         // Floor 0.90*2880 = 2592 → all eligible; max MHz/W = 2700.
         assert_eq!(
@@ -13361,7 +13512,7 @@ mod tests {
         );
         assert_eq!(r.frontier.len(), 5);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
-        assert_eq!(r.profiles.brokkrs.unwrap().clock_mhz, 1815);
+        assert_eq!(r.profiles.brokkrs.unwrap().clock_mhz, 1800, "lower power within 2% of max R");
         assert_eq!(r.profiles.deep_calm.unwrap().clock_mhz, 1740);
     }
 
@@ -13403,8 +13554,8 @@ mod tests {
         );
         assert_eq!(
             r.profiles.brokkrs.unwrap().clock_mhz,
-            2860,
-            "Brokkr's = max R within 98% floor"
+            2840,
+            "Brokkr's = max R within 98% floor, then the lower-power pair within 2%"
         );
         assert_eq!(
             r.profiles.deep_calm.unwrap().clock_mhz,
