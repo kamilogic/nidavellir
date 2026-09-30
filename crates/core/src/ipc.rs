@@ -406,6 +406,13 @@ pub struct ForgeDiscoveryBand {
     /// lowest pass); a pass publishes it without moving `last_qualified_*`.
     #[serde(default)]
     pub publishing: bool,
+    /// Search 10: the voltage a lower level started at (the lowest pass of the level above). The
+    /// level is a distinct profile only after two two-bin steps below it.
+    #[serde(default)]
+    pub level_start_voltage_mv: Option<u32>,
+    /// Search 10: clock bins a non-distinct lower level already dropped (at most two).
+    #[serde(default)]
+    pub clock_retries_used: u32,
     pub last_qualified_clock_mhz: Option<u32>,
     pub last_qualified_voltage_mv: Option<u32>,
     /// Performance exploration alternates one lower voltage bin and one higher clock bin.

@@ -10,11 +10,15 @@
 //! 3. The -5% and -10% levels of the compensated top start at the lowest voltage the level above
 //!    passed and descend in two-bin steps until the first failure. A publication pair above the
 //!    tested range gets its own admission.
+//! 4. Three distinct profiles (user decision 2026-09-30): a lower level must end two steps below
+//!    its start, else it retries one clock bin lower (at most two); one that never went below its
+//!    start publishes nothing.
 
 use nidavellir_core::ipc::{ForgeDiscoveryBand, ForgeDiscoverySearch};
 
-pub const VERSION: u32 = 9;
-pub const STANDARD_ATTEMPTS: u32 = 24;
+pub const VERSION: u32 = 10;
+/// Room for the distinct-profile clock retries; the time budget remains the hard cap.
+pub const STANDARD_ATTEMPTS: u32 = 30;
 pub const STANDARD_BUDGET_MS: u64 = 8 * 60 * 60 * 1_000;
 /// Games need about this much more voltage than the matrix approves (user decision 2026-09-29).
 /// 1830@856 passed the matrix, yet 1815@875 crashes Overwatch within 30 min and 1800@875 is the
@@ -29,6 +33,12 @@ const COMPENSATION_RETRIES: u32 = 2;
 /// Lower levels descend two bins per admission: their descent from the dominated start spans ~10
 /// bins, and the game margin absorbs a one-bin coarser edge.
 const LEVEL_STEP_BINS: usize = 2;
+/// A lower level is a distinct profile only this many steps below its start: with the game margin
+/// its publication then sits ~25 mV (~8 W on the test 3060 Ti) under the level above's.
+const DISTINCT_LEVEL_STEPS: usize = 2;
+/// A level that is not distinct retries one clock bin lower, at most this often. Keep the profile
+/// clock floors (Brokkr's 92%, Deep Calm 87% of Godforge) below the lowest retry.
+const LEVEL_CLOCK_RETRIES: u32 = 2;
 /// Lower clock levels after the (compensated) top, as (band id, percent of that top's clock).
 const LEVELS: [(&str, u64); 2] = [("balanced", 95), ("efficiency", 90)];
 
@@ -303,6 +313,7 @@ fn start_next_level(search: &mut ForgeDiscoverySearch, clock_bins: &[u32], volta
             .min()
             .filter(|c| *c < prev_clock);
         band.voltage_mv = prev_voltage;
+        band.level_start_voltage_mv = Some(prev_voltage);
         band.target_clock_mhz = clock.unwrap_or(prev_clock);
         band.clock_ceiling_mhz = band.target_clock_mhz;
         if clock.is_some() {
@@ -431,7 +442,7 @@ fn record_level(
         // The boot is dirty after a TDR (2026-07-22), so the caller stops this session. The
         // search stays open: after reboot and acknowledgement, Resume continues.
         Outcome::DriverFailure if descending => {
-            return finish_level(search, index, "tdr_edge", voltage_bins)
+            return finish_level(search, index, "tdr_edge", clock_bins, voltage_bins)
         }
         Outcome::DriverFailure => return close_all(search, "driver_failure_recovery_required"),
         Outcome::IntegrityError if dominated_start => {
@@ -439,11 +450,11 @@ fn record_level(
             return close_all(search, "dominated_pair_failed");
         }
         Outcome::IntegrityError if descending => {
-            return finish_level(search, index, "integrity_edge", voltage_bins)
+            return finish_level(search, index, "integrity_edge", clock_bins, voltage_bins)
         }
         // Missing proof ends only this level's descent; the pair is never claimed.
         Outcome::Inconclusive if descending => {
-            return finish_level(search, index, "evidence_boundary", voltage_bins)
+            return finish_level(search, index, "evidence_boundary", clock_bins, voltage_bins)
         }
         _ => {}
     }
@@ -475,7 +486,7 @@ fn record_level(
                     band.voltage_mv = voltage;
                     band.status = "pending".into();
                 }
-                None => finish_level(search, index, "voltage_floor_reached", voltage_bins),
+                None => finish_level(search, index, "voltage_floor_reached", clock_bins, voltage_bins),
             }
         }
         Outcome::PowerBound if band.id == "performance"
@@ -553,12 +564,44 @@ fn record_level(
 }
 
 /// A level's first failure or voltage floor. Its publication pair sits the game margin above the
-/// lowest pass. When the descent did not test it, the level qualifies it next (it is dominated by
-/// the level above); otherwise the level closes.
-fn finish_level(search: &mut ForgeDiscoverySearch, index: usize, reason: &str, voltage_bins: &[u32]) {
+/// lowest pass. A lower level short of two steps below its start would repeat (almost) the level
+/// above's voltage with less clock, so it first retries one clock bin lower from its lowest pass
+/// (dominated there); one that never went below its start publishes nothing. When the descent did
+/// not test the publication pair, the level qualifies it next; otherwise the level closes.
+fn finish_level(
+    search: &mut ForgeDiscoverySearch,
+    index: usize,
+    reason: &str,
+    clock_bins: &[u32],
+    voltage_bins: &[u32],
+) {
     let band = &mut search.bands[index];
-    let publication = band
-        .last_qualified_voltage_mv
+    let lowest = band.last_qualified_voltage_mv;
+    if band.id != "performance" {
+        let start = band.level_start_voltage_mv;
+        let distinct = lowest.zip(start).is_some_and(|(lowest, start)| {
+            nth_below(voltage_bins, start, DISTINCT_LEVEL_STEPS * LEVEL_STEP_BINS)
+                .is_some_and(|limit| lowest <= limit)
+        });
+        let lower_clock = clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max();
+        if !distinct && band.clock_retries_used < LEVEL_CLOCK_RETRIES {
+            if let (Some(clock), Some(mv)) = (lower_clock, lowest) {
+                band.clock_retries_used += 1;
+                band.target_clock_mhz = clock;
+                band.clock_ceiling_mhz = clock;
+                band.voltage_mv = mv;
+                band.first_qualified_voltage_mv = None;
+                band.last_qualified_clock_mhz = None;
+                band.last_qualified_voltage_mv = None;
+                band.status = "pending".into();
+                return;
+            }
+        }
+        if lowest.zip(start).is_none_or(|(lowest, start)| lowest >= start) {
+            return close_band(band, "no_distinct_profile");
+        }
+    }
+    let publication = lowest
         .and_then(|lowest| bin_at_or_above(voltage_bins, lowest + GAME_MARGIN_MV))
         .filter(|mv| {
             band.id != "performance" && band.first_qualified_voltage_mv.is_some_and(|start| *mv > start)
@@ -760,6 +803,77 @@ mod tests {
         assert!(state.bands[1].publishing);
         walk(&mut state, &clocks, &volts, IntegrityError);
         assert_eq!((state.stop_reason.as_deref(), state.integrity_errors), (Some("dominated_pair_failed"), 1));
+    }
+    #[test]
+    fn a_level_short_of_two_steps_retries_one_clock_bin_lower() {
+        use Outcome::*;
+        // Run 1790761502529 with the power fix: the top holds 906, Godforge publishes 1905@937 and
+        // the -5% level TDRs on its first step below 900.
+        let (mut state, clocks, volts) = staircase();
+        let mut trace = walk_all(&mut state, &clocks, &volts, &[
+            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
+            Qualified, Qualified,
+            Qualified, DriverFailure,
+        ]);
+        assert_eq!(state.stop_reason, None, "a TDR edge pauses with the search open");
+        let balanced = &state.bands[2];
+        assert_eq!((balanced.target_clock_mhz, balanced.voltage_mv, balanced.clock_retries_used), (1800, 900, 1));
+        assert_eq!((balanced.level_start_voltage_mv, balanced.last_qualified_voltage_mv), (Some(900), None));
+        trace.extend(walk_all(&mut state, &clocks, &volts, &[Qualified, Qualified, Qualified, IntegrityError, Qualified]));
+        assert_eq!(trace[9..], [
+            (2, 1815, 900), (2, 1815, 887),
+            // One clock bin lower from the lowest pass (dominated there). 875 is two steps below the
+            // start, so 875 + 36 mV = 912 is published.
+            (2, 1800, 900), (2, 1800, 887), (2, 1800, 875), (2, 1800, 862), (2, 1800, 912),
+        ]);
+        assert_eq!(state.bands[2].stop_reason.as_deref(), Some("published"));
+        let efficiency = &state.bands[3];
+        assert_eq!((efficiency.target_clock_mhz, efficiency.voltage_mv, efficiency.level_start_voltage_mv),
+            (1725, 875, Some(875)));
+    }
+    #[test]
+    fn retries_stop_after_two_clock_bins_and_publish_only_a_real_descent() {
+        use Outcome::*;
+        let (mut state, clocks, volts) = staircase();
+        walk_all(&mut state, &clocks, &volts, &[
+            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError, Qualified, Qualified,
+        ]);
+        let mut never = state.clone();
+        let trace = walk_all(&mut state, &clocks, &volts, &[
+            Qualified, IntegrityError, Qualified, IntegrityError, Qualified, Qualified, IntegrityError, Qualified,
+        ]);
+        assert_eq!(trace, [
+            (2, 1815, 900), (2, 1815, 887), (2, 1800, 900), (2, 1800, 887),
+            // Out of retries after one step: 887 + 36 mV = 925 still sits under Godforge's 937.
+            (2, 1785, 900), (2, 1785, 887), (2, 1785, 875), (2, 1785, 925),
+        ]);
+        assert_eq!((state.bands[2].stop_reason.as_deref(), state.bands[2].clock_retries_used), (Some("published"), 2));
+        assert_eq!(state.integrity_errors, 0, "edges never spend the integrity budget");
+        // Never below the start: no profile of its own; the -10% level starts from that lowest pass.
+        walk_all(&mut never, &clocks, &volts, &[
+            Qualified, IntegrityError, Qualified, IntegrityError, Qualified, IntegrityError,
+        ]);
+        assert_eq!(never.bands[2].stop_reason.as_deref(), Some("no_distinct_profile"));
+        assert_eq!((never.bands[3].target_clock_mhz, never.bands[3].voltage_mv), (1725, 900));
+    }
+    #[test]
+    fn a_retry_start_that_proves_nothing_never_claims_a_pair() {
+        use Outcome::*;
+        let (mut state, clocks, volts) = staircase();
+        walk_all(&mut state, &clocks, &volts, &[
+            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
+            Qualified, Qualified, Qualified, DriverFailure,
+        ]);
+        let mut power = state.clone();
+        // Missing proof at the retry's dominated start closes the level without a pass.
+        assert_eq!(walk(&mut state, &clocks, &volts, Inconclusive), (2, 1800, 900));
+        assert_eq!(state.bands[2].stop_reason.as_deref(), Some("evidence_incomplete_no_boundary_inferred"));
+        assert_eq!(state.bands[2].last_qualified_voltage_mv, None);
+        assert_eq!((state.bands[3].target_clock_mhz, state.bands[3].voltage_mv), (1725, 900));
+        // A power-bound start only prepares a lower voltage, still unproven.
+        walk(&mut power, &clocks, &volts, PowerBound);
+        let band = &power.bands[2];
+        assert_eq!((band.voltage_mv, band.status.as_str(), band.last_qualified_voltage_mv), (893, "pending", None));
     }
     #[test]
     fn power_bound_lowers_voltage_at_same_clock_without_promoting_evidence() {

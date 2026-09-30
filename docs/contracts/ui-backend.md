@@ -1,6 +1,22 @@
 \# UI ↔ Backend Contract
 
-## 2026-09-29: game-margin compensation, search 9 (current)
+## 2026-09-30: three distinct profiles, search 10 (current)
+
+Search VERSION 10: a v9 checkpoint cannot resume. Contracts unchanged (Discovery10, Frontier33,
+ExactApply38). Additive only.
+- **`ForgeDiscoveryBand.level_start_voltage_mv`** (null): the voltage a lower level started at (the
+  lowest pass of the level above).
+- **`ForgeDiscoveryBand.clock_retries_used`** (0): a lower level that did not end two steps below
+  its start moved one clock bin lower this many times (at most 2). The UI shows
+  "Lower clock try n/2" while it is open.
+- **New stop reason `no_distinct_profile`:** even two clock bins lower, the level never passed below
+  its start, so it publishes no profile of its own.
+- **Attempt budget:** 30 (was 24); the 8 h time budget is unchanged.
+- **Profiles:**
+  - Brokkr's floor is 92% of Godforge's clock (was 95%); Deep Calm's is 87% (was 90%).
+  - Deep Calm must draw less power than Brokkr's whenever such a pair exists.
+
+## 2026-09-29: game-margin compensation, search 9
 
 Search VERSION 9: a v8 checkpoint cannot resume. Contracts unchanged (Discovery10, Frontier33,
 ExactApply38). Additive only.

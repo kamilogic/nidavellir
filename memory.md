@@ -1,6 +1,26 @@
 # Nidavellir — Project Memory
 
-## Current — game-margin compensation (2026-09-29, search 9)
+## Current — three distinct profiles (2026-09-30, search 10)
+
+- **Run 1790761502529 (search 9, Full Reset → Clean) is paused after a TDR, not resumed.**
+  - Top 1920: lowest pass 906, 900 silent error.
+  - Compensated 1905@900 passed. Godforge 1905@937 was lost to a false p99 "anomaly": the
+    adjacent-bin rule was applied across 37 mV.
+  - The 1815 level took a real TDR at 887.
+- **Physics learned:** PowerRender p99 ≈ 184.7 W + 0.32 W/mV·(V−900) + 0.16 W per clock bin
+  (max residual 0.6 W). Power follows voltage, so a profile is only cheaper at a lower voltage.
+- **Now:**
+  - The p99 recheck compares only within 13 mV.
+  - Lower levels must end two steps below their start, else they retry up to two clock bins lower.
+    A level that never went below its start publishes nothing.
+  - Floors: Brokkr's 92%, Deep Calm 87%. Deep Calm draws less than Brokkr's.
+  - Attempt budget 30.
+- **Expected on the test card:** Godforge 1905@937; Brokkr's ~1785–1800 @ 912–925; Deep Calm
+  lower. The +36 mV margin keeps Brokkr's above the user's 1800@875.
+- **Open:** margin by failure class (TDR vs silent error) not adopted. The 1815@887 test TDR is 12 mV
+  above the field crash (1815@875).
+
+## Previous — game-margin compensation (2026-09-29, search 9)
 
 - **The search-8 run worked, but its profiles were too thin.** Godforge 1920@925 (two bins above
   the test edge) TDR'd in Overwatch after ~23 min. The user's references: 1800@875 is permanently

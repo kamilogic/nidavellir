@@ -119,6 +119,11 @@ const F2_VOLTAGE_AUTHORITY_MIN_SAMPLES: u32 = 3;
 const POWER_P99_RECHECK_ABS_W: f32 = 8.0;
 #[cfg(windows)]
 const POWER_P99_RECHECK_REL: f32 = 0.05;
+/// Only a neighbouring measurement (the two-bin step of the lower levels) is comparable: at ~2 W
+/// per 6.25 mV bin, a publication pair 37 mV above its margin pair is legitimately ~12 W hotter
+/// (run 1790761502529 lost Godforge 1905@937 to that false anomaly).
+#[cfg(windows)]
+const POWER_P99_RECHECK_MAX_DISTANCE_MV: u32 = 13;
 
 
 /// Adjacent p5 values must describe the same sustained-clock regime before power monotonicity is
@@ -1388,21 +1393,24 @@ fn f2_power_p99_pair_consistent(a: f32, b: f32) -> bool {
 }
 
 #[cfg(windows)]
-fn f2_power_p99_requires_recheck(previous: Option<(f32, u32)>, report: &F2StepReport) -> bool {
+fn f2_power_p99_requires_recheck(previous: Option<(f32, u32, u32)>, report: &F2StepReport) -> bool {
     f2_power_p99_requires_recheck_with(previous, report, f2_power_measurement_usable)
 }
 
 
+/// `previous` is the closest same-clock confirmed measurement: (p99 W, p5 MHz, anchor distance mV).
 #[cfg(windows)]
 fn f2_power_p99_requires_recheck_with(
-    previous: Option<(f32, u32)>,
+    previous: Option<(f32, u32, u32)>,
     report: &F2StepReport,
     usable: fn(&F2StepReport) -> bool,
 ) -> bool {
     if !usable(report) {
         return false;
     }
-    let Some((previous_p99, previous_p5)) = previous else {
+    let Some((previous_p99, previous_p5, _)) = previous
+        .filter(|(_, _, distance_mv)| *distance_mv <= POWER_P99_RECHECK_MAX_DISTANCE_MV)
+    else {
         return false;
     };
     let (Some(current_p99), Some(current_p5)) = (report.power_p99_w, report.p5_clock_mhz) else {
@@ -5135,7 +5143,7 @@ pub(crate) fn run_confirmed_f2_power_calibration(
             ))
         })
         .min_by_key(|(distance, _, _)| *distance)
-        .map(|(_, power_p99, p5)| (power_p99, p5));
+        .map(|(distance, power_p99, p5)| (power_p99, p5, distance));
 
     let mut ops = RealF2Ops {
         store,
@@ -6105,9 +6113,13 @@ mod tests {
     #[test]
     fn anomalous_adjacent_p99_step_requires_same_bin_recheck() {
         let report = power_report(160.0, 1890);
-        assert!(f2_power_p99_requires_recheck(Some((183.0, 1890)), &report));
-        assert!(!f2_power_p99_requires_recheck(Some((168.0, 1890)), &report));
-        assert!(!f2_power_p99_requires_recheck(Some((183.0, 1920)), &report));
+        assert!(f2_power_p99_requires_recheck(Some((183.0, 1890, 6)), &report));
+        assert!(f2_power_p99_requires_recheck(Some((183.0, 1890, 13)), &report), "two-bin level step");
+        assert!(!f2_power_p99_requires_recheck(Some((168.0, 1890, 6)), &report));
+        assert!(!f2_power_p99_requires_recheck(Some((183.0, 1920, 6)), &report));
+        // Run 1790761502529: publication 1905@937 (196.4 W) vs its margin pair 1905@900 (184.2 W).
+        let publication = power_report(196.4, 1905);
+        assert!(!f2_power_p99_requires_recheck(Some((184.2, 1905, 37)), &publication));
     }
 
     #[test]

@@ -1,7 +1,21 @@
 # Descoberta e desqualificação de pontos — contrato de 25/09/2026
 
-Implementação atual: Discovery 10, Frontier 33, Exact Apply 38, busca 9 (29/09). Este documento
+Implementação atual: Discovery 10, Frontier 33, Exact Apply 38, busca 10 (30/09). Este documento
 substitui as regras de residência/energia e a ordem de busca de 24/09. A matriz de cargas continua 27.
+
+## Três perfis distintos (30/09)
+
+A run 1790761502529 perdeu o Godforge 1905@937 num falso "p99 anômalo" e deu TDR em 1815@887.
+- **Recheck de potência:** só compara com uma medição a até 13 mV (dois bins) no mesmo clock. A
+  ~2 W por bin, um par 37 mV acima fica legitimamente ~12 W mais quente.
+- **Degraus distintos:** −5% e −10% precisam terminar dois degraus (4 bins) abaixo da tensão em
+  que começaram.
+  - Senão, descem um bin de clock a partir da menor tensão aprovada (par dominado), no máximo
+    duas vezes.
+  - Um degrau que nunca desceu abaixo do início não publica perfil (`no_distinct_profile`).
+- **Seleção:** o piso do Brokkr's é 92% do clock do Godforge e o do Deep Calm 87%. O Deep Calm
+  precisa gastar menos que o Brokkr's quando existe par assim.
+- **Orçamento:** 30 tentativas; o teto de 8 h continua.
 
 ## Margem de jogo e topo compensado (29/09)
 

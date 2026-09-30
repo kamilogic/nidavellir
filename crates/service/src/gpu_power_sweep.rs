@@ -4886,13 +4886,13 @@ struct ForgePolicy {
 #[cfg(windows)]
 #[allow(dead_code)] // conservative/aggressive wired by F1b Phase 2 (profile selector)
 impl ForgePolicy {
-    /// Default daily-use policy: Brokkr's >= 95% clock, Deep Calm >= 90% clock, gate .85.
-    /// Brokkr's floor relaxed 0.98 -> 0.95 so the knee can sit a little deeper (up to 5% clock
-    /// traded for much larger efficiency gains) without colliding into Deep Calm's 90% floor.
+    /// Default daily-use policy: Brokkr's >= 92% clock, Deep Calm >= 87% clock, gate .85.
+    /// The search's -5%/-10% levels may drop two clock bins to stay distinct (2026-09-30), so
+    /// each floor sits below its level's lowest retry and Brokkr's stays above Deep Calm's level.
     fn balanced() -> Self {
         Self {
-            brokkrs_min_clock_frac: 0.95,
-            deep_calm_min_clock_frac: 0.90,
+            brokkrs_min_clock_frac: 0.92,
+            deep_calm_min_clock_frac: 0.87,
             confidence_threshold: 0.85,
         }
     }
@@ -5250,7 +5250,8 @@ fn synthesize_forge_profiles(
 ///   among points that keep ≥ `policy.brokkrs_min_clock_frac` of Godforge's clock
 ///   (so Brokkr's stays near Godforge and never collapses into Deep Calm). Max R wins.
 /// - **Deep Calm** = best MHz/W among points that keep ≥ `policy.deep_calm_min_clock_frac`
-///   of Godforge's clock (so it stays useful, never a near-idle clock).
+///   of Godforge's clock (so it stays useful, never a near-idle clock), restricted to points
+///   drawing less than Brokkr's whenever one exists.
 ///
 /// Sustainability uses `p5_clock_mhz` when present (dip-aware), else `clock_mhz`
 /// (legacy fallback). Selection uses clock / power / p5 / confidence ONLY — NEVER
@@ -5395,19 +5396,6 @@ fn synthesize_forge_profiles_capped(
         ));
     }
 
-    // Deep Calm = best MHz/W within the Deep Calm clock floor (stays useful).
-    let dc_floor = gc * policy.deep_calm_min_clock_frac;
-    let deep_calm = pool
-        .iter()
-        .copied()
-        .filter(|(p, _)| sustained(p) as f64 >= dc_floor)
-        .max_by(|a, b| {
-            efficiency(&a.0)
-                .partial_cmp(&efficiency(&b.0))
-                .unwrap_or(Ord::Equal)
-        })
-        .unwrap_or(godforge);
-
     // Brokkr's = best R within the Brokkr's clock floor; must be a real trade (clock
     // below Godforge AND less power). Falls back to Godforge if no such point exists.
     let br_floor = gc * policy.brokkrs_min_clock_frac;
@@ -5442,6 +5430,19 @@ fn synthesize_forge_profiles_capped(
         })
         .min_by(|a, b| profile_power(&a.0).partial_cmp(&profile_power(&b.0)).unwrap_or(Ord::Equal))
         .unwrap_or(brokkrs);
+
+    // Deep Calm = best MHz/W within the Deep Calm clock floor (stays useful). User decision
+    // 2026-09-30: when a point draws less than Brokkr's it must be one of those (three distinct
+    // profiles; on a board whose power follows voltage, MHz/W alone favours the higher clock).
+    let dc_floor = gc * policy.deep_calm_min_clock_frac;
+    let calm = |below_brokkrs: bool| {
+        pool.iter()
+            .copied()
+            .filter(|(p, _)| sustained(p) as f64 >= dc_floor)
+            .filter(|(p, _)| !below_brokkrs || profile_power(p) < profile_power(&brokkrs.0))
+            .max_by(|a, b| efficiency(&a.0).partial_cmp(&efficiency(&b.0)).unwrap_or(Ord::Equal))
+    };
+    let deep_calm = calm(true).or_else(|| calm(false)).unwrap_or(godforge);
 
     log.push(format!(
         "FORGE: Godforge {}MHz/{:.0}W · Brokkr's {}MHz/{:.0}W (R={:.2}, floor {:.0}%) · \
@@ -9874,6 +9875,15 @@ fn measure_multiclock_undervolt_forge(
                 "Par de margem {target} MHz @ {mv} mV não foi provado ({recorded:?}); o topo compensado desce para {} MHz @ {} mV.",
                 next.target_clock_mhz, next.voltage_mv
             ));
+        } else if next.id != "performance" && next.status == "pending" && next.target_clock_mhz < target {
+            prog.log.push(format!(
+                "Degrau {target} MHz terminou em {} mV, menos de 2 degraus abaixo do início ({} mV): o perfil não seria distinto do nível de cima. Tentativa {}/2 um bin de clock abaixo: {} MHz @ {} mV.",
+                next.voltage_mv,
+                next.level_start_voltage_mv.unwrap_or(next.voltage_mv),
+                next.clock_retries_used,
+                next.target_clock_mhz,
+                next.voltage_mv
+            ));
         }
         if let Some(reason) = next.stop_reason.as_deref().filter(|_| next.status == "closed") {
             match reason {
@@ -9886,6 +9896,10 @@ fn measure_multiclock_undervolt_forge(
                 "compensated_top_unavailable" => prog.log.push(
                     "Topo compensado não foi provado; os degraus abaixo partem da menor tensão aprovada no topo.".into(),
                 ),
+                "no_distinct_profile" => prog.log.push(format!(
+                    "Degrau {target} MHz não desceu abaixo do início ({} mV) nem com os bins de clock extras; sem perfil próprio neste nível.",
+                    next.level_start_voltage_mv.unwrap_or(mv)
+                )),
                 _ => {}
             }
             if next.id == "performance"
@@ -12498,35 +12512,45 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn balanced_policy_relaxed_brokkrs_floor_to_95() {
-        // The default daily-use policy relaxed Brokkr's floor 0.98 → 0.95 (Deep Calm stays 0.90).
+    fn balanced_policy_floors_cover_two_clock_bin_retries() {
+        // 2026-09-30: the -5%/-10% levels may drop two clock bins to stay distinct, so the floors
+        // sit below the lowest retry (95% → 92%, 90% → 87%) and Brokkr's stays above Deep Calm's.
         let b = ForgePolicy::balanced();
-        assert_eq!(
-            b.brokkrs_min_clock_frac, 0.95,
-            "Brokkr's floor relaxed to 95%"
-        );
-        assert_eq!(
-            b.deep_calm_min_clock_frac, 0.90,
-            "Deep Calm floor unchanged at 90%"
-        );
+        assert_eq!(b.brokkrs_min_clock_frac, 0.92);
+        assert_eq!(b.deep_calm_min_clock_frac, 0.87);
     }
 
     #[cfg(windows)]
     #[test]
     fn f1b_deep_calm_floor_boundary() {
-        // Godforge 2000; Deep Calm floor 0.90 = 1800. 1799 has the best MHz/W but is below
+        // Godforge 2000; Deep Calm floor 0.87 = 1740. 1739 has the best MHz/W but is below
         // the floor → excluded; best within floor (1850) wins.
         let frontier = vec![
             (fp(2000, 200.0), 0.95), // 10.0 MHz/W
             (fp(1850, 150.0), 0.95), // 12.33 MHz/W (within floor)
-            (fp(1799, 100.0), 0.95), // 17.99 MHz/W but below the 1800 floor
+            (fp(1739, 100.0), 0.95), // 17.39 MHz/W but below the 1740 floor
         ];
         let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
         assert_eq!(
             p.deep_calm.unwrap().clock_mhz,
             1850,
-            "below 90% floor excluded despite best MHz/W"
+            "below 87% floor excluded despite best MHz/W"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deep_calm_steps_below_brokkrs_when_the_board_power_follows_voltage() {
+        // Run 1790761502529 shape: power barely moves with clock, so MHz/W alone would pick the
+        // higher clock. Brokkr's 1800 (187 W); 1725 @ 186 W is a real further step down.
+        let frontier = vec![
+            (fp(1905, 196.0), 0.95), // Godforge, 9.72 MHz/W
+            (fp(1800, 187.0), 0.95), // Brokkr's, 9.63 MHz/W
+            (fp(1725, 186.0), 0.95), // 9.27 MHz/W, but less power than Brokkr's
+        ];
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        let clocks = [p.godforge, p.brokkrs, p.deep_calm].map(|point| point.unwrap().clock_mhz);
+        assert_eq!(clocks, [1905, 1800, 1725]);
     }
 
     // ── F1b power-bound collapse classification (audit patch) ───────────────────────────────────

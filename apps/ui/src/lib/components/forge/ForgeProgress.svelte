@@ -287,6 +287,7 @@
 
   function bandStatus(band) {
     if (band.publishing && band.status !== "closed") return "Publication check";
+    if (band.clock_retries_used > 0 && band.status !== "closed") return `Lower clock try ${band.clock_retries_used}/2`;
     return { waiting_for_top: "Waiting for the level above", pending: "Pending", in_flight: "Testing", closed: "Closed" }[band.status] ?? "Pending";
   }
 
@@ -318,6 +319,7 @@
       compensated_top_unavailable: "No lower top clock proved the game margin. The lower levels start from the top's lowest passing voltage.",
       published: "Its publication pair, a game margin above the lowest passing voltage, passed its own matrix.",
       publication_unproven: "Its publication pair could not be proven, so this level publishes no profile.",
+      no_distinct_profile: "Even two clock bins lower, this level never passed below the voltage it started at, so it publishes no profile of its own.",
       invalid_search_plan: "The candidate search plan is incomplete or invalid. A new compatible run is required.",
       incompatible_search_version: "This saved search uses a different discovery version. Start a new run.",
     };

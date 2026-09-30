@@ -1,6 +1,28 @@
 # Nidavellir — Session Handoff
 
-## LATEST — game-margin compensation (2026-09-29, search 9)
+## LATEST — three distinct profiles (2026-09-30, search 10)
+
+Run f2-forge-1790761502529 is paused after a TDR at 1815@887. It lost Godforge 1905@937 to a false
+p99 anomaly; see decisions.md 2026-09-30.
+- **Implemented:**
+  - p99 recheck only within 13 mV;
+  - lower levels must end two steps below their start, else they retry up to two clock bins lower;
+  - `no_distinct_profile`;
+  - floors: Brokkr's 92%, Deep Calm 87%; Deep Calm draws less than Brokkr's;
+  - attempt budget 30;
+  - UI labels.
+- **Validation:** Rust 716/3 ignored, release check clean, UI 18/18 + build. Uncommitted. Safety
+  audit GO, no blockers.
+- **Known limit:** if a retry's first pair is inconclusive (for example excluded by safety history),
+  the level closes without a profile, even when the clock above had a weak one.
+- **Next:**
+  1. Reboot and acknowledge the incident. Do not Resume: v9 cannot resume under search 10.
+  2. Rebuild with the BAT.
+  3. Full Reset → Clean Run. The user always validates as a new user's first run, from zero
+     evidence, so 1815@887 may TDR again and exercise the clock retry.
+- **Expected:** Godforge 1905@937, Brokkr's ~1785–1800 @ 912–925, a lower Deep Calm; ~5–6 h.
+
+## Previous — game-margin compensation (2026-09-29, search 9)
 
 Godforge 1920@925 from the search-8 run TDR'd in Overwatch. The user's 1800@875 (stable) and
 1815@875 (Overwatch crash) calibrate the matrix as ~6 bins lenient.

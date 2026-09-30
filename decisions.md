@@ -1,5 +1,46 @@
 # Nidavellir — Decision Log
 
+## 2026-09-30 — three distinct profiles, power recheck only between neighbours (search 10)
+
+Run f2-forge-1790761502529 (search 9) is paused after a TDR and was not resumed.
+- **What happened:**
+  - The top 1920 passed from 937 down to 906; 900 had a silent error. The compensation worked:
+    margin pair 1905@900 passed the full matrix.
+  - Godforge's publication pair 1905@937 (196.4 W) was voided as `power_p99_inconsistent`. The
+    p99 anomaly recheck, meant for adjacent bins, compared it with 1905@900 (184.2 W, 37 mV away).
+  - The -5% level 1815 passed 900, then took a real TDR at 887, 25 s into the DX12 lane at a load
+    step. That is 12 mV above the user's Overwatch crash at 1815@875.
+  - Resuming would repeat the false anomaly on 1815@937 and end with all profiles near 1725.
+- **Learned:** under PowerRender, p99 follows voltage (~2 W per 6.25 mV bin) and barely clock
+  (~0.16 W per 15 MHz bin). A lower level only saves power by passing a lower voltage.
+- **Decisions (user):**
+  1. The p99 anomaly recheck compares only against a measurement ≤13 mV (two bins) away.
+  2. A lower level must end two two-bin steps below its start (~25 mV, ~8 W on the test card).
+     Otherwise it retries one clock bin lower from its lowest pass, at most two times. This
+     applies to both Brokkr's and Deep Calm levels.
+  3. A level that never passed below its start publishes nothing (`no_distinct_profile`).
+  4. The Brokkr's floor drops 95% → 92% and Deep Calm's 90% → 87%, so the retried clocks are
+     eligible. Deep Calm must draw less power than Brokkr's when such a pair exists.
+  5. The attempt budget goes 24 → 30 for the retries; the 8 h budget is unchanged.
+- **Alternatives:**
+  - Not chosen: a smaller margin over TDR-class edges than over silent-error edges. It would
+    publish 1815@900 as Brokkr's from existing evidence, but it rests on one test TDR.
+  - Rejected: extra scans at the same clock (the skipped 893 bin). They cannot gain more than one
+    bin.
+- **Trade-off:** retries cost ~17 min per admission and may add TDR pauses. With the +36 mV margin,
+  Brokkr's on the test card is expected near 1785–1800 @ 912–925, not the user's field
+  1800@875.
+
+## 2026-09-29 (b) — scope: NVIDIA GPUs only
+
+Nidavellir is exclusively an NVIDIA GPU tuning program. The original CPU/RAM/GPU optimizer scope
+is dropped (not deferred): CPU and RAM tuning may become separate programs in the future, but are
+out of scope here. Consequence: CPU/RAM/motherboard features and legacy GPU workers no UI calls
+are removed in a dedicated cleanup after the search-9 clean run validates the 36 mV game margin.
+Removing legacy IPC methods is an explicit contract break approved per cleanup phase; safety paths
+(apply, reset-to-stock, TDR sentinel) get a safety audit.
+Inventory: legacy IPC workers ~2k lines, dead F1 ~800, unmounted UI panels ~1.2k.
+
 ## 2026-09-29 — game-margin compensation (search 9)
 
 Run f2-forge-1790664558111 (search 8) published Godforge 1920@925, Brokkr's 1830@862 and Deep Calm

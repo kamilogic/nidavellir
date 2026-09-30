@@ -83,7 +83,8 @@ promise and performs no background stress testing during play.
 
 Forged/Tempered/Refined/Legendary are naming vocabulary, not a promise of implemented
 automatic maturity or permission to disable monitoring. Automatic maturity, community
-learning, CPU/RAM/motherboard tuning, AMD support and new OC modes are deferred.
+learning, AMD support and new OC modes are deferred. CPU/RAM/motherboard tuning is out of
+scope: Nidavellir is an NVIDIA-GPU-only program (decision 2026-09-29 (b)).
 
 ## Recovery and terminal outcomes
 
