@@ -1,6 +1,19 @@
 \# UI ↔ Backend Contract
 
-## 2026-09-30: three distinct profiles, search 10 (current)
+## 2026-10-01: load steps and hot-bin anchor, search 11 (current)
+
+Search VERSION 11, ExactApply 39 and Frontier 34: v10 checkpoints and v38/v33 evidence cannot
+resume or re-synthesize profiles. Additive only.
+- **`ForgeDiscoveryBand.lowest_hot_bin`** (false): the band's lowest pass held its target mostly at
+  the hot bin in a critical phase. Its game margin is anchored 10 mV higher.
+- **`PowerSweepPoint.hot_bin_relief`** (false): the same flag on a qualified point. The profile
+  margin proof adds 10 mV for such an anchor.
+- **New phase `load-step`** in Texture Hop `phase_metrics` (v13-r5). Texture/DX12 lanes are 138 s
+  and screening is 34.5 s (Long: 345 s and 69 s).
+- **Profiles:** for F2 points, a p5 within one hot bin below the target counts as the target in
+  selection.
+
+## 2026-09-30: three distinct profiles, search 10
 
 Search VERSION 10: a v9 checkpoint cannot resume. Contracts unchanged (Discovery10, Frontier33,
 ExactApply38). Additive only.

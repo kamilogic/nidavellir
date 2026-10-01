@@ -1,6 +1,38 @@
 # Nidavellir — Project Memory
 
-## Current — three distinct profiles (2026-09-30, search 10)
+## Current — load steps + hot-bin anchor (2026-10-01, search 11, ExactApply39/Frontier34)
+
+- **Why 1815@887 TDR'd once and 881…843 passed later:**
+  - TDR is ~7% per idle→heavy step, and the matrix had only ~6 steps per pair.
+  - Below ~870 mV the GPU self-relieved to the 1800 hot bin in the critical phase.
+- **(a) Texture Hop r5:** a `load-step` phase gives ~66 steps per pair. Lanes are 138 s and
+  screening 34.5 s; existing phases keep their durations.
+- **(b) Hot-bin relief:** a pass whose critical phases ran >50% at the hot bin stays a pass but
+  anchors the game margin +10 mV. Search (`QualifiedHotBin`) and synthesis (`hot_bin_relief`) share
+  the rule. Never inconclusive.
+- **Selection** treats a one-hot-bin p5 as the target (F2 only).
+- **Open:**
+  - TDR handling (user decisions, not implemented yet):
+    - a per-run sanity ceiling of 6 replaces the cross-run budget of 2;
+    - opt-in auto-resume;
+    - an experimental driver reset after a recovered TDR, with reboot as fallback.
+  - The PIN only blocks the dev BAT: the installed service starts before login.
+  - v38 runs no longer re-synthesize into applicable profiles.
+
+## Previous — first search-10 run and selection fix (2026-10-01)
+
+- **Run 1790850465550 finished.**
+  - Top 1905 (1920@943 had a broken measurement): lowest 893.
+  - 1815: lowest 843, silent error at 831.
+  - 1725: lowest 793; TDR at 781 escalated to bugcheck 0x116, then Resume.
+- **It published** Godforge 1905@943 and Brokkr's 1905@931, because a one-bin p5 dip at 931
+  read as a clock trade.
+- **Fix:** selection counts the held hot bin as the target (F2 only). Restore re-synthesis then
+  gives 1905@931 / 1815@881 / 1725@831.
+- **Watch:** Brokkr's 1815@881 is 6 mV above the Overwatch crash at 1815@875. Edges vary ~40 mV
+  between runs.
+
+## Previous — three distinct profiles (2026-09-30, search 10)
 
 - **Run 1790761502529 (search 9, Full Reset → Clean) is paused after a TDR, not resumed.**
   - Top 1920: lowest pass 906, 900 silent error.

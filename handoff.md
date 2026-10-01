@@ -1,6 +1,45 @@
 # Nidavellir — Session Handoff
 
-## LATEST — three distinct profiles (2026-09-30, search 10)
+## LATEST — load steps + hot-bin anchor (2026-10-01, search 11)
+
+The user's question was why the test failed 1815@887 once and then passed 881…843. See decisions.md
+2026-10-01 (b).
+- **Implemented:**
+  - (a) Texture Hop r5 `load-step` phase, ExactApply39/Frontier34, lanes 138 s and screening
+    34.5 s;
+  - (b) `QualifiedHotBin`: a hot-bin-relieved anchor counts +10 mV, in the search (search 11) and
+    the margin proof;
+  - selection holds the one hot bin.
+- **Validation:** Rust 721/3 ignored. Safety audit GO; its two nits (sliced load-step idle, stale
+  "v29" log strings) are fixed.
+- **TDR decisions (user, 2026-10-01), not implemented yet. Plan: one commit and audit per step:**
+  1. A per-run sanity ceiling of 6 replaces the cross-run budget of 2. Edge TDRs stop blocking
+     future runs; condemnations stay permanent.
+  2. Opt-in auto-resume at run start.
+  3. Experimental GPU driver reset after a recovered TDR, validated by the stock mirror, with
+     reboot as fallback.
+- **Login PIN:** the installed service starts before login, so auto-resume needs no PIN there (lanes
+  are headless, but a full Forge in session 0 is not validated yet). The dev BAT runs only after
+  login.
+- **Before updating:** the current run's profiles (ExactApply38) stop re-synthesizing after the
+  update. Test 1815@881 in Overwatch first if wanted.
+- **Next:** rebuild with the BAT, then Full Reset → Clean. Expect more TDR pauses at level edges.
+- **Decision pending:** the TDR crash budget is still 2 per run, which can stop the run before the
+  −10% level. Raising it to 3 would allow one per level.
+
+## Previous — selection holds the one hot bin (2026-10-01)
+
+Run f2-forge-1790850465550 finished, but Brokkr's became 1905@931, Godforge's own clock, because of
+a one-bin p5 dip. See decisions.md 2026-10-01.
+- **Fix:** F2 selection treats a p5 in the held band as the target. New test
+  `one_hot_bin_p5_dip_is_not_a_clock_trade`. Rust 717/3 ignored. Uncommitted.
+- **After rebuild and service restart:** restore re-synthesis should show Godforge 1905@931,
+  Brokkr's 1815@881 and Deep Calm 1725@831.
+- **Before trusting Brokkr's:** validate 1815@881 in Overwatch with Safe Loop. It is 6 mV above the
+  field crash at 1815@875.
+- **Open:** retry a broken top measurement (1920@943, 71 W) once before descending a clock bin.
+
+## Previous — three distinct profiles (2026-09-30, search 10)
 
 Run f2-forge-1790761502529 is paused after a TDR at 1815@887. It lost Godforge 1905@937 to a false
 p99 anomaly; see decisions.md 2026-09-30.

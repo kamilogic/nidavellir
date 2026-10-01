@@ -97,16 +97,18 @@ const V8_GOLDEN_SAMPLE_MS: u64 = 2_000;
 const V27_API_MATRIX_STOCK_CHECK_MS: u64 = 60_000;
 /// Long keeps the exhaustive five-minute Texture Hop + twenty-minute thermal Endurance proof.
 /// Standard uses the mode-specific compact dwells below and runs until that planned proof closes.
+/// Texture Hop r5 (2026-10-01) adds the load-step block as 15/115 of each lane, so the Texture Hop
+/// dwells grew ×1.15 and every pre-existing phase keeps its duration.
 #[cfg(windows)]
-const F2_LONG_APPLY_TEXTURE_DWELL_MS: u64 = 300_000;
+const F2_LONG_APPLY_TEXTURE_DWELL_MS: u64 = 345_000;
 #[cfg(windows)]
-const F2_STANDARD_APPLY_TEXTURE_DWELL_MS: u64 = 120_000;
+const F2_STANDARD_APPLY_TEXTURE_DWELL_MS: u64 = 138_000;
 #[cfg(windows)]
 const F2_APPLY_DX11_RESIDENT_DWELL_MS: u64 = 420_000;
 #[cfg(windows)]
-const F2_STANDARD_APPLY_DX12_DWELL_MS: u64 = 120_000;
+const F2_STANDARD_APPLY_DX12_DWELL_MS: u64 = 138_000;
 #[cfg(windows)]
-const F2_LONG_APPLY_DX12_DWELL_MS: u64 = 300_000;
+const F2_LONG_APPLY_DX12_DWELL_MS: u64 = 345_000;
 #[cfg(windows)]
 const F2_STANDARD_APPLY_ENDURANCE_DWELL_MS: u64 = 300_000;
 /// Stock thermal normalization runs in bounded windows. Each window exceeds the six-second
@@ -703,7 +705,7 @@ impl PowerSweepMode {
         match self {
             PowerSweepMode::Standard => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
-                qualification_dwell_ms: 30_000,
+                qualification_dwell_ms: 34_500,
                 qualification_passes: F2_DESCENT_DETECTOR_PASSES,
                 final_gate_dwell_ms: 0,
                 final_gate_passes: 0,
@@ -714,7 +716,7 @@ impl PowerSweepMode {
             },
             PowerSweepMode::Long => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
-                qualification_dwell_ms: 60_000,
+                qualification_dwell_ms: 69_000,
                 qualification_passes: F2_DESCENT_DETECTOR_PASSES,
                 final_gate_dwell_ms: 0,
                 final_gate_passes: 0,
@@ -3666,6 +3668,7 @@ fn qualification_coverage_from_run_with_context(
         })
         .collect::<Vec<_>>();
 
+    // LoadStep is deliberately absent: its drained idle gaps are the stimulus, not missing sustain.
     let heavy_refusal = target_mhz.and_then(|target| {
         let mut evaluated = false;
         let refusal = phase_reports.iter().filter(|report| matches!(report.phase,
@@ -5346,7 +5349,16 @@ fn synthesize_forge_profiles_capped(
     }
 
     // Sustained clock = p5 when available (dip-aware), else average (legacy fallback).
-    let sustained = |p: &PowerSweepPoint| p.p5_clock_mhz.unwrap_or(p.clock_mhz);
+    // An F2 p5 in the held band (the one hot bin below the target, ExactApply38) holds the target:
+    // run 1790850465550 otherwise ranked 1905@931 (p5 1890) as a 15 MHz trade, so Brokkr's became
+    // Godforge's own clock (R 2.91 over 1815@881) and Godforge took 943 for the same clock.
+    let sustained = |p: &PowerSweepPoint| {
+        let p5 = p.p5_clock_mhz.unwrap_or(p.clock_mhz);
+        match p.target_clock_mhz.filter(|_| p.boundary_voltage_mv.is_some()) {
+            Some(target) if nidavellir_core::f2_observation::f2_clock_held(p5, target) => target,
+            _ => p5,
+        }
+    };
     // F2 profiles are applied above their learned boundary. Their selection budget is therefore the
     // sustained p99 measured at the exact apply-margin bin. Legacy/F1 points retain mean-power scoring.
     let profile_power = |p: &PowerSweepPoint| {
@@ -8609,10 +8621,15 @@ fn f2_set_run_points(prog: &mut PowerSweepProgress, points: &[(PowerSweepPoint, 
 
 /// Game margin (2026-09-29): a pair is publishable only when a pair at least
 /// [`crate::qualified_search::GAME_MARGIN_MV`] lower, at the same clock, also holds a complete proof
-/// in this run. Our matrix approves ~six bins below what games sustain (field calibration).
+/// in this run. Our matrix approves ~six bins below what games sustain (field calibration). An
+/// anchor that held its target through the hot bin counts
+/// [`crate::qualified_search::HOT_BIN_RELIEF_MV`] higher, exactly as the search plans it.
 #[cfg(windows)]
 fn f2_margin_proven(points: &[(PowerSweepPoint, f64)]) -> Vec<(PowerSweepPoint, f64)> {
     let margin = crate::qualified_search::GAME_MARGIN_MV;
+    let relief = |q: &PowerSweepPoint| {
+        if q.hot_bin_relief { crate::qualified_search::HOT_BIN_RELIEF_MV } else { 0 }
+    };
     points
         .iter()
         .copied()
@@ -8620,7 +8637,7 @@ fn f2_margin_proven(points: &[(PowerSweepPoint, f64)]) -> Vec<(PowerSweepPoint, 
             points.iter().any(|(q, _)| {
                 q.target_clock_mhz == p.target_clock_mhz
                     && q.vf_table_voltage_mv.zip(p.vf_table_voltage_mv)
-                        .is_some_and(|(lower, mv)| lower + margin <= mv)
+                        .is_some_and(|(lower, mv)| lower + relief(q) + margin <= mv)
             })
         })
         .collect()
@@ -8787,8 +8804,20 @@ fn f2_completely_qualified_point(
         dwell_duration_ms: measured.dwell_duration_ms,
         dwell_sample_count: measured.sample_count,
         max_temp_c: measured.max_temp_c,
+        hot_bin_relief: obs::f2_pair_has_hot_bin_relief(&scoped, run_id, target, mv, gpu_key),
         ..Default::default()
     })
+}
+
+/// A complete proof whose critical phases leaned on the hot bin still qualifies; the search only
+/// anchors its game margin higher (2026-10-01).
+#[cfg(windows)]
+fn f2_qualified_outcome(point: &PowerSweepPoint) -> crate::qualified_search::Outcome {
+    if point.hot_bin_relief {
+        crate::qualified_search::Outcome::QualifiedHotBin
+    } else {
+        crate::qualified_search::Outcome::Qualified
+    }
 }
 
 #[cfg(windows)]
@@ -9615,7 +9644,7 @@ fn measure_multiclock_undervolt_forge(
                 prog.points
                     .retain(|p| f2_apply_key(p) != Some((target, mv)));
                 prog.points.push(point);
-                return Ok(Outcome::Qualified);
+                return Ok(f2_qualified_outcome(&point));
             }
             let calibration = crate::gpu_undervolt::run_confirmed_f2_power_calibration(
                 store,
@@ -9783,7 +9812,7 @@ fn measure_multiclock_undervolt_forge(
             prog.points
                 .retain(|p| f2_apply_key(p) != Some((target, mv)));
             prog.points.push(point);
-            Ok(Outcome::Qualified)
+            Ok(f2_qualified_outcome(&point))
         })();
         let outcome = match result {
             Ok(outcome) => outcome,
@@ -9857,7 +9886,14 @@ fn measure_multiclock_undervolt_forge(
             }
         }
         let next = &discovery.bands[band_index];
-        if recorded == Outcome::Qualified && next.status == "pending" && next.target_clock_mhz == target && next.voltage_mv < mv {
+        if recorded == Outcome::QualifiedHotBin {
+            prog.log.push(format!(
+                "{target} MHz @ {mv} mV aprovado, mas as fases críticas rodaram mais da metade no bin quente ({} MHz): a margem de jogo ancora {} mV acima deste par.",
+                target.saturating_sub(nidavellir_core::f2_observation::F2_HELD_BIN_BELOW_MHZ),
+                crate::qualified_search::HOT_BIN_RELIEF_MV
+            ));
+        }
+        if matches!(recorded, Outcome::Qualified | Outcome::QualifiedHotBin) && next.status == "pending" && next.target_clock_mhz == target && next.voltage_mv < mv {
             prog.log.push(format!(
                 "{target} MHz @ {mv} mV qualificado; descendo a tensão neste clock até a primeira instabilidade: próximo {target} MHz @ {} mV.",
                 next.voltage_mv
@@ -9932,7 +9968,7 @@ fn measure_multiclock_undervolt_forge(
         }
         prog.last_outcome = Some(
             match outcome {
-                Outcome::Qualified => "CandidateQualified",
+                Outcome::Qualified | Outcome::QualifiedHotBin => "CandidateQualified",
                 Outcome::PowerBound => "PowerBoundClockDrop",
                 Outcome::IntegrityError => "BandClosedIntegrityError",
                 Outcome::DriverFailure => "CandidateCrash",
@@ -11627,7 +11663,7 @@ mod tests {
                 standard.final_gate_dwell_ms,
                 standard.final_gate_passes
             ),
-            (30_000, F2_DESCENT_DETECTOR_PASSES, 0, 0)
+            (34_500, F2_DESCENT_DETECTOR_PASSES, 0, 0)
         );
         assert_eq!(
             (
@@ -11636,15 +11672,16 @@ mod tests {
                 long.final_gate_dwell_ms,
                 long.final_gate_passes
             ),
-            (60_000, F2_DESCENT_DETECTOR_PASSES, 0, 0)
+            (69_000, F2_DESCENT_DETECTOR_PASSES, 0, 0)
         );
-        assert_eq!(standard.apply_texture_dwell_ms, 120_000);
+        // Texture Hop r5: ×1.15 so the load-step block extends the lanes (120 → 138 s).
+        assert_eq!(standard.apply_texture_dwell_ms, 138_000);
         assert_eq!(standard.apply_dx11_dwell_ms, 420_000);
-        assert_eq!(standard.apply_dx12_dwell_ms, 120_000);
+        assert_eq!(standard.apply_dx12_dwell_ms, 138_000);
         assert_eq!(standard.apply_endurance_dwell_ms, 300_000);
-        assert_eq!(long.apply_texture_dwell_ms, 300_000);
+        assert_eq!(long.apply_texture_dwell_ms, 345_000);
         assert_eq!(long.apply_dx11_dwell_ms, 420_000);
-        assert_eq!(long.apply_dx12_dwell_ms, 300_000);
+        assert_eq!(long.apply_dx12_dwell_ms, 345_000);
         assert_eq!(long.apply_endurance_dwell_ms, 1_200_000);
     }
 
@@ -11815,7 +11852,7 @@ mod tests {
         assert_eq!(texture_pass.strength, F2QualificationStrength::Fsgl4);
         assert_eq!(texture_pass.pattern, Some(F2QualificationPattern::Texture));
         assert_eq!(texture_pass.phases_completed, 12);
-        assert_eq!(texture_pass.phases_expected, 11);
+        assert_eq!(texture_pass.phases_expected, 12, "Texture Hop r5 adds the load-step phase");
 
         let adjacent_lower_bin_samples = samples
             .iter()
@@ -12536,6 +12573,51 @@ mod tests {
             1850,
             "below 87% floor excluded despite best MHz/W"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hot_bin_anchor_needs_ten_more_millivolts_of_game_margin() {
+        let point = |mv: u32, relief: bool| {
+            (PowerSweepPoint {
+                target_clock_mhz: Some(1815),
+                vf_table_voltage_mv: Some(mv),
+                hot_bin_relief: relief,
+                ..fp(1815, 170.0)
+            }, 0.99)
+        };
+        // Run 1790850465550 at 1815: the anchor 843 held field concurrency 69% at 1800.
+        let proven = |anchor_hot: bool| {
+            f2_margin_proven(&[point(843, anchor_hot), point(881, false), point(893, false)])
+                .iter()
+                .map(|(p, _)| p.vf_table_voltage_mv.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(proven(false), [881, 893]);
+        assert_eq!(proven(true), [893], "843 + 10 + 36 mV = 889 no longer covers 881");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn one_hot_bin_p5_dip_is_not_a_clock_trade() {
+        // Run 1790850465550 (target, p5, PowerRender p99): 943, 931, 881 and 831 mV.
+        let point = |target: u32, p5: u32, power: f32| PowerSweepPoint {
+            target_clock_mhz: Some(target),
+            p5_clock_mhz: Some(p5),
+            boundary_voltage_mv: Some(900),
+            power_p99_w: Some(200.0),
+            ..fp(target, power)
+        };
+        let frontier = vec![
+            (point(1905, 1905, 198.1), 0.99),
+            (point(1905, 1890, 193.6), 0.99),
+            (point(1815, 1815, 176.0), 0.99),
+            (point(1725, 1725, 160.6), 0.99),
+        ];
+        let p = synthesize_forge_profiles_capped(&frontier, &ForgePolicy::balanced(), 200.0);
+        let picks = [p.godforge, p.brokkrs, p.deep_calm]
+            .map(|q| q.map(|q| (q.target_clock_mhz.unwrap(), q.power_w)).unwrap());
+        assert_eq!(picks, [(1905, 193.6), (1815, 176.0), (1725, 160.6)]);
     }
 
     #[cfg(windows)]

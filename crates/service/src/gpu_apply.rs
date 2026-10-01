@@ -973,7 +973,10 @@ pub fn apply_and_persist_undervolt(
     if qualification_contract_version
         != nidavellir_core::f2_observation::F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION
     {
-        return Err("F2 apply descriptor is not exact-Apply v29".into());
+        return Err(format!(
+            "F2 apply descriptor is not exact-Apply v{}",
+            nidavellir_core::f2_observation::F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION
+        ));
     }
     let current_gpu_key = crate::gpu_power_sweep::current_gpu_key();
     if gpu_key != current_gpu_key {
@@ -1272,7 +1275,10 @@ pub fn reapply_on_boot(store: &SafeLoopStore) {
         },
         // Legacy F1/pre-v29 V/F descriptors cannot prove they remain outside the current cone.
         None => {
-            Err("legacy GPU V/F descriptor has no exact-Apply v29 proof; reapply refused".into())
+            Err(format!(
+                "legacy GPU V/F descriptor has no exact-Apply v{} proof; reapply refused",
+                nidavellir_core::f2_observation::F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION
+            ))
         }
     };
     if let Err(e) = res {

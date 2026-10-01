@@ -1,5 +1,57 @@
 # Nidavellir — Decision Log
 
+## 2026-10-01 (b) — load steps in the matrix; a hot-bin anchor counts 10 mV higher (search 11)
+
+Why one test TDR'd 1815@887 while the next passed 881…843 at the same clock (user question):
+- **Probabilistic failure:** the TDR came at an idle→heavy load step, and each pair crossed only ~6
+  of them. At exactly 1815: 887 failed on about its 3rd step, while 893 and 881 survived 6 each
+  (~7% per step). A 6-step matrix passes such a pair ~65% of the time.
+- **Self-relief:** below ~870 mV the GPU dropped to the 1800 hot bin in the critical phase (DX12
+  field concurrency 69–77% at 843–868). The one-hot-bin rule counted that as holding 1815, so the
+  margin anchor 843 was mostly a 1800 test.
+
+Decisions (user: implement both, without making results mostly inconclusive):
+- **(a) Texture Hop r5:** a load-step phase (350 ms full-power slam, drained 200–300 ms idle gap)
+  follows field concurrency. It is 15/115 of each lane.
+  - Texture/DX12 lanes go 120 → 138 s and screening 30 → 34.5 s (Long 300 → 345 s, 60 → 69 s);
+    every existing phase keeps its duration.
+  - About 66 steps per pair: at ~7% per step a marginal pair now fails ~99% of the time.
+  - Load-step is not a heavy-sustain phase, because its gaps are idle by design.
+  - Contracts: ExactApply 39, Frontier 34; fingerprint v13-r5.
+- **(b) Hot-bin relief:** a pass whose critical phases (field concurrency, load steps) ran >50% at
+  the hot bin in any non-DX11 lane stays a pass and keeps the descent going.
+  - Its game-margin anchor counts 10 mV higher (one clock bin by the test-edge slope).
+  - A relieved compensated margin pair that no longer fits the power-free voltage steps one clock
+    bin down.
+  - The search (`QualifiedHotBin`, search 11) and synthesis (`hot_bin_relief`) use one rule.
+  - It never makes a result inconclusive. At worst every publication sits ~2 bins higher.
+- **Rejected:**
+  - Repeating short field-concurrency segments: secondary-device churn failed at stock before.
+  - Refusing hot-bin passes: that would stop descents and leave levels without profiles.
+- **Consequence:** existing ExactApply38 runs no longer re-synthesize into applicable profiles. Clean
+  runs start from zero anyway.
+
+## 2026-10-01 — profile selection holds the one hot bin (run 1790850465550)
+
+The first search-10 run (Full Reset → Clean) went as follows:
+- Top 1905, lowest pass 893. 1920@943 was a broken measurement (71 W, voltage telemetry low), and
+  the one-time inconclusive descent moved the top to 1905.
+- −5% level 1815: 893 → 843; 831 had a silent error.
+- −10% level 1725: 843 → 793; 781 was a TDR that escalated to bugcheck 0x116. Resume closed the
+  run.
+
+It published Godforge 1905@943, Brokkr's 1905@931 and Deep Calm 1725@831.
+- **Cause:** the discovery p5 at 931/937 dipped one bin (1890). Selection read that as a 15 MHz
+  trade, so 1905@931 won Brokkr's (R 2.91) over 1815@881 (R ≈ 1.9). Godforge took 943 instead of
+  931 for the same clock.
+- **Fix:** for F2 points, a p5 in the held band (one hot bin below the target, as ExactApply38
+  already counts) holds the target. Legacy F1 points are unchanged.
+- **Effect:** restore re-synthesis yields Godforge 1905@931 (194 W), Brokkr's 1815@881 (176 W) and
+  Deep Calm 1725@831 (161 W), with no new run.
+- **Caution:** Brokkr's 1815@881 is 6 mV above the user's Overwatch crash at 1815@875. Edges vary
+  ~40 mV between runs (1815@887 TDR last run, 1815@843 pass now). Validate in games with Safe Loop.
+- **Open:** a broken top measurement could retry the same pair once before descending a clock bin.
+
 ## 2026-09-30 — three distinct profiles, power recheck only between neighbours (search 10)
 
 Run f2-forge-1790761502529 (search 9) is paused after a TDR and was not resumed.

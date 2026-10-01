@@ -328,6 +328,10 @@ pub struct PowerSweepPoint {
     /// `None` and remain ineligible for F2 Apply.
     #[serde(default)]
     pub apply_qualification_version: Option<u32>,
+    /// ExactApply39: a lane's critical phases held the target mostly one hot bin below it. Still a
+    /// pass; as the game-margin anchor it counts 10 mV higher.
+    #[serde(default)]
+    pub hot_bin_relief: bool,
 }
 
 /// Exact executable/GPU/driver identity required to resume a manually paused Forge checkpoint.
@@ -413,6 +417,10 @@ pub struct ForgeDiscoveryBand {
     /// Search 10: clock bins a non-distinct lower level already dropped (at most two).
     #[serde(default)]
     pub clock_retries_used: u32,
+    /// Search 11: the lowest pass held its target mostly through the hot bin in a critical phase;
+    /// the game margin is anchored 10 mV above it.
+    #[serde(default)]
+    pub lowest_hot_bin: bool,
     pub last_qualified_clock_mhz: Option<u32>,
     pub last_qualified_voltage_mv: Option<u32>,
     /// Performance exploration alternates one lower voltage bin and one higher clock bin.

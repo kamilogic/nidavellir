@@ -13,10 +13,13 @@
 //! 4. Three distinct profiles (user decision 2026-09-30): a lower level must end two steps below
 //!    its start, else it retries one clock bin lower (at most two); one that never went below its
 //!    start publishes nothing.
+//! 5. Hot-bin relief (user decision 2026-10-01): a pass whose critical phases held the target
+//!    mostly one bin below it keeps the descent going, but anchors the game margin one clock
+//!    bin's worth of voltage higher. It never turns a result inconclusive.
 
 use nidavellir_core::ipc::{ForgeDiscoveryBand, ForgeDiscoverySearch};
 
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 /// Room for the distinct-profile clock retries; the time budget remains the hard cap.
 pub const STANDARD_ATTEMPTS: u32 = 30;
 pub const STANDARD_BUDGET_MS: u64 = 8 * 60 * 60 * 1_000;
@@ -28,6 +31,13 @@ pub const GAME_MARGIN_MV: u32 = 36;
 /// Test-edge slope used only to predict the compensated top clock. On the test 3060 Ti the edge
 /// fell 918 → 856 mV over 1920 → 1830 MHz, ~10 mV per 15 MHz bin. The margin pair verifies it.
 const COMPENSATION_MV_PER_CLOCK_BIN: u32 = 10;
+/// A hot-bin pass is evidence one clock bin lower, worth this much voltage at the target by the
+/// same test-edge slope. Profile synthesis applies the identical anchor rule.
+pub const HOT_BIN_RELIEF_MV: u32 = COMPENSATION_MV_PER_CLOCK_BIN;
+
+fn relief_mv(hot_bin: bool) -> u32 {
+    if hot_bin { HOT_BIN_RELIEF_MV } else { 0 }
+}
 /// A compensated top whose margin pair fails steps one clock bin down, at most this often.
 const COMPENSATION_RETRIES: u32 = 2;
 /// Lower levels descend two bins per admission: their descent from the dominated start spans ~10
@@ -105,6 +115,8 @@ fn clear_power_bracket(band: &mut ForgeDiscoveryBand) {
 pub enum Outcome {
     /// Only a complete current-contract matrix, exact pair and confirmed stock cleanup.
     Qualified,
+    /// Qualified, but a lane's critical phases held the target mostly at the hot bin below it.
+    QualifiedHotBin,
     /// Confirmed power limitation, no integrity/thermal/containment error, cleanup confirmed.
     PowerBound,
     IntegrityError,
@@ -258,9 +270,10 @@ fn start_next_level(search: &mut ForgeDiscoverySearch, clock_bins: &[u32], volta
         return;
     };
     let power_free = top.first_qualified_voltage_mv.unwrap_or(top_lowest);
+    let top_relief = relief_mv(top.lowest_hot_bin);
     if let Some(comp) = search.bands.iter().position(|b| b.id == "compensated") {
         if search.bands[comp].status == "waiting_for_top" {
-            let publication = bin_at_or_above(voltage_bins, top_lowest + GAME_MARGIN_MV);
+            let publication = bin_at_or_above(voltage_bins, top_lowest + top_relief + GAME_MARGIN_MV);
             let margin = bin_at_or_below(voltage_bins, power_free.saturating_sub(GAME_MARGIN_MV));
             // Predict how far the clock must drop for the margin to fit under the power-free voltage.
             let clock = publication.filter(|mv| *mv > power_free).and_then(|mv| {
@@ -366,7 +379,7 @@ pub fn record(
 fn record_publication(search: &mut ForgeDiscoverySearch, index: usize, outcome: Outcome) {
     search.bands[index].publishing = false;
     match outcome {
-        Outcome::Qualified => close_band(&mut search.bands[index], "published"),
+        Outcome::Qualified | Outcome::QualifiedHotBin => close_band(&mut search.bands[index], "published"),
         Outcome::IntegrityError => {
             search.integrity_errors += 1;
             close_all(search, "dominated_pair_failed");
@@ -391,21 +404,22 @@ fn record_compensated(
     let power_free = top.and_then(|band| band.first_qualified_voltage_mv);
     let top_lowest = top.and_then(|band| band.last_qualified_voltage_mv);
     let band = &mut search.bands[index];
-    if outcome == Outcome::Qualified {
-        band.first_qualified_voltage_mv = Some(band.voltage_mv);
-        band.last_qualified_clock_mhz = Some(band.target_clock_mhz);
-        band.last_qualified_voltage_mv = Some(band.voltage_mv);
-        match bin_at_or_above(voltage_bins, band.voltage_mv + GAME_MARGIN_MV)
-            .filter(|mv| power_free.is_none_or(|limit| *mv <= limit))
-        {
-            Some(publication) => {
-                band.voltage_mv = publication;
-                band.publishing = true;
-                band.status = "pending".into();
-            }
-            None => close_band(band, "compensated_top_unavailable"),
+    if matches!(outcome, Outcome::Qualified | Outcome::QualifiedHotBin) {
+        let hot_bin = outcome == Outcome::QualifiedHotBin;
+        let publication = bin_at_or_above(voltage_bins, band.voltage_mv + relief_mv(hot_bin) + GAME_MARGIN_MV)
+            .filter(|mv| power_free.is_none_or(|limit| *mv <= limit));
+        if let Some(publication) = publication {
+            band.first_qualified_voltage_mv = Some(band.voltage_mv);
+            band.last_qualified_clock_mhz = Some(band.target_clock_mhz);
+            band.last_qualified_voltage_mv = Some(band.voltage_mv);
+            band.lowest_hot_bin = hot_bin;
+            band.voltage_mv = publication;
+            band.publishing = true;
+            band.status = "pending".into();
+            return;
         }
-        return;
+        // Only the hot bin can push the publication over the power-free voltage: the margin pair
+        // held one clock bin lower, so the prediction steps down like a failed margin pair.
     }
     match clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max() {
         Some(clock) if band.attempts <= COMPENSATION_RETRIES => {
@@ -461,7 +475,7 @@ fn record_level(
     let band = &mut search.bands[index];
     let lower_power_voltage = lower_power_voltage(band, voltage_bins, power_hint);
     match outcome {
-        Outcome::Qualified => {
+        Outcome::Qualified | Outcome::QualifiedHotBin => {
             if band.last_qualified_clock_mhz != Some(band.target_clock_mhz) {
                 band.first_qualified_voltage_mv = Some(band.voltage_mv);
             }
@@ -469,6 +483,7 @@ fn record_level(
             clear_power_bracket(band);
             band.last_qualified_clock_mhz = Some(band.target_clock_mhz);
             band.last_qualified_voltage_mv = Some(band.voltage_mv);
+            band.lowest_hot_bin = outcome == Outcome::QualifiedHotBin;
             let higher_clock = clock_bins
                 .iter()
                 .copied()
@@ -593,6 +608,7 @@ fn finish_level(
                 band.first_qualified_voltage_mv = None;
                 band.last_qualified_clock_mhz = None;
                 band.last_qualified_voltage_mv = None;
+                band.lowest_hot_bin = false;
                 band.status = "pending".into();
                 return;
             }
@@ -601,8 +617,9 @@ fn finish_level(
             return close_band(band, "no_distinct_profile");
         }
     }
+    let relief = relief_mv(band.lowest_hot_bin);
     let publication = lowest
-        .and_then(|lowest| bin_at_or_above(voltage_bins, lowest + GAME_MARGIN_MV))
+        .and_then(|lowest| bin_at_or_above(voltage_bins, lowest + relief + GAME_MARGIN_MV))
         .filter(|mv| {
             band.id != "performance" && band.first_qualified_voltage_mv.is_some_and(|start| *mv > start)
         });
@@ -874,6 +891,42 @@ mod tests {
         walk(&mut power, &clocks, &volts, PowerBound);
         let band = &power.bands[2];
         assert_eq!((band.voltage_mv, band.status.as_str(), band.last_qualified_voltage_mv), (893, "pending", None));
+    }
+    #[test]
+    fn a_hot_bin_anchor_raises_the_publication_without_stopping_the_descent() {
+        use Outcome::*;
+        let (mut state, clocks, volts) = staircase();
+        walk_all(&mut state, &clocks, &volts, &[
+            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
+            Qualified, Qualified,
+        ]);
+        // The -5% level's passes below 887 held 1815 mostly at the 1800 hot bin.
+        let trace = walk_all(&mut state, &clocks, &volts, &[
+            Qualified, Qualified, QualifiedHotBin, QualifiedHotBin, IntegrityError, Qualified,
+        ]);
+        assert_eq!(trace, [
+            (2, 1815, 900), (2, 1815, 887), (2, 1815, 875), (2, 1815, 862), (2, 1815, 850),
+            // 862 + 10 + 36 mV = 908 → 912; a plain anchor would publish the tested 900.
+            (2, 1815, 912),
+        ]);
+        assert!(state.bands[2].lowest_hot_bin);
+        assert_eq!((state.bands[2].stop_reason.as_deref(), state.integrity_errors), (Some("published"), 0));
+    }
+    #[test]
+    fn a_hot_bin_margin_or_top_anchor_compensates_one_clock_bin_deeper() {
+        use Outcome::*;
+        let (mut state, clocks, volts) = staircase();
+        walk_all(&mut state, &clocks, &volts, &[Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError]);
+        // 900 + 10 + 36 mV = 946 → 950, over the power-free 937: the margin pair only held 1890.
+        assert_eq!(walk_all(&mut state, &clocks, &volts, &[QualifiedHotBin, Qualified, Qualified]),
+            [(1, 1905, 900), (1, 1890, 900), (1, 1890, 937)]);
+        assert_eq!(state.bands[1].stop_reason.as_deref(), Some("published"));
+        // A hot-bin top anchor: 906 + 10 + 36 mV = 952 → 956, 19 mV over 937, so two clock bins.
+        let (mut hot_top, clocks, volts) = staircase();
+        walk_all(&mut hot_top, &clocks, &volts, &[
+            Qualified, Qualified, Qualified, Qualified, Qualified, QualifiedHotBin, IntegrityError,
+        ]);
+        assert_eq!((hot_top.bands[1].target_clock_mhz, hot_top.bands[1].voltage_mv), (1890, 900));
     }
     #[test]
     fn power_bound_lowers_voltage_at_same_clock_without_promoting_evidence() {

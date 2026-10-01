@@ -152,7 +152,8 @@ pub fn f2_clock_held(clock: u32, target: u32) -> bool {
 /// limit; qualification samples below target while at the limit count as held. Heavy phases too
 /// short to evaluate are skipped, not refused.
 /// v33 (2026-09-28): screening residency counts the one hot bin below the target as held.
-pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 33;
+/// v34 (2026-10-01): the screening runs Texture Hop r5 (load steps), 34.5 s.
+pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 34;
 
 /// v29 (2026-08-11): three consecutive, provenance-identical native DX11 v2 exact-Apply dwells that
 /// finish reset-clean and off-cap with at least 95% of clocks below the requested target are a
@@ -174,7 +175,9 @@ pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 33;
 /// v38 (2026-09-28): the one hot bin below the target counts as held target time in residency,
 /// DX11 exposure (the light phase included) and the Endurance hot target (user decision). The
 /// exact label is no longer proven when hot; a two-bin drop still fails.
-pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 38;
+/// v39 (2026-10-01): Texture and DX12 lanes run Texture Hop r5 with ~30 idle→slam load steps each
+/// (138 s); a pass that held its target only through the hot bin anchors the game margin higher.
+pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 39;
 
 /// Backward-compatible alias for callers that expose one latest profile-publication contract.
 /// Frontier qualification has an independent version because exact-Apply policy changes must not
@@ -925,6 +928,52 @@ pub fn is_current_apply_qualification_pass(o: &F2Observation) -> bool {
             .as_ref()
             .and_then(|coverage| coverage.pattern)
             .is_some_and(is_required_qualification_pattern)
+}
+
+/// A pass holds its target only through the GPU's own relief when, in some lane, more than this
+/// share of its critical-phase samples sat at the hot bin (2026-10-01). It stays a pass; it only
+/// anchors the game margin one clock bin's worth of voltage higher (never inconclusive).
+pub const F2_HOT_BIN_RELIEF_SHARE: f32 = 0.5;
+/// Field concurrency and the r5 load steps carry the transient that TDR'd 1815@887. DX11 lanes have
+/// neither: their variable phase spreads clocks under the power limit for reasons unrelated to it.
+const F2_CRITICAL_PHASES: [&str; 2] = ["field-concurrency", "load-step"];
+const F2_HOT_BIN_RELIEF_MIN_SAMPLES: u32 = 20;
+
+/// One lane's share of critical-phase samples at the hot bin (target − 15 MHz) versus at or above
+/// the target. None when the lane has too few critical samples to judge.
+pub fn f2_critical_hot_bin_share(metrics: &[F2QualificationPhaseMetric], target_mhz: u32) -> Option<f32> {
+    let (mut hot, mut held) = (0u32, 0u32);
+    for metric in metrics.iter().filter(|m| F2_CRITICAL_PHASES.contains(&m.phase_name.as_str())) {
+        for &[clock, _, samples, _] in &metric.clock_temp {
+            if clock >= target_mhz {
+                held += samples;
+            } else if clock + F2_HELD_BIN_BELOW_MHZ >= target_mhz {
+                hot += samples;
+            }
+        }
+    }
+    (hot + held >= F2_HOT_BIN_RELIEF_MIN_SAMPLES).then(|| hot as f32 / (hot + held) as f32)
+}
+
+/// True when any current exact-Apply pass lane of this pair held its critical phases mostly at the
+/// hot bin (run 1790850465550: 1815@843 ran 69% of DX12 field concurrency at 1800).
+pub fn f2_pair_has_hot_bin_relief(
+    obs: &[F2Observation],
+    run_id: &str,
+    target_mhz: u32,
+    anchor_mv: u32,
+    gpu_key: &str,
+) -> bool {
+    obs.iter()
+        .filter(|o| {
+            o.run_id == run_id
+                && o.gpu_key.as_deref() == Some(gpu_key)
+                && o.target_mhz == target_mhz
+                && o.anchor_mv == anchor_mv
+                && is_current_apply_qualification_pass(o)
+        })
+        .filter_map(|o| f2_critical_hot_bin_share(&o.qualification_coverage.as_ref()?.phase_metrics, target_mhz))
+        .any(|share| share > F2_HOT_BIN_RELIEF_SHARE)
 }
 
 fn is_current_apply_qualification_evidence(o: &F2Observation) -> bool {
@@ -1845,6 +1894,31 @@ impl F2ObservationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_bin_share_reads_only_critical_phases_of_one_lane() {
+        let metric = |name: &str, cells: &[(u32, u32)]| F2QualificationPhaseMetric {
+            sample_count: None, clock_max: None, phase_name: name.into(), phase_pattern: String::new(),
+            duration_ms: 0, frame_count: 0, checksum_count: 0, compute_check_count: 0, clock_avg: None,
+            clock_p5: None, clock_p50: None, clock_p95: None, target_residency_pct: None,
+            power_avg: None, power_p95: None, power_capped_fraction: None, temperature_avg: None,
+            temperature_max: None, coverage_status: "pass".into(),
+            clock_temp: cells.iter().map(|&(clock, n)| [clock, 66, n, 0]).collect(),
+        };
+        // Run 1790850465550, 1815@843 DX12 lane: field concurrency 1394 samples at 1800, 624 at 1815.
+        let dx12 = [
+            metric("texture-rop", &[(1800, 327), (1815, 905)]),
+            metric("field-concurrency", &[(1800, 1394), (1815, 624)]),
+        ];
+        let share = f2_critical_hot_bin_share(&dx12, 1815).unwrap();
+        assert!((share - 0.69).abs() < 0.01 && share > F2_HOT_BIN_RELIEF_SHARE);
+        // Its Texture lane held 1815 exactly; a two-bin drop is not the hot bin; DX11 has no
+        // critical phase; too few samples prove nothing.
+        assert_eq!(f2_critical_hot_bin_share(&[metric("field-concurrency", &[(1815, 1978)])], 1815), Some(0.0));
+        assert_eq!(f2_critical_hot_bin_share(&[metric("load-step", &[(1785, 50), (1815, 50)])], 1815), Some(0.0));
+        assert_eq!(f2_critical_hot_bin_share(&[metric("dx11-game", &[(1800, 500)])], 1815), None);
+        assert_eq!(f2_critical_hot_bin_share(&[metric("load-step", &[(1800, 19)])], 1815), None);
+    }
 
     fn reproducible_provenance() -> F2EvidenceProvenance {
         F2EvidenceProvenance {

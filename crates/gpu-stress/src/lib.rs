@@ -30,6 +30,10 @@ const TABLE_INIT: u32 = 2246822519;
 // the graceful checksum detector crosses more VRM response periods without lengthening the dwell.
 const DROOP_BURST: u64 = 6;
 const DROOP_GAP_MS: u64 = 4;
+/// r5 load steps: each slam renders this long at full power, then the queue drains and the GPU
+/// idles for one of the gaps below (rotating, so the steps never lock onto one VRM response).
+const LOAD_STEP_BURST_MS: u64 = 350;
+const LOAD_STEP_GAPS_MS: [u64; 3] = [200, 300, 250];
 const TEXROP_DROOP_BURSTS: [u64; 4] = [2, 3, 5, 7];
 const TEXROP_DROOP_GAPS_MS: [u64; 4] = [2, 5, 11, 3];
 // FrameCadence idle gaps between single heavy frames, cycled per frame. Sweeping the gap
@@ -277,11 +281,15 @@ pub enum VfQualifierPhase {
     /// v13 Field Concurrency (legacy enum name retained for source compatibility): the v12
     /// Texture Stack remains resident while a persistent secondary TextureRop device overlaps it.
     CompositeGameLoad,
+    /// r5 load steps (2026-10-01): repeated idle gap → full power-render slam at the exact target.
+    /// One matrix crossed only ~6 such steps, so a ~7%-per-step TDR (1815@887) passed or failed by
+    /// chance between runs; ~60 steps per pair make the outcome repeatable.
+    LoadStep,
 }
 
 impl VfQualifierPhase {
     /// Number of phase variants (codes are `0..COUNT`). Coverage bitmaps must use this size.
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 15;
 
     pub const NONE_CODE: u8 = u8::MAX;
 
@@ -301,6 +309,7 @@ impl VfQualifierPhase {
             VfQualifierPhase::TextureStream => "texture-stream",
             VfQualifierPhase::BoostEntry => "boost-entry",
             VfQualifierPhase::CompositeGameLoad => "field-concurrency",
+            VfQualifierPhase::LoadStep => "load-step",
         }
     }
 
@@ -324,6 +333,7 @@ impl VfQualifierPhase {
             11 => Some(Self::TextureStream),
             12 => Some(Self::BoostEntry),
             13 => Some(Self::CompositeGameLoad),
+            14 => Some(Self::LoadStep),
             _ => None,
         }
     }
@@ -394,6 +404,8 @@ pub enum VfWorkload {
     /// while a persistent secondary device runs the live TextureRop canary. The final primary render lane
     /// still rotates so all three deterministic images remain golden-checked.
     CompositeGameLoad,
+    /// Power render in ~350 ms slams separated by drained idle gaps (see [`LOAD_STEP_GAPS_MS`]).
+    LoadStep,
 }
 
 const MIXED_GAME_WORKLOADS: [VfWorkload; 3] = [
@@ -434,7 +446,9 @@ pub fn vf_qualifier_workload_fingerprint(pattern: VfQualifierPattern) -> &'stati
         VfQualifierPattern::Fsgl3A => "f2q-texhop-v10-r1/fsgl3-a",
         VfQualifierPattern::Fsgl3B => "f2q-texhop-v10-r1/fsgl3-b",
         VfQualifierPattern::V8HighFps => "f2q-texhop-v10-r1/v8-high-fps",
-        VfQualifierPattern::V8Texture => "f2q-texhop-v13-r4/v13-stock-checked-field-concurrency",
+        VfQualifierPattern::V8Texture => {
+            "f2q-texhop-v13-r5/v13-stock-checked-field-concurrency-load-steps"
+        }
         VfQualifierPattern::V8Transitions => {
             "f2q-texhop-v10-r1/v8-transitions"
         }
@@ -461,7 +475,8 @@ fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u
         VfWorkload::PowerRender
         | VfWorkload::HeavySpike
         | VfWorkload::IdlePulse
-        | VfWorkload::BoostEntry => {
+        | VfWorkload::BoostEntry
+        | VfWorkload::LoadStep => {
             Some(goldens.power)
         }
         VfWorkload::BoostEdge => Some(goldens.boost),
@@ -827,12 +842,16 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
     // TextureRop canary. Wrong output, DeviceLost and a real TDR remain valid rejection evidence;
     // neither context has a wall-time pre-hang abort. The remaining half preserves the established
     // TextureRop oracle plus minimal broader coverage.
-    const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 13] = [
+    // r5 (2026-10-01): the hot load-step block follows the field-concurrency stack, adding ~30
+    // idle→slam steps per 138 s lane. Its weight extends the lanes (120 → 138 s) instead of
+    // shrinking the other phases, so their durations are unchanged.
+    const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 14] = [
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 1),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 15),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
         (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 50),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 9),
+        (VfQualifierPhase::LoadStep, VfWorkload::LoadStep, 15),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 7),
         (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 3),
@@ -2825,6 +2844,7 @@ impl GpuCtx {
             VfWorkload::TextureStream => (TEXTURE_STREAM_SHADER, 2, wgpu::BlendState::REPLACE),
             VfWorkload::HeavySpike
             | VfWorkload::IdlePulse
+            | VfWorkload::LoadStep
             | VfWorkload::ComputeBurst
             | VfWorkload::MixedGame
             | VfWorkload::VramPressure
@@ -3374,6 +3394,7 @@ impl GpuCtx {
             | VfWorkload::HeavySpike
             | VfWorkload::IdlePulse
             | VfWorkload::BoostEntry
+            | VfWorkload::LoadStep
             | VfWorkload::CompositeGameLoad
             | VfWorkload::MixedGame => {
                 (RENDER_SHADER, 8, wgpu::BlendState::REPLACE)
@@ -3676,6 +3697,9 @@ impl GpuCtx {
         // FrameCadence paces itself per frame (sync + gap after every submit below), so the
         // coarser droop-burst / idle-pulse pacing must not also fire.
         let frame_cadence = profile == VfWorkload::FrameCadence;
+        // LoadStep paces itself: full-power slam → drained idle gap → slam again.
+        let load_step = profile == VfWorkload::LoadStep;
+        let mut load_step_gap = 0usize;
         // BoostEntry paces itself too: heavy slam (timed) → true-idle seconds → slam again.
         let boost_entry = profile == VfWorkload::BoostEntry;
         // BoostEdge (v16.3): drain every frame + sub-ms CPU-build bubble → discrete boost edges at
@@ -3773,6 +3797,21 @@ impl GpuCtx {
         {
             if frame_cadence {
                 // paced after submit
+            } else if load_step {
+                if last_idle.elapsed().as_millis() as u64 >= LOAD_STEP_BURST_MS {
+                    self.device.poll(wgpu::Maintain::Wait);
+                    // Sliced like BoostEntry's idle so Stop and crash detection stay responsive.
+                    let gap_ms = LOAD_STEP_GAPS_MS[load_step_gap];
+                    let idle_start = std::time::Instant::now();
+                    while (idle_start.elapsed().as_millis() as u64) < gap_ms
+                        && !self.crashed.load(Ordering::SeqCst)
+                        && !cancel.is_cancelled()
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    load_step_gap = (load_step_gap + 1) % LOAD_STEP_GAPS_MS.len();
+                    last_idle = std::time::Instant::now();
+                }
             } else if golden_mode && texture_rop && frames >= next_texrop_droop_frame {
                 self.device.poll(wgpu::Maintain::Wait);
                 std::thread::sleep(std::time::Duration::from_millis(
@@ -4471,7 +4510,7 @@ mod tests {
         assert_ne!(texture, endurance);
         assert_eq!(
             texture,
-            "f2q-texhop-v13-r4/v13-stock-checked-field-concurrency"
+            "f2q-texhop-v13-r5/v13-stock-checked-field-concurrency-load-steps"
         );
         assert_eq!(
             endurance,
@@ -4840,7 +4879,8 @@ mod tests {
     fn v13_texture_hop_and_legacy_v8_patterns_preserve_duration_and_bias_failure_modes() {
         let high_fps = vf_qualifier_plan(60_000, VfQualifierPattern::V8HighFps);
         let texture = vf_qualifier_plan(60_000, VfQualifierPattern::V8Texture);
-        let compact_texture = vf_qualifier_plan(30_000, VfQualifierPattern::V8Texture);
+        // r5: the compact frontier dwell grew 30 → 34.5 s with the load-step weight.
+        let compact_texture = vf_qualifier_plan(34_500, VfQualifierPattern::V8Texture);
         let transitions = vf_qualifier_plan(60_000, VfQualifierPattern::V8Transitions);
         let memory = vf_qualifier_plan(60_000, VfQualifierPattern::V8Memory);
         let required_phases = [
@@ -4913,7 +4953,13 @@ mod tests {
         // Texture Hop v13 exercises the same VRAM-bound primary stack plus a persistent secondary
         // canary without a pre-hang wall-time abort on either context.
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8HighFps), 10);
-        assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Texture), 11);
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Texture), 12);
+        // r5: about 30 load steps in a 138 s lane (350 ms slam + ~250 ms drained idle each).
+        let lane = vf_qualifier_plan(138_000, VfQualifierPattern::V8Texture);
+        let steps = duration_for(&lane, VfWorkload::LoadStep) / (LOAD_STEP_BURST_MS + 250);
+        assert!((25..=35).contains(&steps), "{steps} load steps per lane");
+        assert_eq!(duration_for(&lane, VfWorkload::CompositeGameLoad), 60_000,
+            "the load steps extend the lane instead of shrinking field concurrency");
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Transitions), 10);
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Memory), 12);
         // Severity ladder: hang-prone detectors sit AFTER the last graceful TextureRop segment.
@@ -4950,8 +4996,8 @@ mod tests {
             "Texture Hop must pay the large primary Texture Stack VRAM-pool setup only once per cycle"
         );
         assert!(
-            duration_for(&texture, VfWorkload::CompositeGameLoad) >= 30_000,
-            "at least half of Texture Hop must exercise field concurrency"
+            duration_for(&texture, VfWorkload::CompositeGameLoad) >= 24_000,
+            "field concurrency stays the dominant Texture Hop load (40% after the r5 load steps)"
         );
         let idle = texture
             .iter()

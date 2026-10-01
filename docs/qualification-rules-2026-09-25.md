@@ -1,7 +1,29 @@
 # Descoberta e desqualificação de pontos — contrato de 25/09/2026
 
-Implementação atual: Discovery 10, Frontier 33, Exact Apply 38, busca 10 (30/09). Este documento
+Implementação atual: Discovery 10, Frontier 34, Exact Apply 39, busca 11 (01/10). Este documento
 substitui as regras de residência/energia e a ordem de busca de 24/09. A matriz de cargas continua 27.
+
+## Degraus de carga e âncora no bin quente (01/10)
+
+Um teste deu TDR em 1815@887, e o seguinte aprovou 881…843 no mesmo clock. Dois motivos:
+- **Falha probabilística:** ~6 degraus idle→carga por par, com ~7% de chance por degrau.
+- **Alívio da própria GPU:** abaixo de ~870 mV, a fase crítica rodou em 1800, o bin quente.
+
+O que mudou:
+- **Texture Hop r5:** uma fase `load-step` (pancada de 350 ms em potência cheia, 200–300 ms ociosa)
+  vem depois da concorrência de campo. São ~30 degraus por lane de 138 s e ~66 por par.
+  - As lanes Texture/DX12 passaram de 120 s para 138 s, e a triagem de 30 s para 34,5 s. As outras
+    fases mantêm a duração.
+  - O load-step não entra na regra de sustentação pesada, porque os intervalos ociosos são
+    propositais.
+- **Âncora no bin quente:** um par aprovado cujas fases críticas (concorrência de campo, load-step)
+  passaram mais de 50% no bin quente, em alguma lane fora da DX11, continua aprovado e a descida
+  segue.
+  - Como âncora da margem de jogo, ele vale 10 mV a mais.
+  - Se isso tira o par de margem do topo compensado de dentro da tensão de potência, o topo desce
+    um bin de clock.
+  - Isso nunca vira inconclusivo; no máximo, a publicação sobe ~2 bins.
+- **Seleção:** para pares F2, um p5 até um bin quente abaixo do alvo conta como o alvo.
 
 ## Três perfis distintos (30/09)
 
