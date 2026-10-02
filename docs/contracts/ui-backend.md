@@ -1,6 +1,29 @@
 \# UI ↔ Backend Contract
 
-## 2026-10-01: load steps and hot-bin anchor, search 11 (current)
+## 2026-10-01 (c): TDR autonomy (current)
+
+Additive only; contract and search versions are unchanged.
+- **New method `SetForgeAutoResume`.** Wire: `{"method":"SetForgeAutoResume","params":{"enabled":true}}`.
+  - It returns the normal `PowerSweep` response.
+  - The option is stored in `forge_options.json` and survives Full Reset. Turning it off cancels a
+    countdown.
+- **`PowerSweepProgress.auto_resume`** (false): the opt-in state.
+- **`PowerSweepProgress.auto_resume_at_ms`** (null): epoch ms when an automatic continuation fires.
+  The UI shows a countdown with Cancel, which calls `SetForgeAutoResume` with false.
+- **Behaviour:**
+  - The countdown starts when an `interrupted` run with an open search has no pending incident, or
+    only its own CandidateCrash.
+  - If no TDR latch remains, it acknowledges that incident and calls `ResumePowerSweep`'s own path.
+  - If this boot still holds the TDR, the installed service resets only the GPU driver, once per
+    incident: the service is unavailable for ~10–60 s, then a new countdown follows.
+  - In console mode it waits for a Windows restart instead.
+  - Log lines explain each step.
+- **TDR ceiling:** at most 6 CandidateCrash per run (`tdr_budget_exhausted` after that). Earlier
+  runs no longer block a new run.
+- **Resume:** it stops at stock with `resume_block_reason` set when stock comes back more than 60 MHz
+  slower than earlier in the run.
+
+## 2026-10-01: load steps and hot-bin anchor, search 11
 
 Search VERSION 11, ExactApply 39 and Frontier 34: v10 checkpoints and v38/v33 evidence cannot
 resume or re-synthesize profiles. Additive only.

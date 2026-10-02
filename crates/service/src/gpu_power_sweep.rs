@@ -128,11 +128,13 @@ const F2_PREHEAT_CLOCK_DELTA_MHZ: u32 = 30;
 const F2_PREHEAT_MIN_SAMPLES: u32 = 30;
 
 
-/// A qualification campaign may spend at most two attributable CandidateCrash/TDR events. Once a
-/// third current-contract event exists, future runs fail closed before any undervolt candidate is
-/// armed. This is a persistent, cross-run budget; Clean only clears positive/operational learning.
+/// TDRs by meaning (user decision 2026-10-01). A staircase-edge TDR is expected search evidence:
+/// its pair and physical cone stay condemned for every future run, and it never blocks a later
+/// run. One run may spend at most this many attributable CandidateCrash/TDR events, a sanity
+/// ceiling against a bug or crash loop; past it, Resume is refused and the proven pairs publish.
+/// Unexpected TDRs (dominated or publication pairs) already close the search on their own.
 #[cfg(windows)]
-const F2_TDR_CANDIDATE_CRASH_BUDGET: usize = 2;
+const F2_TDR_RUN_SANITY_CEILING: usize = 6;
 
 // Safety history is durable across positive-evidence revisions. v29 introduced attributed
 // CandidateCrash records; a workload revision must never erase their budget or physical cone.
@@ -187,19 +189,49 @@ pub(crate) fn f2_effective_candidate_crashes(
 }
 
 #[cfg(windows)]
-fn f2_crash_budget_error(crashes: usize) -> Option<String> {
-    (crashes > F2_TDR_CANDIDATE_CRASH_BUDGET).then(|| format!(
-        "Forge safety limit reached: {crashes} effective GPU crash incidents under contract v{} or later (limit {}). Further exploration is blocked. Soft Reset preserves this limit. Full Reset explicitly erases all GPU learning and known failures; review the incident report before deciding.",
-        F2_CANDIDATE_CRASH_MIN_CONTRACT, F2_TDR_CANDIDATE_CRASH_BUDGET,
+fn f2_crash_budget_error(run_crashes: usize) -> Option<String> {
+    (run_crashes > F2_TDR_RUN_SANITY_CEILING).then(|| format!(
+        "Forge safety ceiling reached: {run_crashes} GPU crash incidents in this run (limit {F2_TDR_RUN_SANITY_CEILING}). Further exploration of this run is blocked and its proven pairs are published. A new run starts a fresh count; every known crash region stays condemned.",
     ))
 }
 
+/// `run_id` is the run being started or resumed; only its own crashes count toward the ceiling.
+/// A new run (`None`) is never blocked by earlier runs' crashes.
 #[cfg(windows)]
-fn f2_current_crash_budget_error(crashes: &[nidavellir_core::condemnation::CondemnationEvent], gpu_key: &str) -> Option<String> {
+fn f2_current_crash_budget_error(
+    crashes: &[nidavellir_core::condemnation::CondemnationEvent],
+    gpu_key: &str,
+    run_id: Option<&str>,
+) -> Option<String> {
     match crate::development_validation::budget_override(crashes, gpu_key) {
         Some(result) => result.err(),
-        None => f2_crash_budget_error(crashes.len()),
+        None => f2_crash_budget_error(f2_run_crash_count(crashes, run_id)),
     }
+}
+
+/// An opted-in run interrupted at a staircase-edge TDR may resume itself: its search is still open
+/// (unexpected TDRs close it) and the only pending incident, if any, is this run's own
+/// CandidateCrash. Every Resume guard (reboot latch, boot flag, Safe Mode, crash ceiling, build
+/// and driver identity) still runs inside `resume`.
+#[cfg(windows)]
+pub(crate) fn auto_resume_eligible(
+    progress: &PowerSweepProgress,
+    pending: Option<&nidavellir_core::safe_loop::ForgeIncident>,
+) -> bool {
+    progress.auto_resume
+        && !progress.running
+        && progress.phase == "interrupted"
+        && progress.discovery_search.as_ref().is_some_and(|search| search.stop_reason.is_none())
+        && pending.is_none_or(|incident| {
+            incident.kind == nidavellir_core::safe_loop::ForgeIncidentKind::CandidateCrash
+                && incident.run_id.is_some()
+                && incident.run_id == progress.run_id
+        })
+}
+
+#[cfg(windows)]
+fn f2_run_crash_count(crashes: &[nidavellir_core::condemnation::CondemnationEvent], run_id: Option<&str>) -> usize {
+    run_id.map_or(0, |run| crashes.iter().filter(|event| event.run_id.as_deref() == Some(run)).count())
 }
 
 /// Read-only readiness shared by the UI and start guards; never initializes a workload.
@@ -212,7 +244,7 @@ pub(crate) fn forge_start_block_reason(store: &SafeLoopStore) -> Option<String> 
         match nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir()).load_all_checked() {
             Ok(events) => {
                 let gpu_key = current_gpu_key();
-                f2_current_crash_budget_error(&f2_effective_candidate_crashes(&events, &gpu_key), &gpu_key)
+                f2_current_crash_budget_error(&f2_effective_candidate_crashes(&events, &gpu_key), &gpu_key, None)
             },
             Err(error) => Some(format!("Safety history is unreadable; Forge refused: {error}")),
         }
@@ -228,11 +260,12 @@ pub(crate) fn forge_start_block_reason(store: &SafeLoopStore) -> Option<String> 
 fn f2_tdr_safety_policy(
     events: &[nidavellir_core::condemnation::CondemnationEvent],
     gpu_key: &str,
+    run_id: Option<&str>,
     targets_descending: &[u32],
     voltage_bins_ascending: &[u32],
 ) -> Result<F2TdrSafetyPolicy, String> {
     let crashes = f2_effective_candidate_crashes(events, gpu_key);
-    if let Some(reason) = f2_current_crash_budget_error(&crashes, gpu_key) {
+    if let Some(reason) = f2_current_crash_budget_error(&crashes, gpu_key, run_id) {
         return Err(reason);
     }
     f2_tdr_cone(crashes, gpu_key, targets_descending, voltage_bins_ascending)
@@ -1131,6 +1164,11 @@ pub struct PowerSweepHandle {
     stop: Arc<AtomicBool>,
     manual_stop: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    /// The automatic-Resume opt-in lives outside the worker-owned progress, which a running Forge
+    /// replaces wholesale; `progress()` reports it. Persisted in `forge_options.json`.
+    auto_resume: Arc<AtomicBool>,
+    /// Epoch ms of a pending automatic Resume; 0 when none.
+    auto_resume_at_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for PowerSweepHandle {
@@ -1140,8 +1178,32 @@ impl Default for PowerSweepHandle {
             stop: Arc::new(AtomicBool::new(false)),
             manual_stop: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
+            auto_resume: Arc::new(AtomicBool::new(false)),
+            auto_resume_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
+}
+
+#[cfg(windows)]
+fn forge_options_path() -> std::path::PathBuf {
+    nidavellir_core::safe_loop::default_data_dir().join("forge_options.json")
+}
+
+/// A user preference, not learning: Full Reset keeps it.
+#[cfg(windows)]
+fn load_auto_resume_option() -> bool {
+    std::fs::read_to_string(forge_options_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get("auto_resume")?.as_bool())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn save_auto_resume_option(enabled: bool) -> Result<(), String> {
+    std::fs::create_dir_all(nidavellir_core::safe_loop::default_data_dir()).map_err(|e| e.to_string())?;
+    std::fs::write(forge_options_path(), serde_json::json!({ "auto_resume": enabled }).to_string())
+        .map_err(|error| format!("forge_options.json não pôde ser gravado: {error}"))
 }
 
 fn record_operator_field_failure(
@@ -1201,10 +1263,11 @@ fn record_operator_field_failure(
 
 impl PowerSweepHandle {
     pub fn progress(&self) -> PowerSweepProgress {
-        self.progress
-            .lock()
-            .map(|p| p.clone())
-            .unwrap_or_else(|_| idle())
+        let mut progress = self.progress.lock().map(|p| p.clone()).unwrap_or_else(|_| idle());
+        progress.auto_resume = self.auto_resume.load(Ordering::SeqCst);
+        progress.auto_resume_at_ms =
+            Some(self.auto_resume_at_ms.load(Ordering::SeqCst)).filter(|at| *at > 0);
+        progress
     }
     pub fn stop(&self) {
         self.manual_stop.store(true, Ordering::SeqCst);
@@ -1479,6 +1542,30 @@ impl PowerSweepHandle {
                 gpu_reboot_required,
                 &condemnation_events,
             );
+        }
+    }
+
+    /// Opt in or out of automatic Resume (2026-10-01). Turning it off also cancels a countdown.
+    #[cfg(windows)]
+    pub fn set_auto_resume(&self, enabled: bool) -> Result<PowerSweepProgress, String> {
+        save_auto_resume_option(enabled)?;
+        self.auto_resume.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            self.auto_resume_at_ms.store(0, Ordering::SeqCst);
+        }
+        Ok(self.progress())
+    }
+
+    /// Show or clear the automatic-Resume countdown with a log line. No hardware work; the line is
+    /// persisted only while no Forge worker owns the progress.
+    #[cfg(windows)]
+    pub(crate) fn note_auto_resume(&self, at_ms: Option<u64>, line: String) {
+        self.auto_resume_at_ms.store(at_ms.unwrap_or(0), Ordering::SeqCst);
+        if let Ok(mut progress) = self.progress.lock() {
+            if !progress.running {
+                progress.log.push(line);
+                save_forge_state(&current_gpu_key(), &progress);
+            }
         }
     }
 
@@ -2703,6 +2790,7 @@ pub(crate) fn current_gpu_key() -> String {
 #[cfg(windows)]
 pub fn restore_handle() -> PowerSweepHandle {
     let handle = PowerSweepHandle::default();
+    handle.auto_resume.store(load_auto_resume_option(), Ordering::SeqCst);
     let gpu_key = current_gpu_key();
     if let Some(mut prog) = load_forge_state(&gpu_key) {
         let store = SafeLoopStore::system();
@@ -2758,7 +2846,7 @@ pub fn finish_soft_reset(store: &SafeLoopStore) -> Result<(), String> {
     {
         return Err("Soft reset requires confirmed stock recovery and a disarmed Safe Loop".into());
     }
-    crate::safe_loop_runtime::acknowledge_forge_incident(store)?;
+    crate::safe_loop_runtime::acknowledge_forge_incident(store, None)?;
     let mut record = store.load_record_checked().map_err(|e| e.to_string())?;
     record.last_validated = None;
     store.save_record(&record).map_err(|e| format!("Soft Reset could not clear the last validated point: {e}"))?;
@@ -9024,6 +9112,8 @@ fn measure_multiclock_undervolt_forge(
     );
     let previous = progress.lock().map(|g| g.clone()).unwrap_or_default();
     let resume_requested = intent == ForgeRunIntent::Resume;
+    let previous_stock_mhz =
+        (resume_requested && previous.stock_clock_mhz > 0).then_some(previous.stock_clock_mhz);
     let elapsed_before_session_ms = if resume_requested {
         previous.elapsed_ms
     } else {
@@ -9297,6 +9387,19 @@ fn measure_multiclock_undervolt_forge(
             return;
         }
     };
+    if let Some(reason) = f2_resume_stock_drift(previous_stock_mhz, preheat.sustained_clock_mhz) {
+        let _ = final_reset(store, true);
+        prog.running = false;
+        prog.phase = "incomplete".into();
+        prog.resume_available = false;
+        prog.resume_block_reason = Some(reason.clone());
+        prog.note = Some(format!(
+            "Retomada parada no stock: {reason}. Reinicie o Windows; o checkpoint da run continua salvo e ela retoma do mesmo ponto."
+        ));
+        set(progress, prog);
+        warn!("f2-forge: resume stock drift: {reason}");
+        return;
+    }
     prog.preheat_converged = Some(true);
     prog.preheat_temperature_c = Some(preheat.temperature_c);
     prog.stock_clock_mhz = preheat.sustained_clock_mhz;
@@ -9433,6 +9536,7 @@ fn measure_multiclock_undervolt_forge(
     let tdr_policy = match f2_tdr_safety_policy(
         &condemnation_events,
         &gpu_key,
+        Some(&run_id),
         &targets,
         &voltage_bins_ascending,
     ) {
@@ -9461,9 +9565,10 @@ fn measure_multiclock_undervolt_forge(
     let tdr_safety_cone = tdr_policy.floors;
     if !tdr_policy.crashes.is_empty() {
         prog.log.push(format!(
-            "Proteção TDR exact-v{F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION}: {}/{} CandidateCrash efetivo(s); cone físico 1 clock-bin : 1 voltage-bin ativo em {} alvo(s).",
+            "Proteção TDR exact-v{F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION}: {}/{} CandidateCrash nesta run ({} no histórico); cone físico 1 clock-bin : 1 voltage-bin ativo em {} alvo(s).",
+            f2_run_crash_count(&tdr_policy.crashes, Some(&run_id)),
+            F2_TDR_RUN_SANITY_CEILING,
             tdr_policy.crashes.len(),
-            F2_TDR_CANDIDATE_CRASH_BUDGET,
             tdr_safety_cone.len(),
         ));
         for event in &tdr_policy.crashes {
@@ -10137,7 +10242,8 @@ fn measure_multiclock_undervolt_forge(
         let resume_refused = nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir())
             .load_all_checked()
             .map_or(true, |events| {
-                f2_current_crash_budget_error(&f2_effective_candidate_crashes(&events, &gpu_key), &gpu_key).is_some()
+                f2_current_crash_budget_error(&f2_effective_candidate_crashes(&events, &gpu_key), &gpu_key, Some(&run_id))
+                    .is_some()
             });
         if resume_refused {
             search::close_all(&mut discovery, "tdr_budget_exhausted");
@@ -10327,6 +10433,21 @@ fn measure_multiclock_undervolt_forge(
     info!("F2 undervolt forge finished");
 }
 
+/// A driver back from a TDR (driver reset or reboot) can be stuck in a lower performance state,
+/// which would turn every later candidate into a clock failure. Four clock bins absorb ambient
+/// drift between sessions; a stuck state is hundreds of MHz lower.
+#[cfg(windows)]
+const F2_RESUME_STOCK_DRIFT_MHZ: u32 = 60;
+
+#[cfg(windows)]
+fn f2_resume_stock_drift(before_mhz: Option<u32>, now_mhz: u32) -> Option<String> {
+    before_mhz
+        .filter(|&before| now_mhz.saturating_add(F2_RESUME_STOCK_DRIFT_MHZ) < before)
+        .map(|before| format!(
+            "o stock sustenta {now_mhz} MHz, abaixo dos {before} MHz medidos antes nesta run (tolerância {F2_RESUME_STOCK_DRIFT_MHZ} MHz)"
+        ))
+}
+
 #[cfg(windows)]
 fn f2_terminal_phase(
     pending_candidate_crash: bool,
@@ -10354,6 +10475,15 @@ fn f2_terminal_phase(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn resume_stops_when_stock_comes_back_slower_than_the_run_measured() {
+        assert!(super::f2_resume_stock_drift(None, 1400).is_none());
+        assert!(super::f2_resume_stock_drift(Some(1950), 1890).is_none());
+        assert!(super::f2_resume_stock_drift(Some(1950), 2000).is_none());
+        assert!(super::f2_resume_stock_drift(Some(1950), 1889).is_some());
+    }
+
     #[cfg(windows)]
     #[test]
     fn clock_control_refusal_budget_survives_resume_without_voltage_repair() {
@@ -12573,6 +12703,37 @@ mod tests {
             1850,
             "below 87% floor excluded despite best MHz/W"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn auto_resume_only_continues_an_opted_in_run_paused_at_its_own_edge_tdr() {
+        use nidavellir_core::safe_loop::{ForgeIncident, ForgeIncidentKind};
+        let mut progress = PowerSweepProgress {
+            auto_resume: true,
+            phase: "interrupted".into(),
+            run_id: Some("run-a".into()),
+            discovery_search: Some(Default::default()),
+            ..Default::default()
+        };
+        let crash = |run: &str| ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash, Some(run.into()), Some("gpu".into()), Some(1815), Some(887), "tdr",
+        );
+        assert!(auto_resume_eligible(&progress, Some(&crash("run-a"))));
+        assert!(auto_resume_eligible(&progress, None), "already acknowledged");
+        assert!(!auto_resume_eligible(&progress, Some(&crash("run-b"))), "another run's incident");
+        let other = ForgeIncident::new(
+            ForgeIncidentKind::OperatorFieldFailure, Some("run-a".into()), None, None, None, "field",
+        );
+        assert!(!auto_resume_eligible(&progress, Some(&other)), "only CandidateCrash");
+        progress.discovery_search.as_mut().unwrap().stop_reason = Some("driver_failure_recovery_required".into());
+        assert!(!auto_resume_eligible(&progress, Some(&crash("run-a"))), "an unexpected TDR closed the search");
+        progress.discovery_search.as_mut().unwrap().stop_reason = None;
+        progress.phase = "paused".into();
+        assert!(!auto_resume_eligible(&progress, None), "a manual Stop is never auto-resumed");
+        progress.phase = "interrupted".into();
+        progress.auto_resume = false;
+        assert!(!auto_resume_eligible(&progress, Some(&crash("run-a"))));
     }
 
     #[cfg(windows)]
@@ -16219,7 +16380,7 @@ mod tests {
         wrong_kind.kind = nidavellir_core::condemnation::KIND_FIELD_TDR.into();
         events.push(wrong_kind);
 
-        let policy = f2_tdr_safety_policy(&events, "gpu-a", &targets, &bins).unwrap();
+        let policy = f2_tdr_safety_policy(&events, "gpu-a", None, &targets, &bins).unwrap();
         assert_eq!(
             policy.crashes.len(),
             2,
@@ -16234,11 +16395,22 @@ mod tests {
             Some(&(1800, 881))
         );
 
-        // A third unique event closes the finite campaign on every future mode, including Clean.
+        // 2026-10-01: earlier runs' edge TDRs never block a new run; their cones still apply.
         events.push(crash("run-clean-c", "gpu-a", 1890, 918, "event-3"));
-        assert!(f2_tdr_safety_policy(&events, "gpu-a", &targets, &bins)
+        let fresh = f2_tdr_safety_policy(&events, "gpu-a", None, &targets, &bins).unwrap();
+        assert_eq!(fresh.crashes.len(), 3);
+        // One run may spend six; the seventh ends its exploration.
+        let run_events = (0..6)
+            .map(|n| crash("run-d", "gpu-a", 1890, 918, &format!("run-d-{n}")))
+            .collect::<Vec<_>>();
+        let mut with_run = events.clone();
+        with_run.extend(run_events);
+        assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-d"), &targets, &bins).is_ok());
+        with_run.push(crash("run-d", "gpu-a", 1890, 918, "run-d-6"));
+        assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-d"), &targets, &bins)
             .unwrap_err()
-            .contains("safety limit reached"));
+            .contains("safety ceiling reached"));
+        assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-e"), &targets, &bins).is_ok());
 
         // Explicit rehabilitation is resolved before the CandidateCrash filter and reopens budget.
         events.push(CondemnationEvent {
@@ -16254,7 +16426,7 @@ mod tests {
             rehabilitated: true,
         });
         assert_eq!(
-            f2_tdr_safety_policy(&events, "gpu-a", &targets, &bins)
+            f2_tdr_safety_policy(&events, "gpu-a", None, &targets, &bins)
                 .unwrap()
                 .crashes
                 .len(),
@@ -16281,7 +16453,7 @@ mod tests {
             rehabilitated: false,
         }];
         let err =
-            f2_tdr_safety_policy(&events, "gpu-a", &[1920, 1905], &[925, 931, 937]).unwrap_err();
+            f2_tdr_safety_policy(&events, "gpu-a", None, &[1920, 1905], &[925, 931, 937]).unwrap_err();
         assert!(
             err.contains("não pertence aos bins físicos atuais"),
             "{err}"

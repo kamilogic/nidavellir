@@ -1,3 +1,5 @@
+#[cfg(windows)]
+mod auto_resume;
 mod detector_lab;
 mod development_validation;
 mod game_trace;
@@ -508,6 +510,8 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     }));
     #[cfg(windows)]
     console_shutdown::install(Arc::clone(&state));
+    #[cfg(windows)]
+    auto_resume::spawn(Arc::clone(&state));
     let result = ipc_server::run_pipe_server(Arc::clone(&state), None);
     // A fatal listener error must also release workers and restore any applied tuning.
     let cleanup = shutdown::complete(state, std::time::Duration::from_secs(30));

@@ -81,10 +81,18 @@ Decisões do usuário após a run f2-forge-1790617016985. Essa run qualificou 19
   - A run pausa com o par condenado e o cone aplicado.
   - Reinicie o Windows, reconheça o incidente e use Retomar: a mesma run continua no próximo degrau.
   - Continuar no mesmo boot é proibido (22/07: depois de um TDR, até o 1800@875 estável falhou).
-  - No último degrau, ou se o orçamento de crashes recusaria a retomada, a run publica os pares já
-    provados.
-- **Orçamento de crashes:** bloqueia só nova exploração (Start/Retomar). O cone de TDR continua
-  valendo para Apply, restauração de perfis e publicação após crash.
+    A única exceção é o reset só do driver (01/10, experimental, serviço instalado): o adaptador
+    NVIDIA reinicia via PnP e o serviço volta num processo novo.
+  - No último degrau, ou se o teto de TDRs recusaria a retomada, a run publica os pares já provados.
+- **Retomada automática (opt-in, 01/10):** espera 120 s e reconhece só o CandidateCrash desta run.
+  Se o boot ainda guarda o TDR, tenta o reset só do driver uma vez por incidente; senão espera o
+  reboot.
+  - Toda retomada refaz o preheat stock, a curva V/F e a matriz de APIs em stock.
+  - Se o stock sustentado cair mais de 60 MHz em relação ao início da run, ela para em stock e pede
+    reboot.
+- **Teto de TDRs:** até 6 CandidateCrash por run. Runs anteriores não bloqueiam uma nova. O teto
+  bloqueia só nova exploração (Start/Retomar); o cone de TDR continua valendo para Apply,
+  restauração de perfis e publicação após crash.
 
 ## Calor, margem e aceite em jogo (27/09)
 

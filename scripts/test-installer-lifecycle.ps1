@@ -34,6 +34,11 @@ function Invoke-CimMethod {
     }
     [pscustomobject]@{ ReturnValue = 0 }
 }
+# Functions outrank applications, so the helper's sc.exe recovery calls never reach the host.
+function sc.exe {
+    $global:NidavellirInstallerFixture.Calls.Add("sc:$($args[0])")
+    $global:LASTEXITCODE = $(if ($global:NidavellirInstallerFixture.Fail -eq "sc:$($args[0])") { 5 } else { 0 })
+}
 function Test-Path {
     param($LiteralPath, $PathType)
     if ($PathType -ne 'Leaf' -or -not $LiteralPath.EndsWith('\nidavellir-service.exe')) { throw "Unexpected binary path: $LiteralPath" }
@@ -55,7 +60,7 @@ function Assert-Failure([string]$Action, [string]$Message) {
 try {
     New-Fixture
     & $helper -Action Install -InstallDir $installDir | Out-Null
-    Assert-Calls 'Create,StartService'
+    Assert-Calls 'Create,sc:failure,sc:failureflag,StartService'
     $expectedPath = '"' + (Join-Path $installDir 'nidavellir-service.exe') + '"'
     if ($global:NidavellirInstallerFixture.PathName -ne $expectedPath) { throw 'Service executable path must retain quotes' }
 
@@ -63,9 +68,9 @@ try {
     & $helper -Action Prepare -InstallDir $installDir | Out-Null
     Assert-Calls 'StopService'
     & $helper -Action Install -InstallDir $installDir | Out-Null
-    Assert-Calls 'StopService,Change,StartService'
+    Assert-Calls 'StopService,Change,sc:failure,sc:failureflag,StartService'
     & $helper -Action Uninstall -InstallDir $installDir | Out-Null
-    Assert-Calls 'StopService,Change,StartService,StopService,Delete'
+    Assert-Calls 'StopService,Change,sc:failure,sc:failureflag,StartService,StopService,Delete'
 
     New-Fixture
     & $helper -Action Uninstall -InstallDir $installDir | Out-Null
@@ -82,6 +87,13 @@ try {
         $action = if ($operation -eq 'Delete') { 'Uninstall' } elseif ($operation -eq 'StopService') { 'Prepare' } else { 'Install' }
         Assert-Failure $action "$operation failed"
         if ($global:NidavellirInstallerFixture.Calls[-1] -ne $operation) { throw 'Workflow continued after a failure' }
+    }
+
+    foreach ($operation in @('sc:failure', 'sc:failureflag')) {
+        New-Fixture
+        $global:NidavellirInstallerFixture.Fail = $operation
+        Assert-Failure 'Install' 'could not be set'
+        if ($global:NidavellirInstallerFixture.Calls[-1] -ne $operation) { throw 'Service started without recovery actions' }
     }
 
     New-Fixture $true

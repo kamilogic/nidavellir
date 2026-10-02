@@ -1,5 +1,56 @@
 # Nidavellir — Decision Log
 
+## 2026-10-01 (c) — TDR autonomy: per-run ceiling, opt-in auto-resume, driver-only reset
+
+The user's concern: limiting TDRs sacrifices discoveries and confidence, but restarting and resuming
+by hand after each one is impractical. The user picked all three recommended options:
+- **Per-run sanity ceiling 6** (`F2_TDR_RUN_SANITY_CEILING`) replaces the cross-run budget of 2.
+  - Only this run's effective CandidateCrash events count.
+  - The 7th closes the search (`tdr_budget_exhausted`) and publishes the proven pairs.
+  - Earlier runs never block a new run. Condemnations and TDR cones stay permanent.
+  - A TDR that is not this run's exact CandidateCrash still stops and waits for the user.
+- **Opt-in auto-resume** (`SetForgeAutoResume`, stored in `forge_options.json`; Full Reset keeps
+  it).
+  - A supervisor waits 120 s, shown as a UI countdown with Cancel.
+  - It then acknowledges only this run's CandidateCrash (the durable condemnation is written first)
+    and calls the same Resume a click calls.
+  - One attempt per incident. A refusal is logged and the run waits for the user.
+- **Driver-only reset (experimental, installed service only).** It runs when the boot's TDR latch
+  is still set at the end of the countdown.
+  - Preconditions:
+    - SCM recovery must restart the service: every failure action is Restart, and non-crash
+      failures count.
+    - At most one attempt per incident, recorded in `gpu_driver_reset.json` before the stop.
+  - Steps:
+    1. The service stops like an SCM stop: workers released, stock confirmed, NVAPI released,
+       clean marker written.
+    2. `pnputil /restart-device` runs on the single NVIDIA display adapter (≤ 60 s), then the
+       service waits for status OK (≤ 30 s).
+    3. Only then does it record `covers_tdr`: the newest nvlddmkm-153 event, which must lie within
+       60 s of the incident.
+    4. It exits non-zero. SCM starts a fresh process whose startup latch skips exactly that TDR.
+  - Anything else keeps the reboot requirement, which stays the fallback (2026-07-22: reboot is the
+    evidence boundary). This covers any failure, a newer TDR, two NVIDIA adapters, console mode and
+    missing SCM recovery.
+- **Validation after a reset or a reboot:** every Resume already re-runs the stock preheat, the live
+  V/F sanity check and the v27 stock API matrix.
+  - New: a Resume whose sustained stock clock is more than 60 MHz below the run's earlier stock stops
+    at stock and asks for a reboot.
+  - A driver stuck in a lower P-state would otherwise fake clock failures.
+- **Installer:** `service-lifecycle.ps1` now sets SCM recovery: restart after 5 s on every failure,
+  reset after 1 day, `failureflag 1`.
+- **Dev:** `scripts/dev-service-boot.ps1 -Action Install|Uninstall` registers the release build the
+  same way.
+  - The binary runs from `C:\Program Files\Nidavellir Dev`, because a LocalSystem service must not
+    run a user-writable binary.
+  - `dev-launch.bat` uses a registered service when one exists.
+- **Rejected:**
+  - No limit at all: a broken setup could loop forever.
+  - Re-initializing NVAPI, NVML and wgpu in-process after the device restart.
+  - An abrupt exit: the armed boot flag would count as a crash.
+- **Not validated on hardware:** pnputil on this driver, a full Forge in session 0 (before login),
+  and the SCM restart cycle.
+
 ## 2026-10-01 (b) — load steps in the matrix; a hot-bin anchor counts 10 mV higher (search 11)
 
 Why one test TDR'd 1815@887 while the next passed 881…843 at the same clock (user question):

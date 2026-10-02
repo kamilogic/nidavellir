@@ -1,6 +1,39 @@
 # Nidavellir — Session Handoff
 
-## LATEST — load steps + hot-bin anchor (2026-10-01, search 11)
+## LATEST — TDR autonomy (2026-10-01 c), branch `forge-tdr-autonomy-2026-10-01`
+
+The user wants an overnight run to finish with nobody logged in, even through recoverable TDRs. See
+decisions.md 2026-10-01 (c).
+- **Implemented, uncommitted:**
+  - per-run TDR ceiling 6;
+  - opt-in auto-resume (`SetForgeAutoResume`, UI checkbox with countdown);
+  - experimental driver-only reset in the installed service (`auto_resume.rs`, `service_impl.rs`
+    hook, startup latch skip in `tdr_sentinel.rs`);
+  - stock-drift stop on Resume (60 MHz);
+  - SCM recovery in `service-lifecycle.ps1`;
+  - `scripts/dev-service-boot.ps1`;
+  - `dev-launch.bat` uses a registered service.
+- **Validation:**
+  - Rust 724 pass / 3 ignored, release build clean, UI 18/18 + build, installer lifecycle test
+    passes (sc.exe mocked).
+  - Nothing ran on hardware.
+- **Safety audit: GO with nits.**
+  - Fixed: auto-resume acknowledges only the exact incident id it read (compare-and-ack); a Resume
+    refused after the acknowledgement gets no second countdown.
+  - Open:
+    - `gpu_driver_reset.json` shares the ProgramData trust model (ACL hardening is a product item);
+    - an installer run within ~5 s of a driver reset would see exit 1 and abort (fail-safe).
+- **User test plan:**
+  1. Elevated PowerShell: `scripts\dev-service-boot.ps1 -Action Install`.
+  2. Run `dev-launch.bat`; it detects the service and opens the UI.
+  3. Full Reset → Clean with "Continue on its own" checked.
+- **Watch in the log:**
+  - "Reset só do driver da GPU…", followed by a new countdown after the service returns;
+  - otherwise, "Este boot ainda guarda o TDR… Reinicie o Windows".
+  - `C:\ProgramData\Nidavellir\gpu_driver_reset.json` shows `covers_tdr` or `error`.
+- **Uninstall the dev service:** `scripts\dev-service-boot.ps1 -Action Uninstall`. Data is kept.
+
+## Previous — load steps + hot-bin anchor (2026-10-01, search 11)
 
 The user's question was why the test failed 1815@887 once and then passed 881…843. See decisions.md
 2026-10-01 (b).
@@ -12,20 +45,12 @@ The user's question was why the test failed 1815@887 once and then passed 881…
   - selection holds the one hot bin.
 - **Validation:** Rust 721/3 ignored. Safety audit GO; its two nits (sliced load-step idle, stale
   "v29" log strings) are fixed.
-- **TDR decisions (user, 2026-10-01), not implemented yet. Plan: one commit and audit per step:**
-  1. A per-run sanity ceiling of 6 replaces the cross-run budget of 2. Edge TDRs stop blocking
-     future runs; condemnations stay permanent.
-  2. Opt-in auto-resume at run start.
-  3. Experimental GPU driver reset after a recovered TDR, validated by the stock mirror, with
-     reboot as fallback.
+- **TDR decisions (user, 2026-10-01):** implemented in 2026-10-01 (c) above.
 - **Login PIN:** the installed service starts before login, so auto-resume needs no PIN there (lanes
   are headless, but a full Forge in session 0 is not validated yet). The dev BAT runs only after
   login.
 - **Before updating:** the current run's profiles (ExactApply38) stop re-synthesizing after the
   update. Test 1815@881 in Overwatch first if wanted.
-- **Next:** rebuild with the BAT, then Full Reset → Clean. Expect more TDR pauses at level edges.
-- **Decision pending:** the TDR crash budget is still 2 per run, which can stop the run before the
-  −10% level. Raising it to 3 would allow one per level.
 
 ## Previous — selection holds the one hot bin (2026-10-01)
 

@@ -233,10 +233,19 @@ pub fn status_snapshot(store: &SafeLoopStore) -> SafeLoopStatus {
 }
 
 /// Explicitly release the pending Forge incident latch while preserving blacklist and history.
-pub fn acknowledge_forge_incident(store: &SafeLoopStore) -> Result<bool, String> {
+/// `expected_id` (auto-resume) refuses when the latch no longer holds the incident it decided on.
+pub fn acknowledge_forge_incident(
+    store: &SafeLoopStore,
+    expected_id: Option<&str>,
+) -> Result<bool, String> {
     let mut record = store.load_record_checked().map_err(|error| {
         format!("Safe Loop record is unreadable; acknowledgement refused: {error}")
     })?;
+    if expected_id.is_some_and(|id| {
+        record.pending_forge_incident.as_ref().map(|incident| incident.id.as_str()) != Some(id)
+    }) {
+        return Err("o incidente pendente mudou; reconhecimento automático recusado".into());
+    }
     #[cfg(windows)]
     if let Some(incident) = record.pending_forge_incident.as_ref().filter(|incident| {
         incident.kind == nidavellir_core::safe_loop::ForgeIncidentKind::CandidateCrash
@@ -420,7 +429,10 @@ mod tests {
         let store = SafeLoopStore::new(&base);
         pending_candidate_crash(&store);
 
-        assert_eq!(acknowledge_forge_incident(&store), Ok(true));
+        // Auto-resume's compare-and-acknowledge refuses a latch that changed under it.
+        assert!(acknowledge_forge_incident(&store, Some("another-incident")).is_err());
+        assert!(store.load_record().pending_forge_incident.is_some());
+        assert_eq!(acknowledge_forge_incident(&store, None), Ok(true));
         assert!(store.load_record().pending_forge_incident.is_none());
         let effective = nidavellir_core::condemnation::effective_condemnation_events(
             &CondemnationLedger::new(&base).load_all(),
@@ -458,7 +470,7 @@ mod tests {
         let store = SafeLoopStore::new(&base);
         pending_candidate_crash(&store);
 
-        let error = acknowledge_forge_incident(&store).unwrap_err();
+        let error = acknowledge_forge_incident(&store, None).unwrap_err();
         assert!(error.contains("continua pendente"), "{error}");
         assert!(store.load_record().pending_forge_incident.is_some());
 

@@ -1,6 +1,22 @@
 # Nidavellir — Project Memory
 
-## Current — load steps + hot-bin anchor (2026-10-01, search 11, ExactApply39/Frontier34)
+## Current — TDR autonomy (2026-10-01 c, branch forge-tdr-autonomy-2026-10-01)
+
+- **Goal:** an overnight Clean Run finishes on its own, including edge TDRs, with nobody logged in.
+- **Implemented:** see decisions.md 2026-10-01 (c).
+  - A per-run ceiling of 6 TDRs.
+  - Opt-in auto-resume: 120 s countdown, acknowledges only this run's CandidateCrash, then Resume.
+  - Experimental driver-only reset when the boot still holds the TDR. The service stops at stock,
+    runs `pnputil /restart-device` and exits non-zero. SCM restarts it, and `gpu_driver_reset.json`
+    lets the new process skip exactly that TDR.
+  - A Resume with stock more than 60 MHz below the run's earlier stock stops and asks for a reboot.
+- **Product installer and dev script:** SCM recovery (restart). The dev service is registered by
+  `scripts/dev-service-boot.ps1 -Action Install`, run elevated by the user.
+- **Not hardware-validated:** pnputil on driver 595.97, a Forge in session 0, the SCM restart cycle.
+- **Build revision:** Resume needs the same build. Never update the service during a run.
+- **Still open from search 11:** v38 runs no longer re-synthesize into applicable profiles.
+
+## Previous — load steps + hot-bin anchor (2026-10-01, search 11, ExactApply39/Frontier34)
 
 - **Why 1815@887 TDR'd once and 881…843 passed later:**
   - TDR is ~7% per idle→heavy step, and the matrix had only ~6 steps per pair.
@@ -11,13 +27,8 @@
   anchors the game margin +10 mV. Search (`QualifiedHotBin`) and synthesis (`hot_bin_relief`) share
   the rule. Never inconclusive.
 - **Selection** treats a one-hot-bin p5 as the target (F2 only).
-- **Open:**
-  - TDR handling (user decisions, not implemented yet):
-    - a per-run sanity ceiling of 6 replaces the cross-run budget of 2;
-    - opt-in auto-resume;
-    - an experimental driver reset after a recovered TDR, with reboot as fallback.
-  - The PIN only blocks the dev BAT: the installed service starts before login.
-  - v38 runs no longer re-synthesize into applicable profiles.
+- **Open then:** TDR handling (implemented in 2026-10-01 c above). The PIN only blocks the dev BAT:
+  the installed service starts before login.
 
 ## Previous — first search-10 run and selection fix (2026-10-01)
 

@@ -101,7 +101,8 @@ fn event_is_from_current_boot(timestamp: &str, boot_epoch_ms: u64) -> bool {
 }
 
 /// Seed the process-local reboot latch from the durable Windows Event Log. A service restart on the
-/// same boot therefore cannot make a post-TDR GPU look clean; only a newer Windows boot clears it.
+/// same boot therefore cannot make a post-TDR GPU look clean; only a newer Windows boot, or a
+/// completed PnP restart of the GPU recorded for exactly the newest TDR, clears it.
 pub(crate) fn initialize_reboot_guard() -> Result<SentinelStartupSnapshot, String> {
     let latest_tdr = match query_latest_tdr_event_checked() {
         Ok(event) => event,
@@ -120,6 +121,9 @@ pub(crate) fn initialize_reboot_guard() -> Result<SentinelStartupSnapshot, Strin
     let current_boot_tdr = latest_tdr
         .as_deref()
         .filter(|timestamp| event_is_from_current_boot(timestamp, current_boot_epoch_ms()))
+        // A completed driver-only reset after exactly this event stands in for the reboot
+        // (auto_resume, 2026-10-01). Any newer TDR latches again.
+        .filter(|timestamp| !crate::auto_resume::driver_reset_covers(timestamp))
         .map(str::to_owned);
     let mut slot = reboot_required_slot()
         .lock()
@@ -395,7 +399,7 @@ fn parse_wevtutil_query<T>(
 
 /// Newest nvlddmkm-153 event timestamp, distinguishing an empty log from an unavailable/corrupt
 /// Event Log. Startup callers must use this checked form so a query failure cannot look like stock.
-fn query_latest_tdr_event_checked() -> Result<Option<String>, String> {
+pub(crate) fn query_latest_tdr_event_checked() -> Result<Option<String>, String> {
     let out = std::process::Command::new("wevtutil")
         .args([
             "qe",

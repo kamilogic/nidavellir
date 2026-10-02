@@ -8,6 +8,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
+sc.exe query NidavellirCore >nul 2>&1
+if not errorlevel 1 (
+    echo Servico NidavellirCore registrado no Windows: a interface usa esse servico.
+    echo Para atualizar o binario, rode scripts\dev-service-boot.ps1 -Action Install elevado, fora de uma run.
+    goto wait_service
+)
+
 echo Iniciando o Core Service em release...
 echo Autorize a solicitacao de administrador do Windows.
 powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\dev-service-admin.ps1" -Release
@@ -17,6 +24,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:wait_service
 echo Aguardando o Core Service responder por ate 3 minutos...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$ErrorActionPreference='Stop'; $deadline=[DateTime]::UtcNow.AddMinutes(3); $ready=$false; function RemainingMs { $left=($deadline-[DateTime]::UtcNow).TotalMilliseconds; if ($left -le 0) { throw 'Timeout' }; [int][Math]::Min(2000,[Math]::Max(1,$left)) }; do { $p=$null; $w=$null; $r=$null; try { $p=[IO.Pipes.NamedPipeClientStream]::new('.','NidavellirCore',[IO.Pipes.PipeDirection]::InOut,[IO.Pipes.PipeOptions]::Asynchronous); $p.Connect((RemainingMs)); $w=[IO.StreamWriter]::new($p,[Text.UTF8Encoding]::new($false),1024,$true); $w.AutoFlush=$true; $r=[IO.StreamReader]::new($p); $send=$w.WriteLineAsync((ConvertTo-Json -Compress @{method='Ping'})); if (-not $send.Wait((RemainingMs))) { throw 'Timeout' }; [void]$send.GetAwaiter().GetResult(); $read=$r.ReadLineAsync(); if (-not $read.Wait((RemainingMs))) { throw 'Timeout' }; $reply=ConvertFrom-Json -InputObject ($read.GetAwaiter().GetResult()); $ready=($reply.ok -eq $true -and $reply.data.type -eq 'Pong') } catch { } finally { if ($p) { $p.Dispose() }; if ($r) { try { $r.Dispose() } catch { } }; if ($w) { try { $w.Dispose() } catch { } } }; if ($ready) { exit 0 }; if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 } } while ([DateTime]::UtcNow -lt $deadline); exit 1"

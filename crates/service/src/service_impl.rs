@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tracing::info;
@@ -12,9 +13,46 @@ use crate::AppState;
 use crate::SERVICE_NAME;
 use nidavellir_driver_pawnio::DriverManager;
 
+/// Set only under SCM: console mode has nobody to start the process again.
+static STOP_TX: OnceLock<std::sync::mpsc::Sender<Result<(), String>>> = OnceLock::new();
+static DRIVER_RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The driver-only reset exits non-zero on purpose, so SCM recovery must restart the service on
+/// every failure, non-crash failures included (`sc failureflag 1`).
+pub(crate) fn driver_reset_available() -> Result<(), String> {
+    use windows_service::service::{ServiceAccess, ServiceActionType};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    if STOP_TX.get().is_none() {
+        return Err("exige o serviço instalado, não o modo console".into());
+    }
+    let scm = |error: windows_service::Error| format!("SCM: {error}");
+    let service = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(scm)?
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG)
+        .map_err(scm)?;
+    let actions = service.get_failure_actions().map_err(scm)?.actions.unwrap_or_default();
+    let restarts = !actions.is_empty()
+        && actions.iter().all(|action| action.action_type == ServiceActionType::Restart);
+    if restarts && service.get_failure_actions_on_non_crash_failures().map_err(scm)? {
+        Ok(())
+    } else {
+        Err("a recuperação do serviço no Windows não está configurada para reiniciá-lo".into())
+    }
+}
+
+/// Stop like an SCM stop (workers released, stock confirmed, NVAPI released), then restart the
+/// GPU device and exit non-zero; see `auto_resume`.
+pub(crate) fn request_driver_reset() -> Result<(), String> {
+    let stop = STOP_TX.get().ok_or("exige o serviço instalado")?;
+    DRIVER_RESET_REQUESTED.store(true, Ordering::SeqCst);
+    stop.send(Err("driver-only GPU reset requested".into()))
+        .map_err(|_| "o serviço já está parando".to_string())
+}
+
 pub fn run_service() -> windows_service::Result<()> {
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
     let pipe_failure_tx = shutdown_tx.clone();
+    let _ = STOP_TX.set(shutdown_tx.clone());
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
@@ -113,6 +151,7 @@ pub fn run_service() -> windows_service::Result<()> {
         detector_lab: crate::detector_lab::DetectorLabHandle::default(),
     }));
 
+    crate::auto_resume::spawn(Arc::clone(&state));
     let pipe_state = Arc::clone(&state);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -160,6 +199,19 @@ pub fn run_service() -> windows_service::Result<()> {
         tracing::error!("cannot report StopPending; still performing shutdown cleanup: {error}");
     }
     let result = crate::shutdown::complete(state, Duration::from_secs(20));
+    if DRIVER_RESET_REQUESTED.load(Ordering::SeqCst) {
+        // pnputil (≤ 60 s) plus the adapter readiness wait (≤ 30 s) outlast the first stop hint.
+        let _ = status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::StopPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 2,
+            wait_hint: Duration::from_secs(120),
+            process_id: None,
+        });
+        crate::auto_resume::finish_driver_reset(&result);
+    }
     let failed = result.is_err() || stop_status.is_err() || stop_reason.is_err();
     match result {
         Ok(()) => info!("service shutdown complete: workers released and required stock recovery confirmed"),

@@ -1,5 +1,6 @@
 <script>
   import { Activity, ArrowRight, Clock3, Play, ShieldCheck, Square, Timer } from "@lucide/svelte";
+  import { serviceCall } from "../../service.js";
 
   let {
     powerSweep = null,
@@ -33,6 +34,33 @@
   let taskObservedAt = $state(Date.now());
   let observedRunId = $state(null);
   let latchedLastOutcome = $state(null);
+
+  // Automatic Resume after a staircase-edge TDR (opt-in, persisted by the service, kept across runs).
+  let autoResumeBusy = $state(false);
+  let autoResumeOverride = $state(null);
+  let autoResumeError = $state(null);
+  const autoResume = $derived(autoResumeOverride ?? Boolean(powerSweep?.auto_resume));
+  const autoResumeSeconds = $derived(
+    powerSweep?.auto_resume_at_ms ? Math.max(0, Math.ceil((powerSweep.auto_resume_at_ms - now) / 1000)) : null,
+  );
+  $effect(() => {
+    powerSweep?.auto_resume;
+    autoResumeOverride = null;
+  });
+  async function setAutoResume(enabled) {
+    autoResumeBusy = true;
+    autoResumeOverride = enabled;
+    autoResumeError = null;
+    try {
+      const response = await serviceCall("SetForgeAutoResume", { enabled });
+      if (response?.ok === false) throw new Error(response.error ?? "The service refused the change.");
+    } catch (e) {
+      autoResumeOverride = null;
+      autoResumeError = String(e?.message ?? e);
+    } finally {
+      autoResumeBusy = false;
+    }
+  }
 
   const hasRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
   const isInterrupted = $derived(powerSweep?.phase === "interrupted");
@@ -701,6 +729,27 @@
       Resume unavailable: {powerSweep?.resume_block_reason ?? "This checkpoint no longer matches the current program, GPU or driver."}
     </p>
   {/if}
+
+  <div class="auto-resume">
+    <label>
+      <input
+        type="checkbox"
+        checked={autoResume}
+        disabled={autoResumeBusy}
+        onchange={(event) => setAutoResume(event.currentTarget.checked)}
+      />
+      <span>Continue on its own after a TDR at a step edge (GPU driver reset, or after Windows restarts)</span>
+    </label>
+    {#if autoResumeSeconds != null}
+      <p class="auto-resume-countdown" role="status">
+        Automatic resume in {autoResumeSeconds}s. This run's TDR incident will be acknowledged.
+        <button type="button" onclick={() => setAutoResume(false)}>Cancel</button>
+      </p>
+    {/if}
+    {#if autoResumeError}
+      <p class="resume-note" role="alert">{autoResumeError}</p>
+    {/if}
+  </div>
 </section>
 
 <style>
@@ -1069,6 +1118,41 @@
     text-overflow: ellipsis;
     text-transform: none;
     white-space: nowrap;
+  }
+
+  .auto-resume {
+    display: grid;
+    gap: 8px;
+    font-size: 0.78rem;
+    color: #c9cbc6;
+  }
+
+  .auto-resume label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+  }
+
+  .auto-resume-countdown {
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    border-radius: 9px;
+    padding: 8px 12px;
+    background: rgba(214, 160, 76, 0.08);
+    box-shadow: inset 0 0 0 1px rgba(214, 160, 76, 0.3);
+  }
+
+  .auto-resume-countdown button {
+    border: 0;
+    border-radius: 7px;
+    padding: 4px 10px;
+    background: rgba(255, 255, 255, 0.08);
+    color: inherit;
+    cursor: pointer;
   }
 
   .resume-note {

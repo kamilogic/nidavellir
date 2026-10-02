@@ -66,6 +66,9 @@ pub enum IpcRequest {
     /// when the checkpoint was created by a manual `StopPowerSweep` and its program build, GPU and
     /// graphics-driver identity still match the current machine exactly.
     ResumePowerSweep,
+    /// Opt in or out of automatic Resume after a staircase-edge TDR (2026-10-01). No hardware work;
+    /// turning it off also cancels a pending countdown. Additive.
+    SetForgeAutoResume { enabled: bool },
     GetPowerSweepProgress,
     ApplyPowerGodforge,
     ApplyPowerBrokkrs,
@@ -568,6 +571,14 @@ pub struct PowerSweepProgress {
     /// Structured human-readable reason why `ResumePowerSweep` is currently unavailable.
     #[serde(default)]
     pub resume_block_reason: Option<String>,
+    /// Opt-in (2026-10-01): after a staircase-edge TDR and the next service start, acknowledge the
+    /// run's own CandidateCrash and Resume automatically, through the same guards as the user's
+    /// Resume. Persisted with the run and carried into the next one.
+    #[serde(default)]
+    pub auto_resume: bool,
+    /// Epoch ms when a pending automatic Resume fires; `None` when none is scheduled.
+    #[serde(default)]
+    pub auto_resume_at_ms: Option<u64>,
     /// Stable identifier for the active backend task; the UI must not infer this from log text.
     #[serde(default)]
     pub current_task: Option<String>,

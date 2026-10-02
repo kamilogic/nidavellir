@@ -68,6 +68,12 @@ if ($service) {
     } -OperationTimeoutSec 10 -ErrorAction Stop
     if ($result.ReturnValue -ne 0) { throw "Create failed for ${serviceName}: Windows service error $($result.ReturnValue)" }
 }
+# SCM restarts the Core after any failure, including the deliberate non-zero exit of the
+# driver-only GPU reset (Forge auto-resume). Startup recovery owns crash accounting.
+& sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Recovery actions could not be set for ${serviceName} (sc.exe exit $LASTEXITCODE)" }
+& sc.exe failureflag $serviceName 1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Recovery flag could not be set for ${serviceName} (sc.exe exit $LASTEXITCODE)" }
 Invoke-CoreMethod (Read-CoreService) 'StartService'
 Wait-CoreState 'Running'
 Write-Output "Core Service is running. Installed binary: $binary"

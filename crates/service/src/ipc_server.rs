@@ -273,7 +273,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             IpcResponse::success(ResponseData::SafeLoop(status))
         }
         IpcRequest::AcknowledgeForgeIncident => {
-            match crate::safe_loop_runtime::acknowledge_forge_incident(&guard.safe_store) {
+            match crate::safe_loop_runtime::acknowledge_forge_incident(&guard.safe_store, None) {
                 Ok(acknowledged) => {
                     if acknowledged {
                         guard.power_sweep.refresh_resume_state(&guard.safe_store);
@@ -583,6 +583,10 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                 Err(e) => IpcResponse::failure(format!("Forge resume refused: {e}")),
             }
         }
+        IpcRequest::SetForgeAutoResume { enabled } => match guard.power_sweep.set_auto_resume(*enabled) {
+            Ok(progress) => IpcResponse::success(ResponseData::PowerSweep(progress)),
+            Err(error) => IpcResponse::failure(error),
+        },
         IpcRequest::GetPowerSweepProgress => {
             let mut progress = guard.power_sweep.progress();
             progress.start_block_reason = crate::gpu_power_sweep::forge_start_block_reason(&guard.safe_store);
