@@ -1,6 +1,27 @@
 # Nidavellir — Project Memory
 
-## Current — TDR autonomy (2026-10-01 c, branch forge-tdr-autonomy-2026-10-01)
+## Current — first search-11 Clean run finished (2026-10-02)
+
+- **Run f2-forge-1790936118478** ran in console mode with auto-resume off. It tested for 5.7 h and
+  used 24/30 attempts; 18 pairs passed the full matrix. No hot-bin relief and no clock retries.
+- **Profiles:**
+  - Godforge 1890@937 (196 W representative).
+  - Brokkr's **1800@875**: the user's daily-stable point, so the 36 mV margin reproduces the field.
+    175 W.
+  - Deep Calm 1710@825: 160 W.
+  - Stock is p5 1740 MHz at 199.7 W.
+- **Edges:**
+  - 1920@906: DX12 silent error.
+  - 1800@825: DX11 silent error.
+  - 1710@775: TDR in DX11, then bugcheck 0x116 and an auto-reboot. 1725@781 did the same on
+    01/10.
+- **Fixed (decisions.md 2026-10-02):**
+  - A Sentinel-stopped TDR on the run's exact pending pair now counts as `tdr_edge`, not
+    `Cancelled`.
+  - The UI was decluttered: cards show the representative power, there is no false Safe Loop alert
+    while forging, and Run details is collapsed.
+
+## Previous — TDR autonomy (2026-10-01 c, branch forge-tdr-autonomy-2026-10-01)
 
 - **Goal:** an overnight Clean Run finishes on its own, including edge TDRs, with nobody logged in.
 - **Implemented:** see decisions.md 2026-10-01 (c).

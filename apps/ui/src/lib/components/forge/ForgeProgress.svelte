@@ -1,12 +1,12 @@
 <script>
-  import { Activity, ArrowRight, Clock3, Play, ShieldCheck, Square, Timer } from "@lucide/svelte";
-  import { serviceCall } from "../../service.js";
+  import { Activity, ArrowRight, Clock3, Play, Square, Timer } from "@lucide/svelte";
 
   let {
     powerSweep = null,
     powerRunning = false,
     safeLoop = null,
     forgeMode = "standard",
+    detailsOpen = $bindable(false),
     onStopPower,
     onRecoverContinue,
     onResumePower,
@@ -35,33 +35,9 @@
   let observedRunId = $state(null);
   let latchedLastOutcome = $state(null);
 
-  // Automatic Resume after a staircase-edge TDR (opt-in, persisted by the service, kept across runs).
-  let autoResumeBusy = $state(false);
-  let autoResumeOverride = $state(null);
-  let autoResumeError = $state(null);
-  const autoResume = $derived(autoResumeOverride ?? Boolean(powerSweep?.auto_resume));
   const autoResumeSeconds = $derived(
     powerSweep?.auto_resume_at_ms ? Math.max(0, Math.ceil((powerSweep.auto_resume_at_ms - now) / 1000)) : null,
   );
-  $effect(() => {
-    powerSweep?.auto_resume;
-    autoResumeOverride = null;
-  });
-  async function setAutoResume(enabled) {
-    autoResumeBusy = true;
-    autoResumeOverride = enabled;
-    autoResumeError = null;
-    try {
-      const response = await serviceCall("SetForgeAutoResume", { enabled });
-      if (response?.ok === false) throw new Error(response.error ?? "The service refused the change.");
-    } catch (e) {
-      autoResumeOverride = null;
-      autoResumeError = String(e?.message ?? e);
-    } finally {
-      autoResumeBusy = false;
-    }
-  }
-
   const hasRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
   const isInterrupted = $derived(powerSweep?.phase === "interrupted");
   const isPaused = $derived(powerSweep?.phase === "paused");
@@ -112,10 +88,12 @@
   const currentPhaseIndex = $derived(forgePhaseIndex(powerSweep?.current_task, powerSweep?.phase));
   const progressPercent = $derived.by(() => {
     if (isFinished) return 100;
-    if (totalSteps > 0) return clampPercent((completedSteps / totalSteps) * 100);
     if (powerRunning && elapsedMs != null && remainingMs != null && elapsedMs + remainingMs > 0) {
       return clampPercent((elapsedMs / (elapsedMs + remainingMs)) * 100);
     }
+    // The staircase search never fills the legacy step counters; closed levels measure it honestly.
+    if (searchBands.length) return clampPercent((closedBands / searchBands.length) * 100);
+    if (totalSteps > 0) return clampPercent((completedSteps / totalSteps) * 100);
     if (hasRun && currentPhaseIndex != null) {
       return clampPercent((currentPhaseIndex / FORGE_PHASES.length) * 100);
     }
@@ -141,32 +119,48 @@
   const discoverySearch = $derived(powerSweep?.discovery_search ?? null);
   const searchBands = $derived(discoverySearch?.bands ?? []);
   const qualifiedBands = $derived(searchBands.filter((band) => band.last_qualified_clock_mhz > 0 && band.last_qualified_voltage_mv > 0).length);
+  const closedBands = $derived(searchBands.filter((band) => band.status === "closed").length);
   const rebootRequired = $derived(Boolean(safeLoop?.gpu_reboot_required));
+  const endedEarly = $derived(["incomplete", "needs_attention", "field_rejected"].includes(powerSweep?.phase));
+  // Live detail only while a run can still move; a settled run shows a summary and Run details.
+  const active = $derived(Boolean(powerRunning || isPaused || isInterrupted || isStopping));
   const canResume = $derived(
     Boolean(!rebootRequired && !powerRunning && isPaused && powerSweep?.resume_available),
   );
-  const safetyLabel = $derived.by(() => {
-    if (!safeLoop) return "Protection pending";
-    if (rebootRequired) return "Restart Windows";
-    if (safeLoop.safe_mode || safeLoop.state === "unstable") return "Needs attention";
-    if (safeLoop.boot_flag_armed || safeLoop.recovery_pending_ack) return "Recovery ready";
-    return "Protected";
-  });
   const title = $derived(
-    rebootRequired
-      ? "Restart Windows to continue"
-      : isInterrupted
-        ? "Forge interrupted"
-        : isPaused
-          ? "Forge paused"
-          : isProvisional
-            ? "Forge preview ready"
-            : isFinished
-              ? "Forge complete"
-              : powerRunning
-                ? "Forging your GPU"
+    isInterrupted
+      ? (rebootRequired ? "Restart Windows to continue" : "Forge interrupted")
+      : isPaused
+        ? "Forge paused"
+        : isProvisional
+          ? "Forge preview ready"
+          : isFinished
+            ? "Forge complete"
+            : powerRunning
+              ? "Forging your GPU"
+              : endedEarly
+                ? "Forge ended early"
                 : "Forge progress",
   );
+  const runSummary = $derived.by(() => {
+    const parts = [];
+    if (reportedElapsedMs) parts.push(duration(reportedElapsedMs));
+    if (discoverySearch) parts.push(`${discoverySearch.attempts_used} candidate tests`);
+    if (searchBands.length) parts.push(`${qualifiedBands} of ${searchBands.length} search levels qualified`);
+    return parts.join(" · ");
+  });
+  const interruptionNote = $derived.by(() => {
+    if (!isInterrupted) return null;
+    const pair = currentPairLabel === "—" ? "" : ` at ${currentPairLabel}`;
+    const cause = latchedLastOutcome === "TdrOrCrash"
+      ? `A driver crash stopped the test${pair}.`
+      : `The run stopped before finishing${pair}.`;
+    if (autoResumeSeconds != null) return `${cause} Continuing automatically in ${autoResumeSeconds}s.`;
+    const after = powerSweep?.auto_resume ? " The run then continues by itself." : "";
+    return rebootRequired
+      ? `${cause} Progress is saved; restart Windows to continue.${after}`
+      : `${cause} Progress is saved.`;
+  });
   const runState = $derived(
     rebootRequired
       ? "Restart required"
@@ -280,6 +274,9 @@
       validate: 1,
       stopping: 3,
       finished: 3,
+      // A saved run stops inside candidate testing; it resumes there.
+      paused: 1,
+      interrupted: 1,
     };
     return phaseIndexes[phase] ?? null;
   }
@@ -492,6 +489,9 @@
     if (!running && phase === "interrupted") {
       return { label: "Recovery required", detail: "Saved learning is intact; review recovery before continuing." };
     }
+    if (!running && ["incomplete", "needs_attention", "field_rejected"].includes(phase)) {
+      return { label: "Run ended early", detail: "No new profile was published. Open Run details for the reason." };
+    }
     if (!running) return { label: "Ready to forge", detail: "Progress appears here when the next run begins." };
     const stages = {
       preheat: ["Preparing the forge", "Normalizing the GPU before the first measurement."],
@@ -569,17 +569,16 @@
   });
 </script>
 
-<section class="forge-progress" aria-labelledby="forge-progress-title">
+<section class="forge-progress" class:settled={!active} aria-labelledby="forge-progress-title">
   <p class="sr-only" aria-live="polite" aria-atomic="true">{liveAnnouncement}</p>
 
   <header class="progress-header">
     <div class="progress-heading">
       <span class="eyebrow">Forge progress</span>
       <h3 id="forge-progress-title"><Activity size={19} strokeWidth={1.8} />{title}</h3>
-      <p>{phaseInfo.detail}</p>
+      <p>{active || !runSummary ? phaseInfo.detail : runSummary}</p>
     </div>
     <div class="progress-actions">
-      <span class:warning={rebootRequired} class="safety-pill"><ShieldCheck size={14} strokeWidth={1.9} />{safetyLabel}</span>
       <span class:live={powerRunning && !rebootRequired} class:warning={isInterrupted || rebootRequired} class="run-pill">{runState}</span>
       {#if powerRunning && !rebootRequired}
         <button class="progress-button stop" type="button" onclick={onStopPower} disabled={isStopping}>
@@ -597,86 +596,56 @@
     </div>
   </header>
 
-  {#if rebootRequired}
-    <p class="resume-note reboot-note" role="alert">
-      The GPU driver stopped responding and the test was interrupted. Restart Windows once; the incident and recovery state are saved.
-    </p>
+  {#if interruptionNote}
+    <p class="resume-note reboot-note" role={rebootRequired ? "alert" : "status"}>{interruptionNote}</p>
   {/if}
 
-  <ol class="phase-rail" aria-label="Forge stages">
-    {#each FORGE_PHASES as forgePhase, index}
-      <li
-        class:complete={phaseStatus(index) === "complete"}
-        class:active={phaseStatus(index) === "active"}
-        aria-current={phaseStatus(index) === "active" ? "step" : undefined}
+  {#if active}
+    <ol class="phase-rail" aria-label="Forge stages">
+      {#each FORGE_PHASES as forgePhase, index}
+        <li
+          class:complete={phaseStatus(index) === "complete"}
+          class:active={phaseStatus(index) === "active"}
+          aria-current={phaseStatus(index) === "active" ? "step" : undefined}
+        >
+          <span class="phase-marker" aria-hidden="true">{phaseStatus(index) === "complete" ? "✓" : index + 1}</span>
+          <span>{forgePhase.label}</span>
+          <span class="sr-only">{phaseStatus(index)}</span>
+        </li>
+      {/each}
+    </ol>
+
+    <div class="progress-overview">
+      <div class="progress-copy">
+        <span>{phaseInfo.label}</span>
+        <strong>{Math.round(progressPercent)}%</strong>
+      </div>
+      <div
+        class="progress-track"
+        class:forging={powerRunning}
+        role="progressbar"
+        aria-label="Estimated Forge completion"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow={Math.round(progressPercent)}
+        aria-valuetext={`${Math.round(progressPercent)} percent estimated`}
       >
-        <span class="phase-marker" aria-hidden="true">{phaseStatus(index) === "complete" ? "✓" : index + 1}</span>
-        <span>{forgePhase.label}</span>
-        <span class="sr-only">{phaseStatus(index)}</span>
-      </li>
-    {/each}
-  </ol>
-
-  <div class="progress-overview">
-    <div class="progress-copy">
-      <span>{phaseInfo.label}</span>
-      <strong>{Math.round(progressPercent)}%</strong>
+        <span style={`width: ${progressPercent}%`}></span>
+      </div>
     </div>
-    <div
-      class="progress-track"
-      class:forging={powerRunning}
-      role="progressbar"
-      aria-label="Estimated Forge completion"
-      aria-valuemin="0"
-      aria-valuemax="100"
-      aria-valuenow={Math.round(progressPercent)}
-      aria-valuetext={`${Math.round(progressPercent)} percent estimated`}
-    >
-      <span style={`width: ${progressPercent}%`}></span>
-    </div>
-  </div>
 
-  {#if hasRun}
     <div class="run-context" aria-label="Current Forge context">
       <article>
         <span>{currentPairHeading}</span>
         <strong>{currentPairLabel}</strong>
       </article>
       <article>
-        <span>Measured progress</span>
-        <strong>{stepLabel}</strong>
+        <span>{discoverySearch ? "Candidate tests" : "Measured progress"}</span>
+        <strong>{discoverySearch ? `${discoverySearch.attempts_used} of up to ${discoverySearch.attempts_limit}` : stepLabel}</strong>
       </article>
     </div>
 
-    {#if discoverySearch}
-      <section class="search-budget" aria-label="Candidate search coverage">
-        <div class="search-summary">
-          <strong>{discoverySearch.attempts_used} / {discoverySearch.attempts_limit} candidate attempts</strong>
-          <span>{qualifiedBands} / {searchBands.length} regions with a qualified candidate</span>
-          <span>Run budget: {duration(discoverySearch.time_budget_ms)} · used {duration(discoverySearch.elapsed_ms)}</span>
-        </div>
-        <p>First qualify the highest sustainable clock across heavy loads. Then explore efficiency within 10% below the qualified top. Every candidate needs complete qualification; Resume preserves the budget.</p>
-        <p>The requested clock is nominal. Tests allow up to +15 MHz, with the same voltage and power limits. A brief peak does not qualify a higher-clock profile.</p>
-        {#if discoverySearch.stop_reason}<p class="search-stop">Search ended: {searchStopReason(discoverySearch.stop_reason)}</p>{/if}
-        <ul class="search-bands">
-          {#each searchBands as band}
-            <li class:closed={band.status === "closed"}>
-              <strong>{bandLabel(band.id)} <span>· {bandStatus(band)}</span></strong>
-              {#if band.last_qualified_clock_mhz > 0 && band.last_qualified_voltage_mv > 0}
-                <p>Qualified: {band.last_qualified_clock_mhz} MHz @ {band.last_qualified_voltage_mv} mV</p>
-              {:else}
-                <p>No qualified candidate yet.</p>
-              {/if}
-              {#if band.stop_reason}<p>{searchStopReason(band.stop_reason)}</p>{/if}
-            </li>
-          {/each}
-        </ul>
-        {#if searchBands.some((band) => band.status === "closed")}
-          <p>Closing a region stops further exploration; it does not classify untested points as unstable.</p>
-        {/if}
-      </section>
-    {/if}
-
+    {#if !isInterrupted}
     <div class="task-flow">
       <article class="task-card current">
         <span class="task-icon"><Timer size={20} strokeWidth={1.75} /></span>
@@ -697,32 +666,31 @@
       <article class="task-card next">
         <span class="task-icon text-icon">NEXT</span>
         <div>
-          <small>{isFinished ? "Run complete" : powerRunning && taskRemainingMs != null ? `Starts in about ${duration(taskRemainingMs)}` : "Next planned task"}</small>
+          <small>{powerRunning && taskRemainingMs != null ? `Starts in about ${duration(taskRemainingMs)}` : "Next planned task"}</small>
           <strong>{nextTaskLabel}</strong>
-          <p>{isFinished ? "The GPU has returned to its verified final state." : nextTaskDurationMs == null ? "Duration updates from measured hardware evidence." : `Expected duration: ${duration(nextTaskDurationMs)}.`}</p>
+          <p>{nextTaskDurationMs == null ? "Duration updates from measured hardware evidence." : `Expected duration: ${duration(nextTaskDurationMs)}.`}</p>
         </div>
       </article>
     </div>
-  {/if}
+    {/if}
 
-  <div class="run-timing">
-    <article>
-      <Clock3 size={17} strokeWidth={1.7} />
-      <span>Elapsed<strong>{hasRun && elapsedMs != null ? duration(elapsedMs) : "—"}</strong></span>
-    </article>
-    <article>
-      <Timer size={17} strokeWidth={1.7} />
-      <span>Remaining estimate<strong>{remainingEstimate}</strong></span>
-    </article>
-    <article>
-      <Activity size={17} strokeWidth={1.7} />
-      <span>Conservative ceiling<strong>{remainingCeiling}</strong></span>
-    </article>
-    <article>
-      <ArrowRight size={17} strokeWidth={1.7} />
-      <span>Finish window<strong>{estimatedFinishWindow}</strong></span>
-    </article>
-  </div>
+    <div class="run-timing">
+      <article>
+        <Clock3 size={17} strokeWidth={1.7} />
+        <span>Elapsed<strong>{elapsedMs != null ? duration(elapsedMs) : "—"}</strong></span>
+      </article>
+      {#if powerRunning}
+        <article>
+          <Timer size={17} strokeWidth={1.7} />
+          <span>Remaining estimate<strong>{remainingEstimate}</strong></span>
+        </article>
+        <article>
+          <ArrowRight size={17} strokeWidth={1.7} />
+          <span>Finish window<strong>{estimatedFinishWindow}</strong></span>
+        </article>
+      {/if}
+    </div>
+  {/if}
 
   {#if isPaused && !powerSweep?.resume_available}
     <p class="resume-note" role="status">
@@ -730,26 +698,41 @@
     </p>
   {/if}
 
-  <div class="auto-resume">
-    <label>
-      <input
-        type="checkbox"
-        checked={autoResume}
-        disabled={autoResumeBusy}
-        onchange={(event) => setAutoResume(event.currentTarget.checked)}
-      />
-      <span>Continue on its own after a TDR at a step edge (GPU driver reset, or after Windows restarts)</span>
-    </label>
-    {#if autoResumeSeconds != null}
-      <p class="auto-resume-countdown" role="status">
-        Automatic resume in {autoResumeSeconds}s. This run's TDR incident will be acknowledged.
-        <button type="button" onclick={() => setAutoResume(false)}>Cancel</button>
-      </p>
-    {/if}
-    {#if autoResumeError}
-      <p class="resume-note" role="alert">{autoResumeError}</p>
-    {/if}
-  </div>
+  {#if discoverySearch || powerSweep?.note}
+    <details class="run-details" bind:open={detailsOpen}>
+      <summary>Run details</summary>
+      {#if powerSweep?.note}<p class="core-note">{powerSweep.note}</p>{/if}
+      {#if powerRunning}<p class="core-note">Conservative remaining ceiling: {remainingCeiling}.</p>{/if}
+      {#if discoverySearch}
+        <section class="search-budget" aria-label="Candidate search coverage">
+          <div class="search-summary">
+            <strong>{discoverySearch.attempts_used} / {discoverySearch.attempts_limit} candidate attempts</strong>
+            <span>{qualifiedBands} / {searchBands.length} regions with a qualified candidate</span>
+            <span>Run budget: {duration(discoverySearch.time_budget_ms)} · used {duration(discoverySearch.elapsed_ms)}</span>
+          </div>
+          <p>First qualify the highest sustainable clock across heavy loads. Then explore efficiency within 10% below the qualified top. Every candidate needs complete qualification; Resume preserves the budget.</p>
+          <p>The requested clock is nominal. Tests allow up to +15 MHz, with the same voltage and power limits. A brief peak does not qualify a higher-clock profile.</p>
+          {#if discoverySearch.stop_reason}<p class="search-stop">Search ended: {searchStopReason(discoverySearch.stop_reason)}</p>{/if}
+          <ul class="search-bands">
+            {#each searchBands as band}
+              <li class:closed={band.status === "closed"}>
+                <strong>{bandLabel(band.id)} <span>· {bandStatus(band)}</span></strong>
+                {#if band.last_qualified_clock_mhz > 0 && band.last_qualified_voltage_mv > 0}
+                  <p>Qualified: {band.last_qualified_clock_mhz} MHz @ {band.last_qualified_voltage_mv} mV</p>
+                {:else}
+                  <p>No qualified candidate yet.</p>
+                {/if}
+                {#if band.stop_reason}<p>{searchStopReason(band.stop_reason)}</p>{/if}
+              </li>
+            {/each}
+          </ul>
+          {#if searchBands.some((band) => band.status === "closed")}
+            <p>Closing a region stops further exploration; it does not classify untested points as unstable.</p>
+          {/if}
+        </section>
+      {/if}
+    </details>
+  {/if}
 </section>
 
 <style>
@@ -820,7 +803,6 @@
 
   .progress-actions { justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 
-  .safety-pill,
   .run-pill {
     display: inline-flex;
     min-height: 30px;
@@ -850,8 +832,7 @@
     color: var(--forge-gold);
   }
 
-  .run-pill.warning,
-  .safety-pill.warning {
+  .run-pill.warning {
     background: rgba(191, 97, 106, 0.12);
     box-shadow: inset 0 0 0 1px rgba(191, 97, 106, 0.4);
     color: #f3b9bd;
@@ -1087,7 +1068,7 @@
     text-wrap: pretty;
   }
 
-  .run-timing { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+  .run-timing { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 
   .run-timing article {
     min-width: 0;
@@ -1120,39 +1101,30 @@
     white-space: nowrap;
   }
 
-  .auto-resume {
-    display: grid;
-    gap: 8px;
+  .forge-progress.settled { gap: 10px; }
+
+  .run-details {
+    border-radius: var(--inner-radius);
+    background: rgba(0, 0, 0, 0.16);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+  }
+
+  .run-details summary {
+    padding: 10px 12px;
+    color: #a2a9ac;
     font-size: 0.78rem;
-    color: #c9cbc6;
-  }
-
-  .auto-resume label {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
+    font-weight: 700;
     cursor: pointer;
   }
 
-  .auto-resume-countdown {
-    margin: 0;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 10px;
-    border-radius: 9px;
-    padding: 8px 12px;
-    background: rgba(214, 160, 76, 0.08);
-    box-shadow: inset 0 0 0 1px rgba(214, 160, 76, 0.3);
-  }
+  .run-details[open] summary { color: var(--forge-text, #e8ecf1); }
 
-  .auto-resume-countdown button {
-    border: 0;
-    border-radius: 7px;
-    padding: 4px 10px;
-    background: rgba(255, 255, 255, 0.08);
-    color: inherit;
-    cursor: pointer;
+  .run-details > :not(summary) { margin: 0 12px 12px; }
+
+  .core-note {
+    color: #a2a9ac;
+    font-size: 0.75rem;
+    line-height: 1.5;
   }
 
   .resume-note {

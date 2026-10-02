@@ -386,6 +386,8 @@ for (const theme of ["command", "instrument", "workshop"]) {
         },
       });
     });
+    // Search coverage lives under Run details; the open state survives Resume and completion.
+    await page.getByText("Run details", { exact: true }).click();
     const coverage = page.getByRole("region", { name: "Candidate search coverage" });
     await expect(coverage).toContainText("7 / 24 candidate attempts");
     await expect(coverage).toContainText("1 / 3 regions with a qualified candidate");
@@ -417,8 +419,9 @@ test("Qualification: economics wait for top and missing evidence does not claim 
     discovery_search: { version: 2, attempts_used: 1, attempts_limit: 24, elapsed_ms: 1000, time_budget_ms: 28800000,
       bands: [{ id: "performance", status: "in_flight" }, { id: "balanced", status: "waiting_for_top" }, { id: "efficiency", status: "waiting_for_top" }] }
   }));
+  await page.getByText("Run details", { exact: true }).click();
   const coverage=page.getByRole("region", { name: "Candidate search coverage" });
-  await expect(coverage).toContainText("Balance · Waiting for qualified top");
+  await expect(coverage).toContainText("Balance · Waiting for the level above");
   await expect(coverage).toContainText("First qualify the highest sustainable clock across heavy loads");
   await page.evaluate(() => { window.__forgeTest.power.discovery_search.stop_reason="evidence_incomplete_no_boundary_inferred"; });
   await expect(coverage).toContainText("No hardware boundary was inferred");
@@ -455,3 +458,32 @@ for (const scenario of ["unqualified", "apply-failure"]) {
     await expect(page.getByRole("button", { name: "Applied", exact: true })).toHaveCount(0);
   });
 }
+
+test("UX: an active Forge with its armed candidate is not a Safe Loop alert", async ({ page }) => {
+  await openForge(page);
+  await page.evaluate(() => {
+    Object.assign(window.__forgeTest.power, { running: true, phase: "power", run_id: "ux-run" });
+    window.__forgeTest.safe.boot_flag_armed = true;
+  });
+  await expect(page.getByRole("region", { name: "Forging your GPU" })).toBeVisible();
+  await expect(page.getByText("FORGING", { exact: true })).toBeVisible();
+  await expect(page.getByText("Safe Loop needs attention", { exact: true })).toHaveCount(0);
+});
+
+test("UX: profile cards show clock, voltage and typical power before expanding", async ({ page }) => {
+  await openForge(page, "qualified");
+  const brokkrs = page.locator(".profile-disclosure").filter({ hasText: "Brokkr’s Best" });
+  await expect(brokkrs).toContainText("Recommended");
+  await expect(brokkrs).toContainText("1800 MHz · 950 mV · 155 W");
+  await expect(brokkrs).toContainText("−22% power vs stock");
+  await expect(page.getByText(/distinct settings? ·/)).toHaveCount(0);
+});
+
+test("UX: automatic continuation is offered before a run starts", async ({ page }) => {
+  await openForge(page);
+  const toggle = page.getByRole("checkbox", { name: "Continue automatically after a driver crash" });
+  await expect(toggle).toBeEnabled();
+  await toggle.click();
+  await expect.poll(() => page.evaluate(() => window.__forgeTest.calls.includes("SetForgeAutoResume"))).toBe(true);
+  expect(await page.evaluate(() => window.__forgeTest.calls.some((m) => /^(Start|Resume)/.test(m)))).toBe(false);
+});

@@ -3,11 +3,7 @@
   import { serviceCall } from "../service.js";
   import { nvidiaGpu, recoverForge, requireServiceData } from "../forge-workflow.js";
   import AdvancedDiagnosticsHub from "../components/forge/AdvancedDiagnosticsHub.svelte";
-  import ForgeProgress from "../components/forge/ForgeProgress.svelte";
   import ForgeThemeScreen from "../components/forge/ForgeThemeScreen.svelte";
-  import GpuHeroStatus from "../components/forge/GpuHeroStatus.svelte";
-  import MonitoringPanel from "../components/forge/MonitoringPanel.svelte";
-  import ProfileCards from "../components/forge/ProfileCards.svelte";
 
   let { theme = "command", onThemeChange } = $props();
 
@@ -21,7 +17,6 @@
   let activeView = $state("forge");
   let diagnosticsTab = $state("log");
   let applied = $state(null);
-  let verification = $state(null);
   let exporting = $state(false);
   let exportMsg = $state("");
   let exportFailed = $state(false);
@@ -55,9 +50,6 @@
   let lastSlowRefreshAt = 0;
 
   const powerRunning = $derived(Boolean(powerSweep?.running));
-  const hasProfiles = $derived(Boolean(powerSweep?.godforge || powerSweep?.brokkrs || powerSweep?.deep_calm));
-  const hasKnowledge = $derived(Boolean(powerSweep?.points?.length || verification?.status));
-  const hasForgeRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
 
   function responseData(response, type, label) {
     return requireServiceData(response, type, label);
@@ -125,7 +117,6 @@
       "Return the GPU to stock? The saved run and safety history stay preserved. A pending incident still requires recovery acknowledgement.",
     ) ?? true;
     if (!confirmed) return;
-    verification = null;
     actionBusy = true;
     try {
       await call("ResetGpuTuning", setApplied);
@@ -183,7 +174,6 @@
       }
 
       applied = response.data;
-      verification = null;
       const message = response.data.message || `${resetName} completed`;
       if (/^reset failed/i.test(message)) throw new Error(message);
       if (full && /negative safety evidence preserved/i.test(message)) {
@@ -284,7 +274,6 @@
       `Recover Forge? Nidavellir will return the GPU to stock and acknowledge the incident while preserving safety history. It will resume only if the saved run is compatible. Otherwise it stays at stock; a new run requires a separate action.${point}`,
     ) ?? true;
     if (!confirmed) return;
-    verification = null;
     actionBusy = true;
     try {
       const result = await recoverForge(serviceCall);
@@ -362,7 +351,6 @@
         : "Safe Loop and Core Service must be ready before applying a profile.";
       return;
     }
-    verification = null;
     actionBusy = true;
     try {
       await call(POWER_APPLY[which], setApplied);
@@ -607,15 +595,18 @@
   const sentinelState = $derived.by(() => {
     if (!sentinel) return "No events";
     if (sentinel.action === "bump") return "Automatic adjustment";
-    if (sentinel.action === "stock") return "Returned to stock";
+    if (String(sentinel.action ?? "").startsWith("stock")) return "Returned to stock";
     return "Event recorded";
   });
+  // Sentinel status records differ by event; a TDR record carries no tuning pair.
   const sentinelSummary = $derived.by(() => {
     if (!sentinel) return "No automatic recovery action recorded.";
-    if (sentinel.action === "bump") {
+    const pair = sentinel.target_mhz && sentinel.failed_mv ? `${sentinel.target_mhz} MHz @ ${sentinel.failed_mv} mV` : null;
+    if (sentinel.action === "bump" && pair) {
       return `Kept ${sentinel.target_mhz} MHz and moved the unstable point from ${sentinel.failed_mv} to ${sentinel.new_mv} mV (strike ${sentinel.strike}/3).`;
     }
-    return `Removed ${sentinel.target_mhz} MHz @ ${sentinel.failed_mv} mV and returned the GPU to stock after three failures.`;
+    if (sentinel.event === "tdr") return `The GPU driver crashed${pair ? ` at ${pair}` : ""}; the GPU returned to stock.`;
+    return pair ? `Returned the GPU to stock after a failure at ${pair}.` : "Returned the GPU to stock after a stability event.";
   });
 
   $effect(() => {
@@ -729,78 +720,10 @@
     />
   </ForgeThemeScreen>
 
-  <div class="legacy-forge-content">
-  <GpuHeroStatus
-    {theme}
-    {error}
-    {applied}
-    {hardware}
-    {powerSweep}
-    {safeLoop}
-    {powerRunning}
-    {hasProfiles}
-    {hasKnowledge}
-    {verification}
-    {forgeMode}
-    onStartPower={startPower}
-    onForgeModeChange={selectForgeMode}
-    onReset={resetTuning}
-    onFullReset={fullResetTuning}
-    onRecoverContinue={recoverAndStartPower}
-  />
-
-  <MonitoringPanel gpu={primarySensorGpu} {sparks} live={powerRunning} />
-
-  {#if hasForgeRun}
-    <ForgeProgress
-      {powerSweep}
-      {powerRunning}
-      {safeLoop}
-      onStopPower={stopPower}
-    />
-  {/if}
-
-  {#if powerRunning}
-    <section class="home-section profile-section active-forging">
-      <div>
-        <span class="section-kicker">Profile Comparison</span>
-        <h3>Profiles being produced</h3>
-        <p>Profiles update as forging completes. Existing profiles remain available for reference.</p>
-      </div>
-      <ProfileCards
-        {powerSweep}
-        {applied}
-        {verification}
-        showPlaceholders
-        onApplyPower={applyPower}
-      />
-    </section>
-  {:else}
-    <section class="home-section profile-section">
-      <div>
-        <span class="section-kicker">Profile Comparison</span>
-        <h3>Choose how this GPU should behave</h3>
-        <p>Brokkr's Best is recommended for most users unless your own forge data points elsewhere.</p>
-      </div>
-      <ProfileCards
-        {powerSweep}
-        {applied}
-        {verification}
-        showPlaceholders
-        onApplyPower={applyPower}
-      />
-    </section>
-  {/if}
-
-  </div>
 </section>
 
 <style>
   .forge {
     display: block;
-  }
-
-  .legacy-forge-content {
-    display: none;
   }
 </style>

@@ -1,6 +1,29 @@
 # Nidavellir — Session Handoff
 
-## LATEST — TDR autonomy (2026-10-01 c), branch `forge-tdr-autonomy-2026-10-01`
+## LATEST — run f2-forge-1790936118478 analysed (2026-10-02)
+
+The first search-11 Clean run finished: Godforge 1890@937, Brokkr's 1800@875 (the user's stable
+point) and Deep Calm 1710@825. Details are in memory.md.
+- **Not exercised:** console mode, auto-resume off. The last-level TDR became BSOD 0x116 at 13:01,
+  and the run waited 2 h 20 min for the user.
+- **Done 2026-10-02, uncommitted; see decisions.md:**
+  - Sentinel-cancelled TDR = `tdr_edge`.
+  - UI declutter in all three themes.
+  - Sentinel summary fix ("undefined MHz").
+  - Validation: Rust 725/3 ignored, release build clean, UI unit 18/18 + build, e2e 37/37
+    (three new UX tests).
+  - Safety audit GO; the shutdown-aware wait nit was applied.
+- **Next:** a run with `dev-service-boot.ps1 -Action Install` and auto-resume on.
+- **Open UI ideas:**
+  - The Instrument theme puts the primary action at the bottom below 1380 px.
+  - Portuguese UI.
+  - Dead panels can go in the code cleanup:
+    - nothing imports `PowerSweepPanel` (→ `ProfileCards` → `StatusBadge`), `DiagnosticsPanel` or
+      `VfCurvePanel` (→ `VfChart`);
+    - the Dashboard and SafeLoop views are unreachable (no nav after onboarding).
+- **Field validation:** Godforge 1890@937 and Deep Calm 1710@825 in games, with Safe Loop.
+
+## Previous — TDR autonomy (2026-10-01 c), branch `forge-tdr-autonomy-2026-10-01`
 
 The user wants an overnight run to finish with nobody logged in, even through recoverable TDRs. See
 decisions.md 2026-10-01 (c).

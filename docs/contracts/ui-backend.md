@@ -22,6 +22,12 @@ Additive only; contract and search versions are unchanged.
   runs no longer block a new run.
 - **Resume:** it stops at stock with `resume_block_reason` set when stock comes back more than 60 MHz
   slower than earlier in the run.
+- **UI reading of existing fields (2026-10-02, no IPC change):**
+  - Staircase progress comes from `discovery_search` (closed bands, `attempts_used`) and
+    `estimated_remaining_ms`. `completed_steps` and `total_steps_estimate` are legacy and stay unused
+    for F2.
+  - Profile cards headline `comparison_power_p99_w`; `max_power_w` is the heavy-load peak.
+  - `note` is shown only under Run details.
 
 ## 2026-10-01: load steps and hot-bin anchor, search 11
 

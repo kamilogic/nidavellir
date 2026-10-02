@@ -911,6 +911,45 @@ fn pending_candidate_crash_for_run<'a>(
     })
 }
 
+fn pending_candidate_crash_is_pair(
+    record: &nidavellir_core::safe_loop::SafeLoopRecord,
+    run_id: &str,
+    gpu_key: &str,
+    target_mhz: u32,
+    anchor_mv: u32,
+) -> bool {
+    pending_candidate_crash_for_run(record, run_id, gpu_key).is_some_and(|incident| {
+        incident.target_mhz == Some(target_mhz) && incident.anchor_mv == Some(anchor_mv)
+    })
+}
+
+/// The Sentinel stops the dwell before it persists the CandidateCrash, so the lane reports
+/// `Cancelled`. With a real TDR latched, wait briefly for this exact pair's durable incident.
+#[cfg(windows)]
+fn f2_sentinel_crashed_pair(
+    store: &SafeLoopStore,
+    run_id: &str,
+    gpu_key: &str,
+    target_mhz: u32,
+    anchor_mv: u32,
+) -> bool {
+    let tdr_latched = crate::tdr_sentinel::reboot_required_event()
+        .is_some_and(|event| chrono::DateTime::parse_from_rfc3339(&event).is_ok());
+    if !tdr_latched {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let recorded = store.load_record_checked().is_ok_and(|record| {
+            pending_candidate_crash_is_pair(&record, run_id, gpu_key, target_mhz, anchor_mv)
+        });
+        if recorded || std::time::Instant::now() >= deadline || crate::shutdown::is_requested() {
+            return recorded;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// A TDR continuation is intentionally narrower than manual pause/resume. It keeps the exact run,
 /// mode and learning scope only after the attributed CandidateCrash was acknowledged on a later,
 /// clean boot. Build/GPU/driver compatibility remains byte-for-byte strict; this path never imports
@@ -9926,6 +9965,16 @@ fn measure_multiclock_undervolt_forge(
                 Outcome::OperationalFailure
             }
         };
+        // A Sentinel-stopped TDR is this pair's staircase edge, not a cancellation: Resume then
+        // starts the next level, and a TDR on the last level publishes without a Resume (02/10 run).
+        let outcome = if outcome == Outcome::Cancelled
+            && f2_sentinel_crashed_pair(store, &run_id, &gpu_key, target, mv)
+        {
+            failure_reason = "CandidateCrash (Sentinel TDR)".into();
+            Outcome::DriverFailure
+        } else {
+            outcome
+        };
         if exact_gate
             && outcome == Outcome::IntegrityError
             && failure_reason.contains("SilentError")
@@ -10475,6 +10524,21 @@ fn f2_terminal_phase(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sentinel_tdr_counts_only_for_this_runs_exact_pair() {
+        use nidavellir_core::safe_loop::{ForgeIncident, ForgeIncidentKind, SafeLoopRecord};
+        let mut record = SafeLoopRecord::default();
+        assert!(!super::pending_candidate_crash_is_pair(&record, "run", "gpu", 1710, 775));
+        record.record_forge_incident(ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash, Some("run".into()), Some("gpu".into()), Some(1710), Some(775), "tdr",
+        ));
+        assert!(super::pending_candidate_crash_is_pair(&record, "run", "gpu", 1710, 775));
+        assert!(!super::pending_candidate_crash_is_pair(&record, "run", "gpu", 1710, 787));
+        assert!(!super::pending_candidate_crash_is_pair(&record, "other-run", "gpu", 1710, 775));
+        record.acknowledge_forge_incident();
+        assert!(!super::pending_candidate_crash_is_pair(&record, "run", "gpu", 1710, 775));
+    }
+
     #[cfg(windows)]
     #[test]
     fn resume_stops_when_stock_comes_back_slower_than_the_run_measured() {

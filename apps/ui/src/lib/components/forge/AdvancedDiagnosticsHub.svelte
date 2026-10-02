@@ -80,7 +80,7 @@
     {
       id: "game-trace",
       label: "Game Trace",
-      detail: gameTrace?.running ? `Gravando · ${gameTrace.samples ?? 0}` : "Parado",
+      detail: gameTrace?.running ? `Recording · ${gameTrace.samples ?? 0}` : "Stopped",
       icon: Radio,
     },
     {
@@ -205,6 +205,13 @@
     const kind = String(event?.kind ?? "stability evidence").replaceAll("-", " ").replaceAll("_", " ");
     return event?.note ? `${kind} · ${event.note}` : kind;
   }
+
+  /** Local date and time for a Core RFC 3339 timestamp; the raw value when it does not parse. */
+  function when(timestamp) {
+    if (!timestamp) return null;
+    const date = new Date(timestamp);
+    return Number.isNaN(date.getTime()) ? String(timestamp) : date.toLocaleString();
+  }
 </script>
 
 <section class={`advanced-hub ${theme}`} class:embedded aria-labelledby="advanced-diagnostics-title">
@@ -303,7 +310,7 @@
         </div>
         <div>
           <dt>Recorded</dt>
-          <dd>{sentinel?.ts ?? "—"}</dd>
+          <dd>{when(sentinel?.ts) ?? "—"}</dd>
         </div>
       </dl>
 
@@ -327,7 +334,7 @@
                     {#if event?.rehabilitated}<span class="rehabilitated-label">Rehabilitated</span>{/if}
                   </div>
                   <small>{condemnationReason(event)}</small>
-                  <small class="ledger-meta">{event?.timestamp ?? "Timestamp unavailable"}{event?.run_id ? ` · run ${event.run_id}` : ""}</small>
+                  <small class="ledger-meta">{when(event?.timestamp) ?? "Timestamp unavailable"}{event?.run_id ? ` · run ${event.run_id}` : ""}</small>
                 </div>
               </li>
             {/each}

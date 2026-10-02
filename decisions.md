@@ -1,5 +1,38 @@
 # Nidavellir — Decision Log
 
+## 2026-10-02 — a Sentinel-stopped TDR is the level edge; the UI shows results, not diagnostics
+
+The user asked for the run-analysis bugs to be fixed and the UI to be decluttered (run
+f2-forge-1790936118478).
+- **TDR edge:** the Sentinel stops the dwell before it persists the CandidateCrash, so the lane
+  reports `Cancelled`.
+  - Fix: a `Cancelled` outcome counts as `DriverFailure` (`tdr_edge`) only when both hold:
+    - the reboot latch holds a real TDR timestamp;
+    - this run's exact pair has a pending CandidateCrash. The service waits up to 5 s for it.
+  - Effect: a last-level TDR publishes at once, with Apply still latched until acknowledgement.
+    Resume starts the next level instead of re-trying the condemned pair.
+- **UI, the same blocks in all three themes:**
+  - Profile cards show clock, voltage, typical (representative) power and the change vs stock
+    without expanding. Brokkr's is tagged Recommended. The heavy-load peak, which is at the 200 W
+    limit for most profiles, is only in the details.
+  - Forge progress shows live detail only while a run can move. A settled run shows a one-line
+    summary; search coverage and the Core's own note sit under a collapsed "Run details".
+  - The progress bar follows closed search levels or the time estimate. The legacy
+    `completed_steps` counter is never filled by the staircase.
+  - A running Forge's own armed boot flag is no longer a Safe Loop alert.
+  - Raw backend notes are no longer the hero message.
+  - Restart prompts no longer repeat.
+  - The auto-resume toggle sits under the primary action, so it can be set before a run.
+  - Goal placeholders show only before the first run.
+  - The reset strip is compact.
+  - Sentinel and ledger timestamps show in local time.
+- **Removed:** the hidden legacy Forge block (`display: none` but mounted, with its own timers) and
+  its components `GpuHeroStatus` and `MonitoringPanel`.
+- **Not changed:**
+  - The three themes.
+  - The Advanced Diagnostics content.
+  - The English-only interface: backend notes stay Portuguese under Run details.
+
 ## 2026-10-01 (c) — TDR autonomy: per-run ceiling, opt-in auto-resume, driver-only reset
 
 The user's concern: limiting TDRs sacrifices discoveries and confidence, but restarting and resuming

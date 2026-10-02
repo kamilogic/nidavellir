@@ -21,6 +21,7 @@
   } from "@lucide/svelte";
   import ForgeSettingsPage from "./ForgeSettingsPage.svelte";
   import ForgeProgress from "./ForgeProgress.svelte";
+  import AutoResumeToggle from "./AutoResumeToggle.svelte";
   import { distinctForgeProfiles, forgePrimaryAction, nvidiaGpu } from "../../forge-workflow.js";
   import TelemetrySpark from "./TelemetrySpark.svelte";
   import commandMark from "../../assets/themes/nidavellir-mark.png";
@@ -76,6 +77,7 @@
   let expandedProfile = $state(null);
   let safetyDetailsOpen = $state(false);
   let safetyDetails = $state(null);
+  let progressDetailsOpen = $state(false);
 
   const profileMeta = [
     {
@@ -123,12 +125,20 @@
   );
   const displayedProfiles = $derived(profilesReady ? distinctForgeProfiles(profileMeta, powerSweep) : profileMeta);
   const censoredClocks = $derived((powerSweep?.clock_search ?? []).filter((clock) => clock.censored_floor_mv != null).length);
+  // Three distinct qualified profiles need no banner; only the exceptions are worth reading.
+  const profileCaveat = $derived(
+    displayedProfiles.length < 3 || !profilesQualified || censoredClocks > 0 ||
+      (!powerSweep?.discovery_search && !powerSweep?.profile_search_complete),
+  );
   const hasForgeRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
+  // Goal placeholders explain a first run; once a run exists only real profiles are worth the space.
+  const showProfiles = $derived(profilesReady || !hasForgeRun);
   const forgePaused = $derived(powerSweep?.phase === "paused");
   const rebootRequired = $derived(Boolean(safeLoop?.gpu_reboot_required));
   const forgeBlocked = $derived(Boolean(powerSweep?.start_block_reason));
+  // A running Forge arms the boot flag for every candidate by design; only a leftover flag needs review.
   const safetyNeedsAttention = $derived(
-    Boolean(safeLoop?.safe_mode || safeLoop?.state === "unstable" || safeLoop?.boot_flag_armed || safeLoop?.recovery_pending_ack),
+    Boolean(safeLoop?.safe_mode || safeLoop?.state === "unstable" || (safeLoop?.boot_flag_armed && !powerRunning) || safeLoop?.recovery_pending_ack),
   );
   const runFinished = $derived(powerSweep?.phase === "finished");
   const runNeedsAttention = $derived(
@@ -191,9 +201,16 @@
     if (state === "CONNECTING") return "Connecting to the protected local Core Service.";
     if (state === "WAITING") return "Waiting for the local NVIDIA GPU to be identified.";
     if (powerSweep?.start_block_reason) return powerSweep.start_block_reason;
-    if (state === "ATTENTION") return runNeedsAttention
-      ? (powerSweep?.note ?? "Forge stopped without publishing a qualified profile set. Review the preserved result below.")
-      : protectionMessage;
+    // The Core's own note is technical; it stays readable under Run details.
+    if (state === "ATTENTION") {
+      if (rebootRequired) return "A driver crash stopped the test. Progress and safety history are saved.";
+      if (recoveryPending || !runNeedsAttention) return protectionMessage;
+      return {
+        interrupted: "The last run stopped before finishing. Its progress is saved; see Forge progress below.",
+        provisional: "Preview profiles are ready. A Standard run qualifies them before they can be applied.",
+        field_rejected: "A profile was marked unstable in real use. Forge again to replace it.",
+      }[powerSweep?.phase] ?? "The last run ended without new profiles. Open Run details below for the reason.";
+    }
     if (state === "FORGED") return "Profiles are qualified and ready for daily use.";
     if (state === "REFINED") return "Measured profiles are ready for review.";
     if (state === "FORGING") return "Qualification is active; progress and safety take priority below.";
@@ -210,9 +227,11 @@
           ? "Core Service is offline"
           : "Action could not be completed",
   );
+  // An interrupted run explains its own restart in Forge progress; the banner covers every other case.
+  const runExplainsReboot = $derived(rebootRequired && powerSweep?.phase === "interrupted");
   const alertMessage = $derived(
     error
-      || (rebootRequired || safetyNeedsAttention ? protectionMessage : null)
+      || ((rebootRequired || safetyNeedsAttention) && !runExplainsReboot ? protectionMessage : null)
       || (forgeBlocked && serviceReady ? powerSweep.start_block_reason : null)
       || (!serviceReady && serviceStatus === "offline"
         ? "Nidavellir could not reach the elevated Core Service. Start it to restore hardware detection and GPU actions."
@@ -313,11 +332,6 @@
     return voltage == null ? "—" : `${voltage.toFixed(0)} mV`;
   }
 
-  function profileEfficiency(point) {
-    if (isUndervolt && !(finite(point?.comparison_power_p99_w) > 0)) return "—";
-    const efficiency = finite(point?.perf_per_watt);
-    return efficiency == null ? "—" : `${efficiency.toFixed(1)} MHz/W`;
-  }
 
   function profileEfficiencyVsStock(point) {
     if (isUndervolt && !(finite(point?.comparison_power_p99_w) > 0)) return "—";
@@ -329,6 +343,36 @@
     }
     const delta = ((efficiency / (stockClock / stockPower)) - 1) * 100;
     return `${delta >= 0 ? "+" : ""}${delta.toFixed(0)}%`;
+  }
+
+  /** Representative-load power (PowerRender p99): what separates the profiles. The heaviest lane
+   * reaches the power limit for most of them, so it is shown only as the heavy-load peak. */
+  function typicalPower(point) {
+    const watts = finite(point?.comparison_power_p99_w);
+    return watts != null && watts > 0 ? watts : null;
+  }
+
+  function profileFacts(point) {
+    const watts = typicalPower(point);
+    return [profileTarget(point), profileVoltage(point), watts == null ? null : `${watts.toFixed(0)} W`]
+      .filter(Boolean)
+      .join(" · ");
+  }
+
+  function profileVsStock(point) {
+    const stockClock = finite(powerSweep?.stock_clock_mhz);
+    const stockPower = finite(powerSweep?.stock_power_p99_w);
+    const target = finite(point?.target_clock_mhz ?? point?.clock_mhz);
+    const watts = typicalPower(point);
+    if (!stockClock || !stockPower || target == null || watts == null) return null;
+    const signed = (value, unit) => `${value > 0 ? "+" : value < 0 ? "−" : ""}${Math.abs(value)}${unit}`;
+    const mhz = Math.round(target - stockClock);
+    const power = Math.round(((watts - stockPower) / stockPower) * 100);
+    return `${signed(mhz, " MHz")} · ${signed(power, "% power")} vs stock`;
+  }
+
+  function recommended(profile) {
+    return profile.key === "brokkrs" || Boolean(profile.roles?.includes("Brokkr’s Best"));
   }
 
   function profileExpanded(key) {
@@ -481,8 +525,13 @@
         {:else}<Feather size={27} />{/if}
       </span>
       <span class="profile-card-copy">
-        <strong>{profile.name}</strong>
-        <small>{profile.summary}</small>
+        <strong>{profile.name}{#if recommended(profile)}<em class="profile-tag">Recommended</em>{/if}</strong>
+        {#if profilesReady && point}
+          <span class="profile-facts">{profileFacts(point)}</span>
+          {#if profileVsStock(point)}<small>{profileVsStock(point)}</small>{/if}
+        {:else}
+          <small>{profile.summary}</small>
+        {/if}
       </span>
       <span class="profile-card-state">
         <small>{profileStatus(profile.key)}</small>
@@ -492,13 +541,13 @@
 
     {#if profileExpanded(profile.key)}
       <div class="profile-card-details" id={`profile-details-${variant}-${profile.key}`}>
+        <p class="profile-card-summary">{profile.summary}</p>
         <div class="profile-card-metrics">
-          <span><small>Target clock</small><strong>{profileTarget(point)}</strong></span>
-          <span><small>Target voltage</small><strong>{profileVoltage(point)}</strong></span>
-          <span><small>Stress peak power</small><strong>{profilePeakPowerText(point)}</strong></span>
-          <span><small>Comparison power · PowerRender p99</small><strong>{finite(point?.comparison_power_p99_w) > 0 ? `${point.comparison_power_p99_w.toFixed(1)} W` : "—"}</strong></span>
-          <span><small>Clock/W vs stock · PowerRender</small><strong>{profileEfficiencyVsStock(point)}</strong></span>
-          <span><small>Clock/W proxy · not game FPS</small><strong>{profileEfficiency(point)}</strong></span>
+          <span><small>Clock</small><strong>{profileTarget(point)}</strong></span>
+          <span><small>Voltage</small><strong>{profileVoltage(point)}</strong></span>
+          <span title="Power p99 in the representative test load"><small>Typical power</small><strong>{typicalPower(point) != null ? `${typicalPower(point).toFixed(1)} W` : "—"}</strong></span>
+          <span title="Highest power seen in the heaviest test; the GPU power limit caps it"><small>Heavy-load peak</small><strong>{profilePeakPowerText(point)}</strong></span>
+          <span title="Clock per watt in the representative load, compared with stock"><small>Efficiency vs stock</small><strong>{profileEfficiencyVsStock(point)}</strong></span>
         </div>
         <div class="profile-card-actions">
           <button class="profile-apply" type="button" onclick={() => profileAction(profile.key)} disabled={!canApply(profile.key)}>
@@ -512,7 +561,7 @@
 {/snippet}
 
 {#snippet safetyNotice()}
-  {#if profilesReady}
+  {#if profilesReady && profileCaveat}
     <aside class="command-alert" role="status">
       <ShieldCheck size={22} strokeWidth={1.8} />
       <div>
@@ -564,8 +613,7 @@
     <section class="full-reset-strip" aria-label="Full Reset">
       <div class="full-reset-copy">
         <span>START OVER</span>
-        <strong>Full Reset</strong>
-        <p>Full Reset forgets all GPU learning, profiles and known failures. Choose Soft Reset to remeasure while keeping known failures blocked.</p>
+        <p>Soft Reset remeasures and keeps known failures blocked. Full Reset erases all GPU learning.</p>
       </div>
       <button class="soft-reset-action" type="button" onclick={(event) => openResetConfirmation(event, "soft")} disabled={fullResetDisabled}>Soft Reset</button>
       <button class="full-reset-action" type="button" onclick={openResetConfirmation} disabled={fullResetDisabled} title={!serviceReady ? "Core Service must be online" : rebootRequired ? "Restart Windows before tuning actions" : undefined}>
@@ -628,6 +676,7 @@
     {onStartPower}
     {onRecoverContinue}
     {onResumePower}
+    bind:detailsOpen={progressDetailsOpen}
   />
 {/snippet}
 
@@ -671,7 +720,7 @@
           <span class="gpu-source">{gpuDetected ? (primaryGpu?.driver ?? "Identified by local sensors") : "Waiting for local hardware detection"}</span>
           <div class="state-status">
             <div><span>STATE</span><strong class="state-value" class:problem={["OFFLINE", "ATTENTION"].includes(state)} class:pending={["CONNECTING", "WAITING"].includes(state)} class:working={["RAW", "FORGING", "REFINED"].includes(state)}>{state}</strong></div>
-            <div><span>STATUS</span><strong class="protected" class:pending={!safeLoopKnown}><ShieldCheck size={38} />{protectionLabel}</strong></div>
+            <div><span>STATUS</span><strong class="protected" class:pending={!safeLoopKnown} class:problem={rebootRequired || safetyNeedsAttention}><ShieldCheck size={38} />{protectionLabel}</strong></div>
           </div>
           <p>{heroMessage}</p>
         </div>
@@ -694,10 +743,8 @@
             </label>
             </details>
             <small id="primary-action-reason">{primaryActionReason}</small>
+            <AutoResumeToggle {powerSweep} disabled={!serviceReady} />
           </div>
-          {#if profilesReady}
-            <span class="refine">Profiles forged from measured hardware data <ShieldCheck size={23} /></span>
-          {/if}
         </div>
       </section>
 
@@ -706,13 +753,13 @@
       {#if progressPriority}
         {#if hasForgeRun}{@render commandProgress()}{/if}
         {@render commandTelemetry()}
-        {@render commandProfiles()}
+        {#if showProfiles}{@render commandProfiles()}{/if}
       {:else if profilesReady || runFinished}
-        {@render commandProfiles()}
+        {#if showProfiles}{@render commandProfiles()}{/if}
         {#if hasForgeRun}{@render commandProgress()}{/if}
         {@render commandTelemetry()}
       {:else}
-        {@render commandProfiles()}
+        {#if showProfiles}{@render commandProfiles()}{/if}
         {@render commandTelemetry()}
         {#if hasForgeRun}{@render commandProgress()}{/if}
       {/if}
@@ -777,9 +824,11 @@
               {onStartPower}
               {onRecoverContinue}
               {onResumePower}
+              bind:detailsOpen={progressDetailsOpen}
             />
           {/if}
 
+          {#if showProfiles}
           <section class="recommended-panel">
             <span class="instrument-kicker">{profilesReady ? "FORGED PROFILES" : "PROFILE OVERVIEW"}</span>
             <div class="instrument-profile-grid" class:ready={profilesReady}>
@@ -788,6 +837,7 @@
               {/each}
             </div>
           </section>
+          {/if}
           {@render fullResetControl()}
         </div>
 
@@ -802,7 +852,7 @@
               <option value="long">Long — exhaustive proof</option>
             </select>
             <p>Standard is recommended. Other modes are optional.</p>
-            <small>Measures this GPU and publishes only qualified profiles. Duration depends on the measurements.</small>
+            <AutoResumeToggle {powerSweep} disabled={!serviceReady} />
           </div>
           <div class="safe-loop-block">
             <span>SAFE LOOP</span>
@@ -842,6 +892,7 @@
             <button class="workshop-forge" onclick={runForge} disabled={primaryActionDisabled}><Anvil size={25} />{actionLabel}</button>
             <label><select value={forgeMode} onchange={selectMode} disabled={runModeDisabled}><option value="clean">Clean Run · Remeasures positives</option><option value="standard">Standard · Compact proof</option><option value="long">Long · Exhaustive proof</option></select><ChevronDown size={20} /></label>
         </div>
+        <div class="workshop-auto-resume"><AutoResumeToggle {powerSweep} disabled={!serviceReady} /></div>
       </section>
 
       {#if hasForgeRun}
@@ -855,17 +906,20 @@
             {onStartPower}
             {onRecoverContinue}
             {onResumePower}
+            bind:detailsOpen={progressDetailsOpen}
           />
         </div>
       {/if}
 
       {@render safetyNotice()}
+      {#if showProfiles}
       <section class="workshop-profile" class:ready={profilesReady}>
-        <div class="workshop-current"><span>Current profile</span><div><span class="workshop-profile-icon"><Hammer size={33} /></span><strong>{activeName}</strong></div><small><i></i>{activeKey ? "Applied" : "Stock"}</small></div>
+        <div class="workshop-current"><span>Current profile</span><div><span class="workshop-profile-icon"><Hammer size={33} /></span><strong>{activeName}</strong></div><small><i></i>{activeKey ? "Applied" : "Default settings"}</small></div>
         {#each displayedProfiles as profile}
           {@render profileDisclosure(profile, "workshop")}
         {/each}
       </section>
+      {/if}
 
       {@render fullResetControl()}
 
@@ -1013,13 +1067,12 @@
   .full-reset-strip {
     display: flex;
     min-width: 0;
-    min-height: 68px;
     align-items: center;
     justify-content: space-between;
-    gap: 24px;
-    border: 1px solid rgba(174, 91, 72, 0.38);
-    padding: 12px 18px;
-    background: rgba(40, 15, 12, 0.12);
+    gap: 18px;
+    border: 1px solid rgba(174, 91, 72, 0.2);
+    padding: 10px 16px;
+    background: rgba(40, 15, 12, 0.08);
   }
 
   .full-reset-copy {
@@ -1038,13 +1091,6 @@
     letter-spacing: 0.12em;
   }
 
-  .full-reset-copy > strong {
-    color: #d3b3aa;
-    font-size: 15px;
-    font-weight: 560;
-    white-space: nowrap;
-  }
-
   .full-reset-copy > p {
     margin: 0;
     color: #878c8e;
@@ -1057,7 +1103,7 @@
   .full-reset-action,
   .reset-dialog-actions button {
     display: inline-flex;
-    min-height: 44px;
+    min-height: 38px;
     align-items: center;
     justify-content: center;
     gap: 9px;
@@ -1530,6 +1576,7 @@
   }
 
   .state-status .protected.pending { color: #8e979d; }
+  .state-status .protected.problem { color: #d98270; }
 
   .command-identity p {
     max-width: 62ch;
@@ -1645,21 +1692,6 @@
     line-height: 1.45;
     text-align: center;
   }
-
-  .refine {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    border: 0;
-    border-bottom: 1px solid #51575c;
-    padding: 0 0 7px;
-    background: transparent;
-    color: #8f99a4;
-    font-size: 14px;
-    cursor: default;
-  }
-
-  .refine :global(svg) { color: #7eae3a; }
 
   .command-alert {
     display: grid;
@@ -2208,7 +2240,6 @@
 
   .mode-block p,
   .safe-loop-block p { margin: 0 0 8px; color: #c0c0bb; font-size: 14px; line-height: 1.5; }
-  .mode-block small { color: #8e9390; line-height: 1.5; }
 
   .safe-loop-block > strong {
     display: flex;
@@ -2411,6 +2442,12 @@
     gap: 35px;
   }
 
+  .workshop-auto-resume {
+    display: flex;
+    justify-content: center;
+    margin-top: 18px;
+  }
+
   .workshop-forge {
     display: flex;
     width: 300px;
@@ -2588,7 +2625,6 @@
     }
     .full-reset-copy { grid-template-columns: 1fr; }
     .full-reset-copy > span,
-    .full-reset-copy > strong,
     .full-reset-copy > p { grid-column: 1; }
     .soft-reset-action,
   .full-reset-action { width: 100%; }
@@ -2749,6 +2785,35 @@
     text-wrap: pretty;
   }
 
+  .profile-tag {
+    margin-left: 10px;
+    border-radius: 999px;
+    padding: 2px 8px;
+    background: rgba(214, 160, 76, 0.12);
+    color: var(--profile-accent, #d6a04c);
+    font-size: 11px;
+    font-style: normal;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    vertical-align: middle;
+  }
+
+  .profile-facts {
+    color: #d7d9d7;
+    font-size: 14px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .profile-card-summary {
+    grid-column: 1 / -1;
+    margin: 0;
+    color: #92999d;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
   .profile-card-state {
     display: flex;
     min-width: 0;
@@ -2818,7 +2883,7 @@
   .profile-card-metrics strong {
     overflow: hidden;
     color: #d7d9d7;
-    font-size: 12px;
+    font-size: 14px;
     font-weight: 580;
     font-variant-numeric: tabular-nums;
     text-overflow: ellipsis;
