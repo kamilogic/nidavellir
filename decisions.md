@@ -1,5 +1,34 @@
 # Nidavellir — Decision Log
 
+## 2026-10-02 (b) — in-app updates from GitHub releases
+
+The user asked for Discord-like updates that a lay user understands: show what changed before
+installing.
+- **Mechanism:** the Tauri v2 updater reads `latest.json` from the latest published GitHub release
+  (the repo is public, so no token). The installer is signed (minisign key pair), and the app
+  verifies it with the public key in `tauri.conf.json`.
+- **UX:**
+  - A check runs 4 s after start, then every 6 h.
+  - A dialog shows the version and the release notes, with Update now or Later.
+  - After Later, an "Update x.y.z" button stays in the corner.
+  - Settings shows the status and has Check for updates.
+  - Passive NSIS install: one UAC prompt, the Core Service restarts through the existing hooks,
+    and the app reopens.
+- **Safety:**
+  - Install is blocked while a Forge run is active.
+  - The dialog warns that a paused or interrupted run cannot resume on a new build.
+  - Dev builds never install.
+- **Release gates (CI):** the tag must equal the app version, the public key must be non-empty, and
+  `docs/release-notes/vX.Y.Z.md` must exist; that file is what users read. The release is a draft
+  until it is published by hand. `build-full-release.ps1` refuses to build without the key.
+- **Rejected:**
+  - A dynamic update server (infrastructure).
+  - Auto-generated notes as the in-app text (commit messages are not lay language).
+  - Silent forced updates.
+- **Pending (user):** generate and back up the signing key, set the GitHub secrets, run a
+  versioning pass (all manifests are still 0.1.0 while tags are at v0.3.1), and write the first
+  notes. See docs/releasing.md.
+
 ## 2026-10-02 — a Sentinel-stopped TDR is the level edge; the UI shows results, not diagnostics
 
 The user asked for the run-analysis bugs to be fixed and the UI to be decluttered (run

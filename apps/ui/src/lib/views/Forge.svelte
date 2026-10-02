@@ -4,6 +4,7 @@
   import { nvidiaGpu, recoverForge, requireServiceData } from "../forge-workflow.js";
   import AdvancedDiagnosticsHub from "../components/forge/AdvancedDiagnosticsHub.svelte";
   import ForgeThemeScreen from "../components/forge/ForgeThemeScreen.svelte";
+  import UpdatePrompt from "../components/forge/UpdatePrompt.svelte";
 
   let { theme = "command", onThemeChange } = $props();
 
@@ -719,6 +720,7 @@
       onClose={closeAdvancedDiagnostics}
     />
   </ForgeThemeScreen>
+  <UpdatePrompt forgeBusy={powerRunning} savedRun={["paused", "interrupted"].includes(powerSweep?.phase)} />
 
 </section>
 

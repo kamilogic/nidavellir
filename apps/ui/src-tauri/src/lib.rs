@@ -16,6 +16,7 @@ async fn service_ping() -> Result<Value, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![service_request, service_ping])
         .run(tauri::generate_context!())
         .expect("error while running nidavellir ui");

@@ -27,11 +27,17 @@
   "plugins": {
     "shell": {
       "open": "^C:\\\\ProgramData\\\\Nidavellir\\\\game-trace-[0-9]+\\.jsonl$"
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEEzMEVENjM0QkNCQTZBNkEKUldScWFycThOTllPb3loSmhkRStaUEY3TnFjNXVQWFNxaW8yWHFmMW02Q0lmV2FFNzNxaGt2WXEK",
+      "endpoints": ["https://github.com/kamilogic/nidavellir/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
     }
   },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

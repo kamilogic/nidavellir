@@ -20,6 +20,12 @@ function Get-SourceSnapshot {
   [pscustomobject]@{ sha256 = $hash; files = $files }
 }
 
+# Release installers carry the updater signature; an installer with no public key could never
+# verify a later update. See docs/releasing.md for the one-time key setup.
+$updater = (Get-Content -LiteralPath 'apps\ui\src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json).plugins.updater
+if (-not $updater.pubkey) { throw 'plugins.updater.pubkey is empty in tauri.conf.json; see docs/releasing.md' }
+if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'Set TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD to sign the installer; see docs/releasing.md' }
+
 $sourceBefore = Get-SourceSnapshot
 $buildStartedUtc = [DateTime]::UtcNow
 Set-Location (Join-Path $RepoRoot "apps\ui")
@@ -37,7 +43,7 @@ if ($sourceBefore.sha256 -ne $sourceAfter.sha256) { throw 'Source files changed 
 $commit = git rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw 'Cannot identify release commit' }
 $config = Get-Content -LiteralPath 'apps\ui\src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json
-$artifacts = @('target\release\nidavellir-service.exe', 'apps\ui\src-tauri\binaries\nidavellir-service-x86_64-pc-windows-msvc.exe', 'target\release\nidavellir-ui.exe', "target\release\bundle\nsis\Nidavellir_$($config.version)_x64-setup.exe")
+$artifacts = @('target\release\nidavellir-service.exe', 'apps\ui\src-tauri\binaries\nidavellir-service-x86_64-pc-windows-msvc.exe', 'target\release\nidavellir-ui.exe', "target\release\bundle\nsis\Nidavellir_$($config.version)_x64-setup.exe", "target\release\bundle\nsis\Nidavellir_$($config.version)_x64-setup.exe.sig")
 $identity = @($artifacts | ForEach-Object {
   $item = Get-Item -LiteralPath (Join-Path $RepoRoot $_)
   [pscustomobject]@{ path = $_; bytes = $item.Length; sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash }

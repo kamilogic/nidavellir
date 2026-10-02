@@ -12,7 +12,8 @@ export default defineConfig({
     launchOptions: { args: ["--disable-gpu"] },
   },
   webServer: {
-    command: "npm run dev -- --host 127.0.0.1 --port 1427",
+    // e2e mode lets the mocked updater run; plain `tauri dev` never offers an install.
+    command: "npm run dev -- --host 127.0.0.1 --port 1427 --mode e2e",
     url: "http://127.0.0.1:1427",
     reuseExistingServer: false,
     timeout: 30000,

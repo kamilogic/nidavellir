@@ -3,11 +3,23 @@
   import { onMount } from "svelte";
   import { Check, Languages, Palette, RefreshCw, Settings } from "@lucide/svelte";
   import { locale } from "../../i18n.js";
+  import { checkForUpdate, reviewUpdate, updateState } from "../../updates.js";
 
   let { theme = "command", onThemeChange } = $props();
 
   let appVersion = $state(null);
   let versionUnavailable = $state(false);
+
+  const updateText = $derived({
+    unavailable: "Updates install only in the installed app, not in development builds.",
+    idle: "Nidavellir checks GitHub for a new version every time it starts.",
+    checking: "Checking for updates…",
+    current: "You have the latest version.",
+    available: `Version ${$updateState.version} is available.`,
+    downloading: "Updating…",
+    installing: "Installing. Nidavellir reopens by itself.",
+    error: `Could not check for updates: ${$updateState.error}`,
+  }[$updateState.status]);
 
   const themes = [
     { id: "command", name: "Command Deck", description: "Wide control surface" },
@@ -120,8 +132,13 @@
           <span>Installed version</span>
           <strong>{appVersion ? `v${appVersion}` : versionUnavailable ? "Desktop app" : "Reading…"}</strong>
         </div>
-        <span class="update-mode">MANUAL</span>
-        <p>Automatic update checks are not configured for this build.</p>
+        <span class="update-mode">{$updateState.status === "unavailable" ? "DEV BUILD" : "AUTOMATIC"}</span>
+        <p>{updateText}</p>
+        {#if $updateState.status === "available"}
+          <button class="update-action" type="button" onclick={reviewUpdate}>See what's new</button>
+        {:else if !["unavailable", "downloading", "installing"].includes($updateState.status)}
+          <button class="update-action" type="button" onclick={() => checkForUpdate({ quiet: false })} disabled={$updateState.status === "checking"}>Check for updates</button>
+        {/if}
       </div>
     </section>
   </div>
@@ -438,6 +455,25 @@
   .update-status p {
     grid-column: 1 / -1;
     margin-top: 0;
+  }
+
+  .update-action {
+    grid-column: 1 / -1;
+    justify-self: start;
+    border: 1px solid var(--settings-line);
+    border-radius: 8px;
+    padding: 0 14px;
+    background: transparent;
+    color: var(--settings-accent);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 650;
+    cursor: pointer;
+  }
+
+  .update-action:disabled {
+    cursor: wait;
+    opacity: 0.6;
   }
 
   @media (max-width: 900px) {

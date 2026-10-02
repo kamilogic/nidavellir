@@ -32,8 +32,40 @@ jobs:
         shell: powershell
         run: ./scripts/validate-offline.ps1
 
-      - name: Build NSIS installer
+      # The in-app updater compares versions and shows these notes before installing.
+      - name: Check version, updater key and release notes
+        shell: pwsh
+        run: |
+          $config = Get-Content apps/ui/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $version = $config.version
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match the app version $version. Bump the version before tagging." }
+          if (-not $config.plugins.updater.pubkey) { throw "plugins.updater.pubkey is empty: installed apps could never verify an update." }
+          $notes = "docs/release-notes/v$version.md"
+          if (-not (Test-Path $notes)) { throw "Missing $notes. Write what changed for users before tagging." }
+          "VERSION=$version" >> $env:GITHUB_ENV
+          "NOTES_FILE=$notes" >> $env:GITHUB_ENV
+
+      - name: Build signed NSIS installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-full-release.ps1
+
+      - name: Write updater manifest (latest.json)
+        shell: pwsh
+        run: |
+          $installer = "Nidavellir_$($env:VERSION)_x64-setup.exe"
+          $signature = (Get-Content "target/release/bundle/nsis/$installer.sig" -Raw).Trim()
+          $manifest = [ordered]@{
+            version = $env:VERSION
+            notes = (Get-Content $env:NOTES_FILE -Raw).Trim()
+            pub_date = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = @{ "windows-x86_64" = [ordered]@{
+              signature = $signature
+              url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$installer"
+            } }
+          }
+          [IO.File]::WriteAllText("target/release/bundle/nsis/latest.json", ($manifest | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
@@ -41,14 +73,20 @@ jobs:
           name: nidavellir-windows-setup
           path: |
             target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/*.sig
+            target/release/bundle/nsis/latest.json
             target/release/release-manifest.json
 
+      # A draft is invisible to installed apps until it is reviewed and published.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/*.sig
+            target/release/bundle/nsis/latest.json
             target/release/release-manifest.json
+          body_path: ${{ env.NOTES_FILE }}
           draft: true
           generate_release_notes: true
         env:

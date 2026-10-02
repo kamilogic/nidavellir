@@ -19,6 +19,11 @@ async function openForge(page, scenario = "ready", theme = "command") {
     window.__forgeTest = state;
     window.__TAURI_INTERNALS__ = {
       invoke: async (command, { method } = {}) => {
+        if (command === "plugin:updater|check") {
+          return scenario === "update"
+            ? { rid: 7, currentVersion: "0.5.0", version: "0.5.1", date: null, body: "Faster checks.\nClearer profile cards.", rawJson: {} }
+            : null;
+        }
         if (command !== "service_request") throw new Error(`Unexpected command ${command}`);
         state.calls.push(method);
         if (state.offline) throw new Error("Core Service unavailable");
@@ -486,4 +491,20 @@ test("UX: automatic continuation is offered before a run starts", async ({ page 
   await toggle.click();
   await expect.poll(() => page.evaluate(() => window.__forgeTest.calls.includes("SetForgeAutoResume"))).toBe(true);
   expect(await page.evaluate(() => window.__forgeTest.calls.some((m) => /^(Start|Resume)/.test(m)))).toBe(false);
+});
+
+test("Updates: the startup check shows what is new and holds the install during a run", async ({ page }, testInfo) => {
+  await openForge(page, "update");
+  const dialog = page.getByRole("dialog", { name: "Update available" });
+  await expect(dialog).toBeVisible({ timeout: 10000 });
+  await page.screenshot({ path: testInfo.outputPath("update-dialog.png") });
+  await expect(dialog).toContainText("Nidavellir 0.5.1 is ready to install. You have 0.5.0.");
+  await expect(dialog).toContainText("Clearer profile cards.");
+  await dialog.getByRole("button", { name: "Later" }).click();
+  await expect(dialog).toBeHidden();
+  await page.getByRole("button", { name: "Update 0.5.1" }).click();
+  await expect(dialog).toBeVisible();
+  await page.evaluate(() => Object.assign(window.__forgeTest.power, { running: true, phase: "power" }));
+  await expect(dialog.getByRole("button", { name: "Update now" })).toBeDisabled();
+  await expect(dialog).toContainText("A Forge run is active");
 });
