@@ -1,5 +1,21 @@
 # Nidavellir — Project Memory
 
+## Current — in-app updates (2026-10-02 b)
+
+- **How it works:** the Tauri updater reads `latest.json` from the latest published GitHub release.
+  The app shows a dialog with the release notes (Update now / Later) and a corner button.
+  - Install is blocked during a Forge run.
+  - The passive NSIS install restarts the Core through the existing hooks.
+- **Release flow:** see docs/releasing.md.
+  - Releases are signed: the public key is in `tauri.conf.json`, the private key is a GitHub
+    secret.
+  - The in-app text comes from `docs/release-notes/vX.Y.Z.md`.
+  - CI makes a draft; publish it by hand.
+- **Version:** 0.5.0 everywhere. Public key ID `A30ED634BCBA6A6A` is in `tauri.conf.json`.
+- **Before the first tag:** the GitHub secrets predate the key files, so the user re-sets them
+  first (see handoff.md).
+- The UI is English by design (global audience). Portuguese is a planned option in Settings.
+
 ## Current — first search-11 Clean run finished (2026-10-02)
 
 - **Run f2-forge-1790936118478** ran in console mode with auto-resume off. It tested for 5.7 h and

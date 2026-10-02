@@ -1,5 +1,23 @@
 # Nidavellir — Session Handoff
 
+## LATEST — v0.5.0 prepared with in-app updates (2026-10-02 b)
+
+decisions.md 2026-10-02 (b) and docs/releasing.md.
+- **Done:**
+  - Updater feature (plugin, dialog and corner button, Settings status), signed release workflow
+    writing `latest.json`, build-script guards.
+  - Public key ID `A30ED634BCBA6A6A` in `tauri.conf.json`.
+  - Version 0.5.0 in every manifest; tags were already at v0.3.1, so v0.5 = multi-clock frontier
+    with three profiles.
+  - `docs/release-notes/v0.5.0.md` and the README updated (beta, English with Portuguese planned).
+  - Validation: Rust 725/3 ignored, UI 18/18, build, e2e 38/38.
+- **Before tagging v0.5.0:** the GitHub secrets (19:52 UTC) predate the key files (16:54 local =
+  19:54 UTC). The user must re-run both `gh secret set` commands from docs/releasing.md so CI
+  signs with the key whose public half ships in the app.
+- **Then:**
+  1. Push tag `v0.5.0` (needs the user's go).
+  2. CI makes a draft; review it, publish, and install that installer by hand once.
+
 ## LATEST — run f2-forge-1790936118478 analysed (2026-10-02)
 
 The first search-11 Clean run finished: Godforge 1890@937, Brokkr's 1800@875 (the user's stable

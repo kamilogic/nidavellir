@@ -14,34 +14,31 @@ The same idea applies here:
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0f766e)
-![Status](https://img.shields.io/badge/status-v0.3%20%E2%80%94%20GPU%20forge%20in%20development-1d4ed8)
+![Status](https://img.shields.io/badge/status-v0.5%20beta%20%E2%80%94%20NVIDIA%20GPU%20forge-1d4ed8)
 
 ---
 
 ## Current Scope
 
-Nidavellir is currently focused on:
+Nidavellir is focused on:
 
 ```text
 NVIDIA GPU tuning on Windows
-````
+```
 
-Current development priorities:
-
-* GPU V/F curve tuning
-* automatic power/efficiency profiling
+* GPU V/F curve tuning (undervolting at a chosen clock)
+* automatic, measured profile generation
 * Safe Loop crash recovery
 * persistent GPU knowledge
-* transparent profile generation
+* transparent results
 
-Out of scope for the current development phase:
+Out of scope:
 
-* CPU tuning
-* RAM tuning
+* CPU and RAM tuning (they may become separate programs later)
 * AMD GPU support
 * Linux support
 
-These may return later, but the project is currently GPU-first.
+The interface is in English. A Portuguese option is planned.
 
 ---
 
@@ -119,6 +116,30 @@ It is intended for users who want:
 
 ---
 
+### Example result
+
+One Forge run on the test RTX 3060 Ti (200 W limit). At stock, this card sustains 1740 MHz at about 200 W under the test load. Every GPU differs.
+
+| Profile | Clock | Voltage | Typical power | vs stock |
+| --- | --- | --- | --- | --- |
+| Godforge | 1890 MHz | 937 mV | 196 W | +150 MHz, −2% power |
+| Brokkr's Best | 1800 MHz | 875 mV | 175 W | +60 MHz, −12% power |
+| Deep Calm | 1710 MHz | 825 mV | 160 W | −30 MHz, −20% power |
+
+---
+
+## How a Forge run works
+
+1. Normalize the GPU at stock and record stock references for every test API.
+2. Find the highest clock the card sustains, then lower the voltage step by step until the first failure: a silent render error, an unstable result or a driver crash.
+3. Repeat at about 5% and 10% below that clock.
+4. Every passing point must survive the full matrix: DX11, DX12 and Vulkan render loads, load steps, field concurrency and an endurance lane.
+5. Publish each profile with a game margin above the lowest passing voltage, and restore stock.
+
+A Standard run takes about 6 hours.
+
+---
+
 ## Forge Knowledge
 
 Nidavellir does not apply a fixed formula.
@@ -128,10 +149,10 @@ It builds GPU-specific knowledge over time.
 Example:
 
 ```text
-+180 MHz → stable
-+210 MHz → stable
-+225 MHz → silent error
-+255 MHz → hard reboot
+1800 MHz @ 875 mV → qualified
+1800 MHz @ 837 mV → qualified (lowest pass)
+1800 MHz @ 825 mV → silent error
+1710 MHz @ 775 mV → driver crash
 ```
 
 That knowledge is preserved and used to avoid repeating unsafe regions.
@@ -144,16 +165,14 @@ The long-term goal is for each GPU to become better understood over time.
 
 Nidavellir is designed around the assumption that tuning can fail.
 
-The Safe Loop system protects the user by tracking risky steps and recovering after interrupted or failed tuning attempts.
+The Safe Loop system protects the user by tracking risky steps and recovering after interrupted or failed tuning attempts:
 
-Planned/active recovery behavior includes:
-
-* boot flags before risky operations;
-* detection of interrupted tuning;
-* crash/reboot classification;
-* automatic return to a safe state;
-* blacklist of known unsafe regions;
-* no persistence of known-bad profiles.
+* a boot flag is armed before every risky step, and boot-time recovery reads it;
+* a driver-crash (TDR) watcher stops the Forge, saves the incident and returns the GPU to stock;
+* failed points and a safety cone below each crash are never tested or applied again;
+* known-bad profiles never persist;
+* a run interrupted by a crash continues from where it stopped, by itself if you allow it;
+* a profile marked unstable in real use is removed and blocked.
 
 Safety is part of the product, not an afterthought.
 
@@ -161,25 +180,19 @@ Safety is part of the product, not an afterthought.
 
 ## Installing
 
-Nidavellir is not ready for general end-user installation yet.
+Nidavellir is in beta, validated on one GPU so far. Try a profile in your own games before relying on it.
 
-Installer builds may exist for testing, but the current project state is still active development.
+1. Download `Nidavellir_x.y.z_x64-setup.exe` from [GitHub Releases](https://github.com/kamilogic/nidavellir/releases).
+2. Run it. Windows asks for administrator permission, because the Core Service talks to the GPU.
+3. Open Nidavellir and press **Forge GPU**.
 
-When end-user releases are available, they will be published through:
-
-[GitHub Releases](https://github.com/kamilogic/nidavellir/releases)
-
-Expected release package:
-
-```text
-Nidavellir_*_x64-setup.exe
-```
+Updates: Nidavellir checks for a new version when it starts, shows what changed and installs it when you choose **Update now**. Versions before 0.5 must be updated by hand once.
 
 Requirements:
 
 * Windows 10/11 x64
 * NVIDIA GPU
-* Administrator permission for the core service
+* Administrator permission for the Core Service
 
 ---
 
@@ -202,6 +215,8 @@ rustup default stable-x86_64-pc-windows-msvc
 ---
 
 ## Development Workflow
+
+`scripts\dev-launch.bat` builds the Core Service, starts it elevated in a console and opens the UI. If the dev service is registered with Windows (`scripts\dev-service-boot.ps1 -Action Install`, elevated), it uses that service instead. The service then starts before login and continues runs through reboots.
 
 For one explicitly reviewed development validation after an exhausted crash budget, see
 [command-based manual validation](docs/development-validation.md). This opt-in console flow
@@ -231,7 +246,11 @@ npm run tauri:dev
 
 ---
 
-## Release Installer
+## Releasing
+
+Releases are built by CI from a version tag. The installers are signed, and the app updates itself from GitHub Releases. See [docs/releasing.md](docs/releasing.md) for the signing key setup, release notes and the publish step.
+
+A signed local build:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-full-release.ps1
@@ -240,7 +259,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-full-release.p
 Expected output:
 
 ```text
-target/release/bundle/nsis/Nidavellir_*_x64-setup.exe
+target/release/bundle/nsis/Nidavellir_*_x64-setup.exe (+ .sig)
 ```
 
 ---
@@ -254,7 +273,7 @@ Tauri + Svelte UI
         v
 Nidavellir Core Service
         |
-        | NVAPI / hardware interfaces
+        | NVAPI / NVML / GPU stress workloads
         v
 GPU
 ```
@@ -274,10 +293,12 @@ nidavellir/
 ├── crates/
 │   ├── core/               Shared core logic
 │   ├── gpu-nvapi/          NVIDIA GPU control and V/F curve access
-│   ├── driver-pawnio/      PawnIO backend for future CPU/MSR work
+│   ├── gpu-stress/         GPU qualification workloads (DX11, DX12, Vulkan)
+│   ├── driver-pawnio/      Legacy PawnIO backend (CPU work, out of scope)
 │   └── service/            Windows service and tuning orchestration
 ├── docs/
 │   ├── contracts/          UI ↔ backend contracts
+│   ├── release-notes/      What users see in the update window
 │   └── ui/                 UI/UX direction and design docs
 ├── scripts/                Development and release scripts
 ├── handoff.md              Continuity document for future sessions
@@ -289,38 +310,29 @@ nidavellir/
 
 ## Current Development Status
 
-Nidavellir is currently in active GPU-focused development.
+Working:
 
-Implemented or in progress:
+* NVIDIA V/F curve read/write through the modern NVAPI path;
+* multi-clock frontier search: a staircase descent with a game margin;
+* exact-Apply qualification matrix (DX11, DX12, Vulkan, endurance, load steps);
+* three distinct profiles: Godforge, Brokkr's Best and Deep Calm;
+* Safe Loop recovery, the TDR watcher and failure cones;
+* automatic continuation after a driver crash (opt-in);
+* signed installer with in-app updates.
 
-* NVIDIA V/F curve read/write through modern NVAPI path;
-* VF ceiling concept;
-* power-aware GPU sweep;
-* Safe Loop recovery model;
-* Forge Knowledge persistence model;
-* profile synthesis model for:
+Next:
 
-  * Godforge;
-  * Brokkr's Best;
-  * Deep Calm;
-* GPU-first UI redesign.
-
-Near-term focus:
-
-* multi-clock frontier sweep;
-* robust maximum sustainable clock discovery;
-* improved Brokkr's Best selection;
-* Deep Calm restoration;
-* persistent applied profile state;
-* Forge Knowledge reconstruction on service startup;
-* UI polish and design system.
+* game validation of the profiles across more GPUs;
+* Portuguese interface;
+* code cleanup after the GPU-only scope change.
 
 ---
 
 ## Tests
 
 ```powershell
-cargo test -p nidavellir-core -p nidavellir-driver-pawnio -p nidavellir-service
+cargo test --workspace
+cd apps/ui; npm test; npx playwright test
 ```
 
 Additional GPU-specific tests may require compatible NVIDIA hardware and should be treated carefully.
