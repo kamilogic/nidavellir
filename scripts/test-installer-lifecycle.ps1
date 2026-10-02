@@ -61,8 +61,9 @@ try {
     New-Fixture
     & $helper -Action Install -InstallDir $installDir | Out-Null
     Assert-Calls 'Create,sc:failure,sc:failureflag,StartService'
-    $expectedPath = '"' + (Join-Path $installDir 'nidavellir-service.exe') + '"'
-    if ($global:NidavellirInstallerFixture.PathName -ne $expectedPath) { throw 'Service executable path must retain quotes' }
+    # Resolve like the helper does: CI's TEMP is an 8.3 path (RUNNER~1) that GetFullPath expands.
+    $expectedPath = '"' + (Join-Path ([IO.Path]::GetFullPath($installDir)) 'nidavellir-service.exe') + '"'
+    if ($global:NidavellirInstallerFixture.PathName -ne $expectedPath) { throw "Service executable path must retain quotes: $($global:NidavellirInstallerFixture.PathName)" }
 
     New-Fixture $true
     & $helper -Action Prepare -InstallDir $installDir | Out-Null
