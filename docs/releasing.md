@@ -44,15 +44,17 @@ can never update again (users would have to reinstall by hand).
 
 ## Each release
 
-1. Bump the version: a versioning pass, see CLAUDE.md. `apps/ui/src-tauri/tauri.conf.json` is the
-   version users see; keep the other manifests aligned.
+1. Bump the version. `apps/ui/src-tauri/tauri.conf.json` is the version users see; keep the other
+   manifests aligned.
 2. Write `docs/release-notes/vX.Y.Z.md` in plain language. This exact text is what users read in
    the update window.
 3. Commit, then tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 4. CI (`.github/workflows/release.yml`) refuses to build when any of these is wrong:
    - the tag and the app version differ;
    - the public key is empty;
-   - the notes file is missing.
+   - the notes file is missing;
+   - an `@tauri-apps/*` npm package and its Rust crate differ in major.minor (the Tauri CLI checks
+     this). `apps/ui/package.json` pins them with `~`; update both sides together.
    Otherwise it builds the signed installer, writes `latest.json`, and creates a **draft** release.
 5. Review the draft and publish it. Installed apps offer the update at their next check.
 
