@@ -49,7 +49,7 @@ async function openForge(page, scenario = "ready", theme = "command") {
         }
         if (command === "plugin:updater|check") {
           return scenario === "update"
-            ? { rid: 7, currentVersion: "0.5.0", version: "0.5.1", date: null, body: "Faster checks.\nClearer profile cards.", rawJson: {} }
+            ? { rid: 7, currentVersion: "0.5.0", version: "0.5.1", date: "2026-10-03T20:31:52Z", body: "Nidavellir now lives in the tray.\n\n- Right-click the tray icon to switch profiles.\n- Fixed: a console window opened next to Nidavellir.\n\nThe run stays saved.", rawJson: {} }
             : null;
         }
         if (command !== "service_request") throw new Error(`Unexpected command ${command}`);
@@ -527,9 +527,13 @@ test("Updates: the startup check shows what is new and holds the install during 
   await openForge(page, "update");
   const dialog = page.getByRole("dialog", { name: "Update available" });
   await expect(dialog).toBeVisible({ timeout: 10000 });
-  await page.screenshot({ path: testInfo.outputPath("update-dialog.png") });
-  await expect(dialog).toContainText("Nidavellir 0.5.1 is ready to install. You have 0.5.0.");
-  await expect(dialog).toContainText("Clearer profile cards.");
+  await page.screenshot({ path: testInfo.outputPath("update-dialog.png"), animations: "disabled" });
+  await expect(dialog.getByLabel("Installed version 0.5.0")).toBeVisible();
+  await expect(dialog.getByLabel("New version 0.5.1")).toBeVisible();
+  await expect(dialog).toContainText("Released Oct 3, 2026");
+  await expect(dialog.getByRole("region", { name: "What's new" })).toContainText("Right-click the tray icon to switch profiles.");
+  await expect(dialog.getByRole("region", { name: "Fixes" })).toContainText("A console window opened next to Nidavellir.");
+  await expect(dialog).not.toContainText("- Right-click");
   await dialog.getByRole("button", { name: "Later" }).click();
   await expect(dialog).toBeHidden();
   await page.getByRole("button", { name: "Update 0.5.1" }).click();

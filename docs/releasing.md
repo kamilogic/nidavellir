@@ -47,7 +47,10 @@ can never update again (users would have to reinstall by hand).
 1. Bump the version. `apps/ui/src-tauri/tauri.conf.json` is the version users see; keep the other
    manifests aligned.
 2. Write `docs/release-notes/vX.Y.Z.md` in plain language. This exact text is what users read in
-   the update window.
+   the update window, which lays it out by line:
+   - the first line is a one-sentence summary;
+   - each `- ` bullet is a change; a bullet that starts with `Fixed:` is listed under Fixes;
+   - a closing paragraph, if any, comes last.
 3. Commit, then tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 4. CI (`.github/workflows/release.yml`) refuses to build when any of these is wrong:
    - the tag and the app version differ;

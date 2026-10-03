@@ -13,6 +13,7 @@ export const updateState = writable({
   version: null,
   currentVersion: null,
   notes: "",
+  date: null,
   error: null,
   progress: null,
   dismissed: false,
@@ -32,7 +33,7 @@ export async function checkForUpdate({ quiet = true } = {}) {
     await pending?.close().catch(() => {});
     pending = found;
     updateState.update((state) => found
-      ? { ...state, status: "available", version: found.version, currentVersion: found.currentVersion, notes: found.body ?? "" }
+      ? { ...state, status: "available", version: found.version, currentVersion: found.currentVersion, notes: found.body ?? "", date: found.date ?? null }
       : { ...state, status: "current" });
   } catch (error) {
     updateState.update((state) => ({ ...state, status: quiet ? "idle" : "error", error: String(error?.message ?? error) }));
