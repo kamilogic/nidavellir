@@ -40,6 +40,19 @@ pub(crate) fn driver_reset_available() -> Result<(), String> {
     }
 }
 
+pub(crate) fn under_scm() -> bool {
+    STOP_TX.get().is_some()
+}
+
+/// Stop like an SCM stop and exit zero, so SCM recovery leaves it stopped: the program exited, or
+/// nothing needs the Core any more. A closed channel means the service is already stopping.
+pub(crate) fn request_clean_stop() {
+    if let Some(stop) = STOP_TX.get() {
+        crate::shutdown::begin();
+        let _ = stop.send(Ok(()));
+    }
+}
+
 /// Stop like an SCM stop (workers released, stock confirmed, NVAPI released), then restart the
 /// GPU device and exit non-zero; see `auto_resume`.
 pub(crate) fn request_driver_reset() -> Result<(), String> {
@@ -126,11 +139,11 @@ pub fn run_service() -> windows_service::Result<()> {
             false
         }
     };
-    if sentinel_ready && crate::tdr_sentinel::reboot_required_event().is_none() {
-        crate::gpu_apply::reapply_on_boot(&safe_store);
-    } else {
-        tracing::warn!("persisted GPU profile reapply skipped by the Sentinel startup guard");
+    if !sentinel_ready {
+        tracing::warn!("persisted GPU profile reapply disabled by the Sentinel startup guard");
     }
+    // The profile is reapplied when the program connects, not at boot (2026-10-03).
+    crate::program_session::startup(sentinel_ready);
 
     let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {
@@ -152,6 +165,7 @@ pub fn run_service() -> windows_service::Result<()> {
     }));
 
     crate::auto_resume::spawn(Arc::clone(&state));
+    crate::program_session::spawn_watchdog(Arc::clone(&state));
     let pipe_state = Arc::clone(&state);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {

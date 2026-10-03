@@ -8,6 +8,7 @@ async function openForge(page, scenario = "ready", theme = "command") {
     const pending = ["recover", "missing", "ack-failure", "double-click"].includes(scenario);
     const state = {
       calls: [], offline: scenario === "offline", acknowledged: false,
+      window: { closeToTray: true, minimizeToTray: false, startWithWindows: false },
       applied: JSON.parse(sessionStorage.getItem("fixture-applied") || "null") || { type: "GpuApply", core: null, label: null },
       safe: { type: "SafeLoop", state: pending ? "unstable" : "idle", safe_mode: false, boot_flag_armed: false, recovery_pending_ack: pending, gpu_reboot_required: scenario === "reboot", blacklist: [], condemnations: [] },
       power: { type: "PowerSweep", phase: scenario === "missing" ? "idle" : pending ? "interrupted" : "idle", running: false, resume_available: false, points: [], log: [], start_block_reason: scenario === "safety-limit" ? "Forge safety limit reached. Soft Reset preserves known failures; Full Reset erases all GPU learning." : null },
@@ -17,8 +18,35 @@ async function openForge(page, scenario = "ready", theme = "command") {
       Object.assign(state.power, { phase: "finished", is_undervolt: true, frontier_complete: true, profile_search_complete: scenario !== "collapsed", profiles_qualified: scenario !== "unqualified", godforge: { ...point, target_clock_mhz: scenario === "collapsed" ? 1800 : 1830 }, brokkrs: point, deep_calm: { ...point, target_clock_mhz: scenario === "collapsed" ? 1800 : 1740 }, stock_clock_mhz: 1800, stock_power_p99_w: 200 });
     }
     window.__forgeTest = state;
+    // Events the program's Rust side emits (tray notices, Exit during a run).
+    const listeners = new Map();
+    let nextCallback = 1;
+    window.__tauriListening = (event) => listeners.has(event);
+    window.__tauriEmit = (event, payload) => {
+      for (const handler of listeners.get(event) ?? []) handler({ event, id: 0, payload });
+    };
     window.__TAURI_INTERNALS__ = {
-      invoke: async (command, { method } = {}) => {
+      transformCallback: (callback) => {
+        const id = nextCallback++;
+        window[`_${id}`] = callback;
+        return id;
+      },
+      invoke: async (command, args = {}) => {
+        const { method } = args;
+        if (command === "plugin:event|listen") {
+          listeners.set(args.event, [...(listeners.get(args.event) ?? []), window[`_${args.handler}`]]);
+          return args.handler;
+        }
+        if (command === "get_window_settings") return structuredClone(state.window);
+        if (command === "set_window_settings") {
+          state.calls.push("set_window_settings");
+          state.window = { ...args.settings };
+          return structuredClone(state.window);
+        }
+        if (command === "exit_program") {
+          state.calls.push("exit_program");
+          return null;
+        }
         if (command === "plugin:updater|check") {
           return scenario === "update"
             ? { rid: 7, currentVersion: "0.5.0", version: "0.5.1", date: null, body: "Faster checks.\nClearer profile cards.", rawJson: {} }
@@ -26,6 +54,7 @@ async function openForge(page, scenario = "ready", theme = "command") {
         }
         if (command !== "service_request") throw new Error(`Unexpected command ${command}`);
         state.calls.push(method);
+        if (scenario === "connecting") return new Promise(() => {});
         if (state.offline) throw new Error("Core Service unavailable");
         const ok = (data) => ({ ok: true, data: structuredClone(data) });
         if (method === "DetectHardware") {
@@ -212,12 +241,13 @@ test("duplicate recovery clicks cannot launch two transactions", async ({ page }
   expect(await page.evaluate(() => window.__forgeTest.calls.filter((m) => m === "ResetGpuTuning").length)).toBe(1);
 });
 
-test("J01: onboarding requires a detected NVIDIA GPU and no CPU driver step", async ({ page }) => {
+test("J01: onboarding finds the NVIDIA GPU by itself and needs no CPU driver step", async ({ page }, testInfo) => {
   await openForge(page, "onboarding-ready");
-  await page.getByRole("button", { name: "Check GPU readiness" }).click();
-  await expect(page.getByRole("heading", { name: "Safety acknowledgement" })).toBeVisible();
+  await expect(page.getByLabel("GPU detection")).toContainText("NVIDIA GeForce RTX 3060 Ti");
+  await expect(page.getByRole("heading", { name: "Before you forge" })).toBeVisible();
   await expect(page.getByText(/PawnIO/)).toHaveCount(0);
-  await page.getByRole("button", { name: "Open GPU Forge" }).click();
+  await page.screenshot({ path: testInfo.outputPath("welcome.png"), animations: "disabled" });
+  await page.getByRole("button", { name: "I understand, open the Forge" }).click();
   await expect(page.locator(".plate-button")).toHaveText("Forge GPU");
   expect(await page.evaluate(() => window.__forgeTest.calls.includes("GetDriverStatus"))).toBe(false);
 });
@@ -225,9 +255,9 @@ test("J01: onboarding requires a detected NVIDIA GPU and no CPU driver step", as
 for (const scenario of ["onboarding-unsupported", "onboarding-malformed"]) {
   test("J01: " + scenario + " cannot advance", async ({ page }) => {
     await openForge(page, scenario);
-    await page.getByRole("button", { name: "Check GPU readiness" }).click();
-    await expect(page.locator(".onboarding .error")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Open GPU Forge" })).toHaveCount(0);
+    await expect(page.locator(".welcome .error")).toBeVisible();
+    await expect(page.getByRole("button", { name: "I understand, open the Forge" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Try again" })).toBeVisible();
   });
 }
 
@@ -507,4 +537,48 @@ test("Updates: the startup check shows what is new and holds the install during 
   await page.evaluate(() => Object.assign(window.__forgeTest.power, { running: true, phase: "power" }));
   await expect(dialog.getByRole("button", { name: "Update now" })).toBeDisabled();
   await expect(dialog).toContainText("A Forge run is active");
+});
+
+test("Program: window and startup options save through the desktop bridge", async ({ page }, testInfo) => {
+  await openForge(page);
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const close = page.getByRole("switch", { name: /Close to tray/ });
+  const start = page.getByRole("switch", { name: /Start with Windows/ });
+  await expect(close).toBeChecked();
+  await expect(start).not.toBeChecked();
+  await page.getByRole("heading", { name: "Window and startup" }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("settings-window.png") });
+  await start.click();
+  await expect(start).toBeChecked();
+  expect(await page.evaluate(() => window.__forgeTest.window)).toEqual({ closeToTray: true, minimizeToTray: false, startWithWindows: true });
+});
+
+test("Program: Exit during a Forge run asks first, then stops the run and exits", async ({ page }, testInfo) => {
+  await openForge(page);
+  await page.waitForFunction(() => window.__tauriListening("exit-requested"));
+  await page.evaluate(() => window.__tauriEmit("exit-requested", null));
+  const dialog = page.getByRole("dialog", { name: "Exit Nidavellir?" });
+  await expect(dialog).toContainText("returns the GPU to stock");
+  await page.screenshot({ path: testInfo.outputPath("exit-dialog.png") });
+  await dialog.getByRole("button", { name: "Keep running" }).click();
+  await expect(dialog).toBeHidden();
+  expect(await page.evaluate(() => window.__forgeTest.calls.includes("exit_program"))).toBe(false);
+  await page.evaluate(() => window.__tauriEmit("exit-requested", null));
+  await dialog.getByRole("button", { name: "Stop run and exit" }).click();
+  await expect.poll(() => page.evaluate(() => window.__forgeTest.calls.includes("exit_program"))).toBe(true);
+});
+
+test("Program: a failed tray action is shown in the window", async ({ page }) => {
+  await openForge(page);
+  await page.waitForFunction(() => window.__tauriListening("tray-notice"));
+  await page.evaluate(() => window.__tauriEmit("tray-notice", "Could not apply Godforge: Exact qualified descriptor was refused"));
+  await expect(page.getByRole("alert").filter({ hasText: "Could not apply Godforge" })).toBeVisible();
+});
+
+test("UX: the state divider follows a long state word", async ({ page }) => {
+  await openForge(page, "connecting");
+  const state = page.locator(".state-status .state-value");
+  await expect(state).toHaveText("CONNECTING");
+  const [word, status] = await Promise.all([state.boundingBox(), page.locator(".state-status > div + div").boundingBox()]);
+  expect(word.x + word.width).toBeLessThan(status.x);
 });

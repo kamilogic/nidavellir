@@ -8,10 +8,20 @@ use crate::gpu_sweep::{GpuSweepProgress, StabilityResult, SweepPhase, VfPoint};
 use crate::safe_loop::{BlacklistRegion, CrashClass, ForgeIncident, SafeLoopState, TuningPoint};
 use crate::sensors::SensorReadings;
 
+/// Prefix of the `ExitProgram` refusal: the program must ask the user before stopping the run.
+pub const EXIT_REFUSED_FORGE: &str = "Forge run active";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum IpcRequest {
     Ping,
+    /// Sent by the program every few seconds while it is open (2026-10-03). The first one after the
+    /// Core starts reapplies the persisted profile; without them and without a Forge run that needs
+    /// the Core, the installed service stops at stock. Additive.
+    ProgramHeartbeat,
+    /// The user exited the program: the installed service stops cleanly at stock. Refused with
+    /// [`EXIT_REFUSED_FORGE`] while a Forge run is active or about to resume. Additive.
+    ExitProgram,
     DetectHardware,
     ReadSensors,
     GetCapabilityReport,

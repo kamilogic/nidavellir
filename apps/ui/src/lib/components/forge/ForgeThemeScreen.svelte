@@ -1540,7 +1540,9 @@
 
   .state-status {
     display: grid;
-    grid-template-columns: minmax(120px, 0.45fr) minmax(190px, 1fr);
+    /* The divider follows the state word: a long one ("CONNECTING") moves it instead of crossing it. */
+    grid-template-columns: max-content minmax(0, 1fr);
+    column-gap: clamp(24px, 3vw, 46px);
     width: min(100%, 460px);
     border-bottom: 1px solid rgba(255, 255, 255, 0.28);
     padding-bottom: 14px;

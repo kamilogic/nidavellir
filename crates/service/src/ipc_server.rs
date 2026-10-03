@@ -134,7 +134,10 @@ fn serve_one_client(state: Arc<Mutex<AppState>>, listening: &mut dyn FnMut()) ->
                 line.clear();
                 continue;
             }
-            let response = handle_request(trimmed, &state);
+            let response = {
+                let _in_flight = crate::program_session::request_started();
+                handle_request(trimmed, &state)
+            };
             let out = format!("{}\n", serialize_response(&response)?);
             write_pipe(handle, out.as_bytes())?;
             line.clear();
@@ -233,6 +236,14 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
 
     match &request {
         IpcRequest::Ping => IpcResponse::success(ResponseData::Pong),
+        IpcRequest::ProgramHeartbeat => {
+            crate::program_session::heartbeat(&guard);
+            IpcResponse::success(ResponseData::Pong)
+        }
+        IpcRequest::ExitProgram => match crate::program_session::exit(&guard) {
+            Ok(()) => IpcResponse::success(ResponseData::Pong),
+            Err(error) => IpcResponse::failure(error),
+        },
         IpcRequest::AuthorizeDevelopmentValidation { reason } => {
             match crate::development_validation::authorize(&guard.safe_store, reason) {
                 Ok(()) => {

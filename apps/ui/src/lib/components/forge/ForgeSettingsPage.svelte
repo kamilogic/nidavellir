@@ -1,7 +1,8 @@
 <script>
   import { getVersion } from "@tauri-apps/api/app";
+  import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { Check, Languages, Palette, RefreshCw, Settings } from "@lucide/svelte";
+  import { AppWindow, Check, Languages, Palette, RefreshCw, Settings } from "@lucide/svelte";
   import { locale } from "../../i18n.js";
   import { checkForUpdate, reviewUpdate, updateState } from "../../updates.js";
 
@@ -27,6 +28,30 @@
     { id: "workshop", name: "Quiet Workshop", description: "Focused daily view" },
   ];
 
+  const windowOptions = [
+    { key: "startWithWindows", name: "Start with Windows", description: "Opens in the tray when you sign in and applies your selected profile." },
+    { key: "closeToTray", name: "Close to tray", description: "The close button keeps Nidavellir running in the tray. Exit from the tray menu to stop it." },
+    { key: "minimizeToTray", name: "Minimize to tray", description: "Minimizing hides the window in the tray instead of the taskbar." },
+  ];
+  let windowSettings = $state(null);
+  let windowUnavailable = $state(false);
+  let windowSaving = $state(false);
+  let windowError = $state(null);
+
+  async function saveWindowSetting(input, key) {
+    if (!windowSettings || windowSaving) return;
+    windowSaving = true;
+    windowError = null;
+    try {
+      windowSettings = await invoke("set_window_settings", { settings: { ...windowSettings, [key]: input.checked } });
+    } catch (error) {
+      input.checked = windowSettings[key];
+      windowError = `The setting was not saved: ${error}`;
+    } finally {
+      windowSaving = false;
+    }
+  }
+
   function selectTheme(nextTheme) {
     onThemeChange?.(nextTheme);
     requestAnimationFrame(() => {
@@ -43,6 +68,14 @@
       })
       .catch(() => {
         if (active) versionUnavailable = true;
+      });
+
+    invoke("get_window_settings")
+      .then((settings) => {
+        if (active) windowSettings = settings;
+      })
+      .catch(() => {
+        if (active) windowUnavailable = true;
       });
 
     return () => {
@@ -115,6 +148,40 @@
           </button>
         </div>
         <p class="setting-note">Português will be enabled when every visible screen has a complete translation.</p>
+      </div>
+    </section>
+
+    <section class="settings-row" aria-labelledby="window-setting-title">
+      <div class="setting-label">
+        <AppWindow size={23} strokeWidth={1.6} />
+        <div>
+          <h2 id="window-setting-title">Window and startup</h2>
+          <p>The Core runs only while Nidavellir does: your profile stays active while it runs, and exiting returns the GPU to stock.</p>
+        </div>
+      </div>
+
+      <div class="setting-control">
+        {#if windowSettings}
+          <div class="toggle-list" role="group" aria-label="Window and startup">
+            {#each windowOptions as option}
+              <label class="toggle-row">
+                <span><strong>{option.name}</strong><small>{option.description}</small></span>
+                <input
+                  type="checkbox"
+                  role="switch"
+                  checked={windowSettings[option.key]}
+                  disabled={windowSaving}
+                  onchange={(event) => saveWindowSetting(event.currentTarget, option.key)}
+                />
+              </label>
+            {/each}
+          </div>
+          {#if windowError}
+            <p class="setting-error" role="alert">{windowError}</p>
+          {/if}
+        {:else}
+          <p class="setting-note">{windowUnavailable ? "Available in the installed app." : "Reading…"}</p>
+        {/if}
       </div>
     </section>
 
@@ -476,6 +543,93 @@
     opacity: 0.6;
   }
 
+  .toggle-list {
+    border: 1px solid var(--settings-line);
+  }
+
+  .toggle-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 18px;
+    border-top: 1px solid var(--settings-line);
+    padding: 14px 16px;
+    cursor: pointer;
+  }
+
+  .toggle-row:first-child {
+    border-top: 0;
+  }
+
+  .toggle-row > span {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .toggle-row strong {
+    color: var(--settings-text);
+    font-size: 14px;
+    font-weight: 620;
+  }
+
+  .toggle-row small {
+    color: var(--settings-muted);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  .toggle-row input {
+    position: relative;
+    width: 40px;
+    height: 22px;
+    margin: 0;
+    flex: 0 0 auto;
+    appearance: none;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.14);
+    cursor: pointer;
+    transition: background-color 150ms ease;
+  }
+
+  .toggle-row input::after {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #e8ebe9;
+    content: "";
+    transition: transform 150ms ease;
+  }
+
+  .toggle-row input:checked {
+    background: var(--settings-accent);
+  }
+
+  .toggle-row input:checked::after {
+    transform: translateX(18px);
+  }
+
+  .toggle-row input:focus-visible {
+    outline: 2px solid var(--settings-accent);
+    outline-offset: 2px;
+  }
+
+  .toggle-row input:disabled {
+    cursor: wait;
+    opacity: 0.6;
+  }
+
+  .setting-error {
+    margin: 10px 0 0;
+    color: #f0b8bc;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
   @media (max-width: 900px) {
     .settings-row {
       grid-template-columns: 1fr;
@@ -517,7 +671,9 @@
 
   @media (prefers-reduced-motion: reduce) {
     .theme-options button,
-    .language-options button {
+    .language-options button,
+    .toggle-row input,
+    .toggle-row input::after {
       transition: none;
     }
   }

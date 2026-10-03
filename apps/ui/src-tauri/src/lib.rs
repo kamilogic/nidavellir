@@ -1,4 +1,5 @@
 mod ipc_client;
+mod program;
 
 use serde_json::Value;
 
@@ -14,10 +15,24 @@ async fn service_ping() -> Result<Value, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if !program::claim_single_instance() {
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![service_request, service_ping])
+        .invoke_handler(tauri::generate_handler![
+            service_request,
+            service_ping,
+            program::get_window_settings,
+            program::set_window_settings,
+            program::exit_program
+        ])
+        .setup(|app| {
+            program::setup(app)?;
+            Ok(())
+        })
+        .on_window_event(program::on_window_event)
         .run(tauri::generate_context!())
         .expect("error while running nidavellir ui");
 }

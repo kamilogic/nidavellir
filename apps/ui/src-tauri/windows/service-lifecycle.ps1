@@ -74,6 +74,10 @@ if ($service) {
 if ($LASTEXITCODE -ne 0) { throw "Recovery actions could not be set for ${serviceName} (sc.exe exit $LASTEXITCODE)" }
 & sc.exe failureflag $serviceName 1 | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Recovery flag could not be set for ${serviceName} (sc.exe exit $LASTEXITCODE)" }
+# The program starts the Core when it opens; the Core stops itself when the program exits.
+# Interactive users get the default service rights plus start (RP), nothing more.
+& sc.exe sdset $serviceName 'D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Start permission could not be set for ${serviceName} (sc.exe exit $LASTEXITCODE)" }
 Invoke-CoreMethod (Read-CoreService) 'StartService'
 Wait-CoreState 'Running'
 Write-Output "Core Service is running. Installed binary: $binary"

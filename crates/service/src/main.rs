@@ -15,6 +15,7 @@ mod gpu_undervolt;
 mod gpu_verify;
 mod ipc_server;
 mod manual_point;
+mod program_session;
 mod qualified_search;
 mod safe_loop_runtime;
 mod sensor_gather;
@@ -440,8 +441,8 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     gpu_power_sweep::reconcile_interrupted_forge(&safe_store);
     safe_loop_runtime::run_startup_recovery(&safe_store);
     safe_loop_runtime::spawn_heartbeat(safe_store.clone());
-    // Re-apply the persisted GPU profile (volatile offsets) unless a prior
-    // crash/Safe Mode says not to.
+    // The startup guard decides whether the program's first heartbeat may re-apply the persisted
+    // GPU profile (volatile offsets); reapply itself still refuses after a crash or in Safe Mode.
     // v17 boot reconciliation: a hard wedge freezes the live sentinel with the machine — detect a
     // TDR that happened while we were down BEFORE re-applying the very profile that caused it.
     #[cfg(windows)]
@@ -481,14 +482,15 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
             false
         }
     };
+    // The profile is reapplied when the program connects, not at startup (2026-10-03).
     #[cfg(windows)]
-    if sentinel_ready && tdr_sentinel::reboot_required_event().is_none() && !development_validation::enabled() {
-        gpu_apply::reapply_on_boot(&safe_store);
-    } else {
-        tracing::warn!("persisted GPU profile reapply skipped by the Sentinel/development startup guard");
-    }
+    let reapply_allowed = sentinel_ready && !development_validation::enabled();
     #[cfg(not(windows))]
-    gpu_apply::reapply_on_boot(&safe_store);
+    let reapply_allowed = true;
+    if !reapply_allowed {
+        tracing::warn!("persisted GPU profile reapply disabled by the Sentinel/development startup guard");
+    }
+    program_session::startup(reapply_allowed);
 
     let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {

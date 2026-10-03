@@ -3,6 +3,7 @@
   import Dashboard from "./lib/views/Dashboard.svelte";
   import SafeLoop from "./lib/views/SafeLoop.svelte";
   import Forge from "./lib/views/Forge.svelte";
+  import TrayBridge from "./lib/components/forge/TrayBridge.svelte";
   import { t, locale, locales } from "./lib/i18n.js";
   import "./lib/theme.css";
 
@@ -25,7 +26,6 @@
   }
 
   let onboarded = $state(initialOnboarded());
-  let onboardingStep = $state(1);
   let activeTab = $state("forge");
   let uiTheme = $state(initialTheme());
 
@@ -49,8 +49,9 @@
   }
 </script>
 
-<main data-ui-theme={uiTheme} class:forge-shell={onboarded && activeTab === "forge"}>
-  {#if !onboarded || activeTab !== "forge"}
+<main data-ui-theme={uiTheme} class:forge-shell={onboarded && activeTab === "forge"} class:welcome-shell={!onboarded}>
+  <TrayBridge />
+  {#if onboarded && activeTab !== "forge"}
     <header class="top">
       <div>
         <h1>Nidavellir</h1>
@@ -82,7 +83,7 @@
   {/if}
 
   {#if !onboarded}
-    <Onboarding bind:step={onboardingStep} onComplete={finishOnboarding} />
+    <Onboarding onComplete={finishOnboarding} />
   {:else if activeTab === "forge"}
     <Forge theme={uiTheme} onThemeChange={applyTheme} />
   {:else if activeTab === "dashboard"}
@@ -236,7 +237,8 @@
     cursor: pointer;
   }
 
-  main.forge-shell {
+  main.forge-shell,
+  main.welcome-shell {
     width: 100%;
     max-width: none;
     margin: 0;

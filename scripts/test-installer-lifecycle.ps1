@@ -60,7 +60,7 @@ function Assert-Failure([string]$Action, [string]$Message) {
 try {
     New-Fixture
     & $helper -Action Install -InstallDir $installDir | Out-Null
-    Assert-Calls 'Create,sc:failure,sc:failureflag,StartService'
+    Assert-Calls 'Create,sc:failure,sc:failureflag,sc:sdset,StartService'
     # Resolve like the helper does: CI's TEMP is an 8.3 path (RUNNER~1) that GetFullPath expands.
     $expectedPath = '"' + (Join-Path ([IO.Path]::GetFullPath($installDir)) 'nidavellir-service.exe') + '"'
     if ($global:NidavellirInstallerFixture.PathName -ne $expectedPath) { throw "Service executable path must retain quotes: $($global:NidavellirInstallerFixture.PathName)" }
@@ -69,9 +69,9 @@ try {
     & $helper -Action Prepare -InstallDir $installDir | Out-Null
     Assert-Calls 'StopService'
     & $helper -Action Install -InstallDir $installDir | Out-Null
-    Assert-Calls 'StopService,Change,sc:failure,sc:failureflag,StartService'
+    Assert-Calls 'StopService,Change,sc:failure,sc:failureflag,sc:sdset,StartService'
     & $helper -Action Uninstall -InstallDir $installDir | Out-Null
-    Assert-Calls 'StopService,Change,sc:failure,sc:failureflag,StartService,StopService,Delete'
+    Assert-Calls 'StopService,Change,sc:failure,sc:failureflag,sc:sdset,StartService,StopService,Delete'
 
     New-Fixture
     & $helper -Action Uninstall -InstallDir $installDir | Out-Null
@@ -90,7 +90,7 @@ try {
         if ($global:NidavellirInstallerFixture.Calls[-1] -ne $operation) { throw 'Workflow continued after a failure' }
     }
 
-    foreach ($operation in @('sc:failure', 'sc:failureflag')) {
+    foreach ($operation in @('sc:failure', 'sc:failureflag', 'sc:sdset')) {
         New-Fixture
         $global:NidavellirInstallerFixture.Fail = $operation
         Assert-Failure 'Install' 'could not be set'

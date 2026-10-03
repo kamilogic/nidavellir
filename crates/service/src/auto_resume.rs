@@ -9,7 +9,8 @@
 //! - otherwise it acknowledges only that run's own CandidateCrash and calls the same `resume` a
 //!   user click calls, so every guard applies, including the stock controls every run starts with.
 //!
-//! One attempt per incident: a refusal is logged and the run waits for the user.
+//! One attempt per incident, kept across Core restarts: a refusal is logged and the run waits for
+//! the user.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,33 +41,68 @@ fn pending_incident(state: &AppState) -> Result<Option<ForgeIncident>, String> {
     state.safe_store.load_record_checked().map(|record| record.pending_forge_incident).map_err(|e| e.to_string())
 }
 
+/// Keys this process already acted on. Shared with the program session: the Core outlives the
+/// program only while a resume can still happen.
+static ATTEMPTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Acknowledge+resume attempts are also saved, because the Core stops when the program closes. A
+/// driver-only reset is not: the restarted process must continue that same incident, and
+/// `gpu_driver_reset.json` already limits the reset to one.
+const SAVED_ATTEMPTS: usize = 64;
+
+fn attempts_path() -> std::path::PathBuf {
+    nidavellir_core::safe_loop::default_data_dir().join("auto_resume_attempts.json")
+}
+
+/// A missing or unreadable file means no saved attempt: the resume guards still apply.
+fn saved_attempts(path: &std::path::Path) -> Vec<String> {
+    std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+}
+
+fn save_attempt(path: &std::path::Path, keys: &[String; 2]) -> Result<(), String> {
+    let mut saved = saved_attempts(path);
+    saved.extend(keys.iter().cloned());
+    let excess = saved.len().saturating_sub(SAVED_ATTEMPTS);
+    saved.drain(..excess);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, serde_json::to_vec(&saved).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+fn attempted(key: &str) -> bool {
+    ATTEMPTED.lock().map_or(true, |keys| keys.iter().any(|attempted| attempted == key))
+        || saved_attempts(&attempts_path()).iter().any(|attempted| attempted == key)
+}
+
 /// The incident an attempt belongs to (the run's own key once it is acknowledged), then the run.
-fn eligible_keys(state: &Mutex<AppState>) -> Option<[String; 2]> {
-    let guard = state.lock().ok()?;
-    let progress = guard.power_sweep.progress();
+fn eligible_keys(state: &AppState) -> Option<[String; 2]> {
+    let progress = state.power_sweep.progress();
     // Progress alone rules out almost every poll; the Safe Loop record is read only after that.
     if !auto_resume_eligible(&progress, None) {
         return None;
     }
-    let pending = pending_incident(&guard).ok()?;
+    let pending = pending_incident(state).ok()?;
     let run = progress.run_id.clone().unwrap_or_default();
     auto_resume_eligible(&progress, pending.as_ref())
         .then(|| [pending.map_or_else(|| run.clone(), |incident| incident.id), run])
 }
 
+/// True while this run will still continue on its own (countdown or next poll).
+pub(crate) fn needs_core(state: &AppState) -> bool {
+    eligible_keys(state).is_some_and(|keys| !attempted(&keys[0]))
+}
+
 fn run(state: &Mutex<AppState>) {
     // Acting on an incident also spends the run's own key: a Resume refused right after the
     // acknowledgement gets no second countdown. A later incident of the run gets a new attempt.
-    let mut attempted = std::collections::HashSet::new();
     while !crate::shutdown::is_requested() {
         std::thread::sleep(Duration::from_secs(5));
-        let Some(keys) = eligible_keys(state) else { continue };
-        if attempted.contains(&keys[0]) {
+        let Some(keys) = state.lock().ok().and_then(|guard| eligible_keys(&guard)) else { continue };
+        if attempted(&keys[0]) {
             continue;
         }
         if countdown(state) {
-            attempted.extend(keys);
-            act(state);
+            act(state, keys);
         }
     }
 }
@@ -98,8 +134,12 @@ fn countdown(state: &Mutex<AppState>) -> bool {
     true
 }
 
-fn act(state: &Mutex<AppState>) {
+fn act(state: &Mutex<AppState>, keys: [String; 2]) {
     let Ok(guard) = state.lock() else { return };
+    // Under the state lock, so `needs_core` never sees the attempt before its outcome.
+    if let Ok(mut attempted) = ATTEMPTED.lock() {
+        attempted.extend(keys.iter().cloned());
+    }
     let refuse = |reason: String| {
         guard.power_sweep.note_auto_resume(None, format!(
             "Retomada automática recusada: {reason}. A run aguarda ação manual."
@@ -123,6 +163,10 @@ fn act(state: &Mutex<AppState>) {
             ),
         };
         return guard.power_sweep.note_auto_resume(None, line);
+    }
+    // Saved before acting, so a Core the program restarts never tries this incident again.
+    if let Err(error) = save_attempt(&attempts_path(), &keys) {
+        tracing::warn!("auto-resume attempt not saved ({error}); a restarted Core may try it once more");
     }
     if let Some(incident) = pending.as_ref() {
         if let Err(error) =
@@ -301,6 +345,25 @@ fn restart_device(instance_id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_attempt_survives_a_restart_and_the_file_stays_bounded() {
+        let dir = std::env::temp_dir().join(format!("nidavellir-attempts-{}", std::process::id()));
+        let path = dir.join("auto_resume_attempts.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(saved_attempts(&path).is_empty(), "no file: nothing attempted");
+        save_attempt(&path, &["incident-a".into(), "run-1".into()]).unwrap();
+        assert_eq!(saved_attempts(&path), ["incident-a", "run-1"]);
+        for n in 0..SAVED_ATTEMPTS {
+            save_attempt(&path, &[format!("incident-{n}"), "run-1".into()]).unwrap();
+        }
+        let saved = saved_attempts(&path);
+        assert_eq!(saved.len(), SAVED_ATTEMPTS);
+        assert!(!saved.contains(&"incident-a".to_string()), "oldest keys go first");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(saved_attempts(&path).is_empty(), "a damaged file never blocks every future run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn driver_reset_covers_only_one_tdr_episode_on_exactly_one_nvidia_adapter() {
