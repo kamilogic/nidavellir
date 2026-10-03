@@ -182,7 +182,7 @@ Safety is part of the product, not an afterthought.
 
 Nidavellir is in beta, validated on one GPU so far. Try a profile in your own games before relying on it.
 
-1. Download `Nidavellir_x.y.z_x64-setup.exe` from [GitHub Releases](https://github.com/kamilogic/nidavellir/releases).
+1. Download `Nidavellir_x.y.z_x64-setup.exe` from the [latest release](https://github.com/kamilogic/nidavellir/releases/latest).
 2. Run it. Windows asks for administrator permission, because the Core Service talks to the GPU.
 3. Open Nidavellir and press **Forge GPU**.
 
