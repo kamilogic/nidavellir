@@ -297,13 +297,8 @@ nidavellir/
 │   ├── driver-pawnio/      Legacy PawnIO backend (CPU work, out of scope)
 │   └── service/            Windows service and tuning orchestration
 ├── docs/
-│   ├── contracts/          UI ↔ backend contracts
-│   ├── release-notes/      What users see in the update window
-│   └── ui/                 UI/UX direction and design docs
-├── scripts/                Development and release scripts
-├── handoff.md              Continuity document for future sessions
-├── AGENTS.md               Project-wide agent instructions
-└── CLAUDE.md               Claude Code backend instructions
+│   └── release-notes/      What users see in the update window
+└── scripts/                Development and release scripts
 ```
 
 ---

@@ -10,3 +10,15 @@ apps/ui/src-tauri/binaries/*.exe
 *.log
 .DS_Store
 Thumbs.db
+
+# Internal docs for AI-assisted development (Claude Code, Codex) stay local.
+# Whitelist: to publish a new root or docs/ file, add a `!` line for it.
+/*.md
+!/README.md
+/docs/*
+!/docs/release-notes/
+!/docs/releasing.md
+!/docs/development-validation.md
+/.claude/
+AGENTS.md
+CLAUDE.md
