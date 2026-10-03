@@ -1,6 +1,6 @@
 [package]
 name = "nidavellir-driver-pawnio"
-version = "0.5.0"
+version = "0.5.1"
 description = "PawnIO driver backend for Nidavellir"
 edition.workspace = true
 license.workspace = true
