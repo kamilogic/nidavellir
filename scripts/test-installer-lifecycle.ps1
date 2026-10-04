@@ -6,8 +6,9 @@ $global:NidavellirInstallerFixture = $null
 
 function New-Fixture([bool]$Installed = $false) {
     $global:NidavellirInstallerFixture = @{
-        Service = $(if ($Installed) { [pscustomobject]@{ State = 'Running'; ExitCode = 0; ServiceSpecificExitCode = 0 } } else { $null })
+        Service = $(if ($Installed) { [pscustomobject]@{ State = 'Running'; ExitCode = 0; ServiceSpecificExitCode = 0; ProcessId = 4242 } } else { $null })
         Calls = [Collections.Generic.List[string]]::new(); Fail = ''; Pending = $false; FailedStop = $false; BinaryExists = $true; PathName = ''
+        Lingering = 0
     }
 }
 function Get-CimInstance {
@@ -38,6 +39,15 @@ function Invoke-CimMethod {
 function sc.exe {
     $global:NidavellirInstallerFixture.Calls.Add("sc:$($args[0])")
     $global:LASTEXITCODE = $(if ($global:NidavellirInstallerFixture.Fail -eq "sc:$($args[0])") { 5 } else { 0 })
+}
+# A Core process that SCM already reports stopped can linger while Windows tears it down.
+function Get-Process {
+    param($Id, $ErrorAction)
+    $fixture = $global:NidavellirInstallerFixture
+    if ($Id -ne 4242) { throw "Unexpected process query: $Id" }
+    if ($fixture.Lingering -le 0) { return }
+    $fixture.Lingering--
+    [pscustomobject]@{ ProcessName = 'nidavellir-service'; Id = $Id }
 }
 function Test-Path {
     param($LiteralPath, $PathType)
@@ -111,6 +121,15 @@ try {
         Assert-Failure $action 'clean shutdown was not confirmed'
         Assert-Calls 'StopService'
     }
+
+    # The binary is replaced only after the stopped Core process is gone (0.5.2 update failure).
+    New-Fixture $true
+    $global:NidavellirInstallerFixture.Lingering = 2
+    & $helper -Action Prepare -InstallDir $installDir | Out-Null
+    if ($global:NidavellirInstallerFixture.Lingering -ne 0) { throw 'Prepare returned before the Core process exited' }
+    New-Fixture $true
+    $global:NidavellirInstallerFixture.Lingering = 1000
+    Assert-Failure 'Prepare' 'did not exit'
 
     New-Fixture
     $global:NidavellirInstallerFixture.Fail = 'Read'

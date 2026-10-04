@@ -32,12 +32,25 @@ function Wait-CoreState([string]$Expected) {
     } while ($true)
 }
 
+# SCM reports Stopped before Windows releases the executable (the GPU driver may still be tearing
+# the process down), so replacing the binary waits for the process itself.
+function Wait-CoreProcessExit([int]$ProcessId) {
+    if ($ProcessId -le 0) { return }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq 'nidavellir-service' }) {
+        if ([DateTime]::UtcNow -ge $deadline) { throw "The Core process ($ProcessId) did not exit within ${TimeoutSeconds}s after stopping. Restart Windows and retry the installer." }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
 function Stop-CoreService($Service) {
+    $processId = [int]$Service.ProcessId
     if ($Service.State -ne 'Stopped') {
         if ($Service.State -ne 'Stop Pending') { Invoke-CoreMethod $Service 'StopService' }
     }
     # Also inspect an already stopped service: retrying must not erase a failed shutdown.
     Wait-CoreState 'Stopped'
+    Wait-CoreProcessExit $processId
 }
 
 $service = Read-CoreService
