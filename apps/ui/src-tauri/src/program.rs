@@ -18,9 +18,6 @@ use crate::ipc_client::call_service_with_params as call;
 const HEARTBEAT: Duration = Duration::from_secs(5);
 /// A stopped run lands within a dwell; this bounds the wait after the user confirmed Exit.
 const FORGE_STOP_TIMEOUT: Duration = Duration::from_secs(120);
-/// Shutdown restores stock within 20 s; NVAPI release and process exit follow.
-#[cfg(all(windows, not(debug_assertions)))]
-const CORE_STOP_TIMEOUT: Duration = Duration::from_secs(45);
 /// Set while exiting: no heartbeats, and a stopped Core is not started again.
 static EXITING: AtomicBool = AtomicBool::new(false);
 
@@ -323,28 +320,22 @@ pub async fn exit_program(app: AppHandle) -> Result<(), String> {
     }
 }
 
+/// A Core that accepted the exit stops by itself, so the program closes at once. A program opened
+/// again meanwhile waits for that stop before starting the Core (`ensure_running`).
 async fn exit(app: &AppHandle) -> Result<(), String> {
     EXITING.store(true, Ordering::SeqCst);
-    // Wait for the stop only when one is happening.
-    let stopping = match call("ExitProgram", None).await {
-        Ok(_) => true,
-        Err(error) if error.contains("shutting down") => true,
-        // Nothing to stop: no Core, or a Core older than this program, which keeps running.
-        Err(error) if error.starts_with("Core Service unavailable") || error.contains("unknown variant") => false,
+    match call("ExitProgram", None).await {
+        Ok(_) => {}
+        // Already stopping, no Core, or a Core older than this program, which keeps running.
+        Err(error)
+            if error.contains("shutting down")
+                || error.starts_with("Core Service unavailable")
+                || error.contains("unknown variant") => {}
         Err(error) => {
             EXITING.store(false, Ordering::SeqCst);
             return Err(error);
         }
-    };
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.hide();
     }
-    #[cfg(all(windows, not(debug_assertions)))]
-    if stopping {
-        let _ = tauri::async_runtime::spawn_blocking(|| core_service::wait_stopped(CORE_STOP_TIMEOUT)).await;
-    }
-    #[cfg(not(all(windows, not(debug_assertions))))]
-    let _ = stopping;
     app.exit(0);
     Ok(())
 }
@@ -468,19 +459,6 @@ mod core_service {
                 }
                 _ if Instant::now() >= deadline => return Err(format!("Core Service stuck in {state:?}")),
                 _ => std::thread::sleep(Duration::from_millis(250)),
-            }
-        }
-    }
-
-    pub fn wait_stopped(timeout: Duration) {
-        let Ok(Some(service)) = open(ServiceAccess::QUERY_STATUS) else { return };
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            match service.query_status() {
-                Ok(status) if status.current_state != ServiceState::Stopped => {
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-                _ => return,
             }
         }
     }
