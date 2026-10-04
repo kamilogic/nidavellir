@@ -325,25 +325,26 @@ pub async fn exit_program(app: AppHandle) -> Result<(), String> {
 
 async fn exit(app: &AppHandle) -> Result<(), String> {
     EXITING.store(true, Ordering::SeqCst);
-    match call("ExitProgram", None).await {
-        Ok(_) => {}
-        // Nothing to stop: no Core, one already stopping, or a Core older than this program.
-        Err(error)
-            if error.starts_with("Core Service unavailable")
-                || error.contains("shutting down")
-                || error.contains("unknown variant") => {}
+    // Wait for the stop only when one is happening.
+    let stopping = match call("ExitProgram", None).await {
+        Ok(_) => true,
+        Err(error) if error.contains("shutting down") => true,
+        // Nothing to stop: no Core, or a Core older than this program, which keeps running.
+        Err(error) if error.starts_with("Core Service unavailable") || error.contains("unknown variant") => false,
         Err(error) => {
             EXITING.store(false, Ordering::SeqCst);
             return Err(error);
         }
-    }
+    };
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
     #[cfg(all(windows, not(debug_assertions)))]
-    {
+    if stopping {
         let _ = tauri::async_runtime::spawn_blocking(|| core_service::wait_stopped(CORE_STOP_TIMEOUT)).await;
     }
+    #[cfg(not(all(windows, not(debug_assertions))))]
+    let _ = stopping;
     app.exit(0);
     Ok(())
 }
