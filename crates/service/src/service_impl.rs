@@ -91,6 +91,7 @@ pub fn run_service() -> windows_service::Result<()> {
         process_id: None,
     })?;
 
+    let started = std::time::Instant::now();
     info!("Nidavellir Core Service initializing");
 
     // Parachute first: the service boots before login, so it reads the
@@ -139,17 +140,18 @@ pub fn run_service() -> windows_service::Result<()> {
             false
         }
     };
+    info!("startup: recovery and Sentinel took {} ms", started.elapsed().as_millis());
     if !sentinel_ready {
         tracing::warn!("persisted GPU profile reapply disabled by the Sentinel startup guard");
     }
     // The profile is reapplied when the program connects, not at boot (2026-10-03).
     crate::program_session::startup(sentinel_ready);
 
-    let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {
         driver: DriverManager::new(),
         sensor_engine: nidavellir_core::sensors::SensorEngine::new(),
-        motherboard: hw.motherboard,
+        // Only the board is needed here; the full probe spawns PowerShell (~2 s) on every start.
+        motherboard: nidavellir_core::detector::detect_motherboard(),
         safe_store: safe_store.clone(),
         gpu_validation: crate::gpu_real::GpuValidationHandle::default(),
         real_sweep: crate::gpu_sweep_real::RealSweepHandle::default(),
@@ -192,7 +194,7 @@ pub fn run_service() -> windows_service::Result<()> {
         });
     let stop_reason = match startup {
         Ok(()) => {
-            info!("Nidavellir Core Service ready");
+            info!("Nidavellir Core Service ready after {} ms", started.elapsed().as_millis());
             shutdown_rx.recv().unwrap_or_else(|error| Err(format!("Service control channel closed: {error}")))
         }
         Err(error) => Err(error),
@@ -212,6 +214,7 @@ pub fn run_service() -> windows_service::Result<()> {
     if let Err(error) = &stop_status {
         tracing::error!("cannot report StopPending; still performing shutdown cleanup: {error}");
     }
+    let stopping = std::time::Instant::now();
     let result = crate::shutdown::complete(state, Duration::from_secs(20));
     if DRIVER_RESET_REQUESTED.load(Ordering::SeqCst) {
         // pnputil (≤ 60 s) plus the adapter readiness wait (≤ 30 s) outlast the first stop hint.
@@ -245,5 +248,7 @@ pub fn run_service() -> windows_service::Result<()> {
         crate::shutdown::exit_process(1);
     }
 
+    // The installer log shows how long Windows then takes to end the process.
+    info!("stopped {} ms after the stop request; ending the process", stopping.elapsed().as_millis());
     crate::shutdown::exit_process(if failed { 1 } else { 0 });
 }

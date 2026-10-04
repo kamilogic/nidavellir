@@ -64,9 +64,26 @@ fn service_main(_arguments: Vec<OsString>) {
     }
 }
 
+/// The installed service has no console, so its log goes here too (one older 5 MB file is kept).
+fn core_log_file() -> Option<std::fs::File> {
+    let dir = nidavellir_core::safe_loop::default_data_dir();
+    let path = dir.join("core.log");
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 5 * 1024 * 1024) {
+        let _ = std::fs::rename(&path, dir.join("core.log.1"));
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("nidavellir=info".parse()?))
+    use tracing_subscriber::prelude::*;
+    let file = core_log_file().map(|file| {
+        tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file))
+    });
+    tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env().add_directive("nidavellir=info".parse()?))
+        .with(tracing_subscriber::fmt::layer())
+        .with(file)
         .init();
 
     let args: Vec<OsString> = std::env::args_os().collect();
@@ -492,11 +509,11 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     }
     program_session::startup(reapply_allowed);
 
-    let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {
         driver: DriverManager::new(),
         sensor_engine: nidavellir_core::sensors::SensorEngine::new(),
-        motherboard: hw.motherboard,
+        // Only the board is needed here; the full probe spawns PowerShell (~2 s) on every start.
+        motherboard: nidavellir_core::detector::detect_motherboard(),
         safe_store,
         gpu_validation: GpuValidationHandle::default(),
         real_sweep: RealSweepHandle::default(),

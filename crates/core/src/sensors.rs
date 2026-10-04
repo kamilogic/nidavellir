@@ -4,16 +4,16 @@ use std::time::{Duration, Instant};
 
 use crate::nvml_gpu::read_nvidia_gpus_nvml;
 use crate::sensor_input::SensorInput;
-use crate::sensor_meta::{SensorQuality, SensorSource};
+use crate::sensor_meta::SensorSource;
 use crate::superio_profile::MotherboardRail;
 
-const WMIC_CACHE_TTL: Duration = Duration::from_secs(5);
 // Dashboard/Forge poll live GPU cards once per second. A 30 s cache made clock,
 // voltage, fan and power look frozen even while the workload changed.
 const GPU_CACHE_TTL: Duration = Duration::from_secs(1);
-const RAM_VOLT_CACHE_TTL: Duration = Duration::from_secs(30);
-const CPU_VOLT_CACHE_TTL: Duration = Duration::from_secs(10);
 const WHEA_CACHE_TTL: Duration = Duration::from_secs(10);
+// GPU-only product (2026-10-04): CPU clock, CPU voltage and RAM voltage came from PowerShell/WMI,
+// ~2 s per spawn under the Core's state lock every few seconds, and no screen shows them. They
+// stay in the readings (IPC shape) as None unless the PawnIO driver supplies them.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorReadings {
@@ -90,12 +90,8 @@ pub struct WheaInfo {
 
 pub struct SensorEngine {
     sys: sysinfo::System,
-    base_freq_mhz: u32,
-    cached_clock: Option<(Instant, Option<u32>)>,
     cached_whea: Option<(Instant, WheaInfo)>,
     cached_gpu: Option<(Instant, Vec<GpuSensors>)>,
-    cached_ram_v: Option<(Instant, Option<u32>)>,
-    cached_cpu_v: Option<(Instant, Option<u32>)>,
 }
 
 impl Default for SensorEngine {
@@ -108,12 +104,8 @@ impl SensorEngine {
     pub fn new() -> Self {
         Self {
             sys: sysinfo::System::new(),
-            base_freq_mhz: read_cpu_base_freq(),
-            cached_clock: None,
             cached_whea: None,
             cached_gpu: None,
-            cached_ram_v: None,
-            cached_cpu_v: None,
         }
     }
 
@@ -164,26 +156,18 @@ impl SensorEngine {
     fn read_cpu(&mut self, input: &SensorInput) -> CpuSensors {
         self.sys.refresh_cpu_usage();
 
-        let (voltage_mv, voltage_source, voltage_quality) =
-            if let Some(mv) = input.cpu_vcore_mv {
-                (
-                    Some(mv),
-                    input.cpu_vcore_source.map(|s| s.as_str().to_string()),
-                    Some(input.cpu_vcore_quality.as_str().to_string()),
-                )
-            } else if let Some(mv) = self.read_cpu_voltage_cached() {
-                (
-                    Some(mv),
-                    Some(SensorSource::Wmi.as_str().to_string()),
-                    Some(SensorQuality::Nominal.as_str().to_string()),
-                )
-            } else {
-                (None, None, None)
-            };
+        let (voltage_mv, voltage_source, voltage_quality) = match input.cpu_vcore_mv {
+            Some(mv) => (
+                Some(mv),
+                input.cpu_vcore_source.map(|s| s.as_str().to_string()),
+                Some(input.cpu_vcore_quality.as_str().to_string()),
+            ),
+            None => (None, None, None),
+        };
 
         CpuSensors {
             utilization_pct: self.sys.global_cpu_usage() as f64,
-            clock_mhz: self.read_clock_cached(),
+            clock_mhz: None,
             voltage_mv,
             voltage_source,
             voltage_quality,
@@ -204,22 +188,14 @@ impl SensorEngine {
             0.0
         };
 
-        let (voltage_mv, voltage_source, voltage_quality) =
-            if let Some(mv) = input.dram_mv {
-                (
-                    Some(mv),
-                    input.dram_source.map(|s| s.as_str().to_string()),
-                    Some(input.dram_quality.as_str().to_string()),
-                )
-            } else if let Some(mv) = self.read_ram_voltage_cached() {
-                (
-                    Some(mv),
-                    Some(SensorSource::Wmi.as_str().to_string()),
-                    Some(SensorQuality::Nominal.as_str().to_string()),
-                )
-            } else {
-                (None, None, None)
-            };
+        let (voltage_mv, voltage_source, voltage_quality) = match input.dram_mv {
+            Some(mv) => (
+                Some(mv),
+                input.dram_source.map(|s| s.as_str().to_string()),
+                Some(input.dram_quality.as_str().to_string()),
+            ),
+            None => (None, None, None),
+        };
 
         MemorySensors {
             used_mb: used,
@@ -229,18 +205,6 @@ impl SensorEngine {
             voltage_source,
             voltage_quality,
         }
-    }
-
-    fn read_clock_cached(&mut self) -> Option<u32> {
-        let now = Instant::now();
-        if let Some((ts, val)) = &self.cached_clock {
-            if now.duration_since(*ts) < WMIC_CACHE_TTL {
-                return *val;
-            }
-        }
-        let val = read_cpu_clock_wmi(self.base_freq_mhz);
-        self.cached_clock = Some((now, val));
-        val
     }
 
     fn read_whea_cached(&mut self) -> WheaInfo {
@@ -268,114 +232,6 @@ impl SensorEngine {
         self.cached_gpu = Some((now, val.clone()));
         val
     }
-
-    fn read_ram_voltage_cached(&mut self) -> Option<u32> {
-        let now = Instant::now();
-        if let Some((ts, val)) = &self.cached_ram_v {
-            if now.duration_since(*ts) < RAM_VOLT_CACHE_TTL {
-                return *val;
-            }
-        }
-        let val = read_ram_voltage();
-        self.cached_ram_v = Some((now, val));
-        val
-    }
-
-    fn read_cpu_voltage_cached(&mut self) -> Option<u32> {
-        let now = Instant::now();
-        if let Some((ts, val)) = &self.cached_cpu_v {
-            if now.duration_since(*ts) < CPU_VOLT_CACHE_TTL {
-                return *val;
-            }
-        }
-        let val = read_cpu_voltage_wmi();
-        self.cached_cpu_v = Some((now, val));
-        val
-    }
-}
-
-fn read_cpu_base_freq() -> u32 {
-    use winreg::enums::*;
-    use winreg::RegKey;
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let path = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0";
-    hklm.open_subkey_with_flags(path, KEY_READ)
-        .ok()
-        .and_then(|k| k.get_value("~MHz").ok())
-        .unwrap_or(0)
-}
-
-fn read_cpu_clock_wmi(base_freq_mhz: u32) -> Option<u32> {
-    if base_freq_mhz > 0 {
-        let ps_cmd = "Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ProcessorInformation \
-                      -Filter \"Name='_Total'\" | Select-Object -ExpandProperty PercentProcessorPerformance";
-        if let Ok(output) = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd])
-            .output()
-        {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                if let Ok(pct) = text.trim().parse::<f64>() {
-                    if pct > 0.0 {
-                        return Some((base_freq_mhz as f64 * pct / 100.0) as u32);
-                    }
-                }
-            }
-        }
-    }
-    let ps_cmd =
-        "Get-CimInstance Win32_Processor | Select-Object -ExpandProperty CurrentClockSpeed";
-    if let Ok(output) = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd])
-        .output()
-    {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if let Ok(mhz) = text.trim().parse::<u32>() {
-                if mhz > 0 {
-                    return Some(mhz);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn read_ram_voltage() -> Option<u32> {
-    let ps_cmd = "$m = Get-CimInstance Win32_PhysicalMemory | Select-Object -First 1; \
-                  if ($m.ConfiguredVoltage -gt 0) { $m.ConfiguredVoltage }";
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mv = text.trim().parse::<u32>().ok().filter(|&mv| mv > 0)?;
-    (800..=2500).contains(&mv).then_some(mv)
-}
-
-fn read_cpu_voltage_wmi() -> Option<u32> {
-    let ps_cmd =
-        "Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty CurrentVoltage";
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let raw = text.trim().parse::<u32>().ok().filter(|&v| v > 0)?;
-    let mv = if raw & 0x80 != 0 {
-        (raw & 0x7F) * 1000
-    } else if raw < 100 {
-        raw * 100
-    } else {
-        raw
-    };
-    (600..=2000).contains(&mv).then_some(mv)
 }
 
 fn read_gpu_sensors() -> Vec<GpuSensors> {

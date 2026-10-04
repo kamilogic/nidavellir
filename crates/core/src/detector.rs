@@ -459,7 +459,8 @@ fn rated_speed_from_part_number(pn: &str) -> Option<u32> {
     None
 }
 
-fn detect_motherboard() -> MotherboardInfo {
+/// Registry only, so the Core can start without the slower CPU/RAM/GPU probes.
+pub fn detect_motherboard() -> MotherboardInfo {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let bios_path = r"HARDWARE\DESCRIPTION\System\BIOS";
 

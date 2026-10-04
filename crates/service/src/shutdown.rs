@@ -36,6 +36,7 @@ pub(crate) fn complete(
 ) -> Result<(), String> {
     begin();
     finish_after_cleanup(timeout, move || {
+        let started = std::time::Instant::now();
         let mut state = state
             .lock()
             .map_err(|_| "Service state lock is poisoned".to_string())?;
@@ -48,6 +49,7 @@ pub(crate) fn complete(
         crate::ipc_server::request_mutating_worker_stop(&mut state, true);
         crate::ipc_server::wait_for_mutating_workers_to_quiesce(&state)?;
         crate::tdr_sentinel::quiesce_for_shutdown()?;
+        tracing::info!("shutdown: workers and Sentinel quiet after {} ms", started.elapsed().as_millis());
         let applied = crate::gpu_apply::load_applied_checked()?.is_some();
         restore_stock(
             &store,
@@ -55,6 +57,7 @@ pub(crate) fn complete(
             crate::gpu_power_sweep::reset_to_stock_checked,
         )?;
         state.manual_point.mark_reset();
+        tracing::info!("shutdown: stock confirmed after {} ms", started.elapsed().as_millis());
         // Admission is closed and app-state readers, tuning workers and Sentinel calls
         // are quiescent. Balance NVAPI before process teardown; failure/timeout must not
         // commit a clean marker or reopen access to the runtime.
@@ -62,7 +65,7 @@ pub(crate) fn complete(
         {
             tracing::info!("shutdown: releasing NVAPI runtime after GPU users quiesced");
             nidavellir_gpu_nvapi::shutdown_runtime()?;
-            tracing::info!("shutdown: NVAPI runtime released");
+            tracing::info!("shutdown: NVAPI runtime released after {} ms", started.elapsed().as_millis());
         }
         Ok(store)
     })
