@@ -4,6 +4,7 @@
   import SafeLoop from "./lib/views/SafeLoop.svelte";
   import Forge from "./lib/views/Forge.svelte";
   import TrayBridge from "./lib/components/forge/TrayBridge.svelte";
+  import WhatsNew from "./lib/components/forge/WhatsNew.svelte";
   import { t, locale, locales } from "./lib/i18n.js";
   import "./lib/theme.css";
 
@@ -51,6 +52,7 @@
 
 <main data-ui-theme={uiTheme} class:forge-shell={onboarded && activeTab === "forge"} class:welcome-shell={!onboarded}>
   <TrayBridge />
+  <WhatsNew />
   {#if onboarded && activeTab !== "forge"}
     <header class="top">
       <div>

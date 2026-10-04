@@ -4,7 +4,7 @@
   import { onMount } from "svelte";
   import { AppWindow, Check, Languages, Palette, RefreshCw, Settings } from "@lucide/svelte";
   import { locale } from "../../i18n.js";
-  import { checkForUpdate, reviewUpdate, updateState } from "../../updates.js";
+  import { checkForUpdate, requestUpdate, updateHold, updateState } from "../../updates.js";
 
   let { theme = "command", onThemeChange } = $props();
 
@@ -13,10 +13,10 @@
 
   const updateText = $derived({
     unavailable: "Updates install only in the installed app, not in development builds.",
-    idle: "Nidavellir checks GitHub for a new version every time it starts.",
+    idle: "Nidavellir checks GitHub for a new version when it starts and every 6 hours.",
     checking: "Checking for updates…",
     current: "You have the latest version.",
-    available: `Version ${$updateState.version} is available.`,
+    available: `Version ${$updateState.version} is ready. Nidavellir restarts to install it and shows what changed.`,
     downloading: "Updating…",
     installing: "Installing. Nidavellir reopens by itself.",
     error: `Could not check for updates: ${$updateState.error}`,
@@ -201,10 +201,15 @@
         </div>
         <span class="update-mode">{$updateState.status === "unavailable" ? "DEV BUILD" : "AUTOMATIC"}</span>
         <p>{updateText}</p>
-        {#if $updateState.status === "available"}
-          <button class="update-action" type="button" onclick={reviewUpdate}>See what's new</button>
-        {:else if !["unavailable", "downloading", "installing"].includes($updateState.status)}
-          <button class="update-action" type="button" onclick={() => checkForUpdate({ quiet: false })} disabled={$updateState.status === "checking"}>Check for updates</button>
+        {#if !["unavailable", "downloading", "installing"].includes($updateState.status)}
+          <div class="update-buttons">
+            {#if $updateState.status === "available"}
+              <button class="update-action primary" type="button" onclick={requestUpdate} disabled={$updateHold.forgeBusy}>
+                {$updateHold.forgeBusy ? "Update after the Forge run" : `Update to ${$updateState.version}`}
+              </button>
+            {/if}
+            <button class="update-action" type="button" onclick={() => checkForUpdate({ quiet: false })} disabled={$updateState.status === "checking"}>Check for updates</button>
+          </div>
         {/if}
       </div>
     </section>
@@ -524,9 +529,14 @@
     margin-top: 0;
   }
 
-  .update-action {
+  .update-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
     grid-column: 1 / -1;
-    justify-self: start;
+  }
+
+  .update-action {
     border: 1px solid var(--settings-line);
     border-radius: 8px;
     padding: 0 14px;
@@ -536,6 +546,12 @@
     font-size: 13px;
     font-weight: 650;
     cursor: pointer;
+  }
+
+  .update-action.primary {
+    border-color: transparent;
+    background: var(--settings-accent);
+    color: #14110b;
   }
 
   .update-action:disabled {

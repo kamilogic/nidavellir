@@ -186,7 +186,7 @@ Nidavellir is in beta, validated on one GPU so far. Try a profile in your own ga
 2. Run it. Windows asks for administrator permission, because the Core Service talks to the GPU.
 3. Open Nidavellir and press **Forge GPU**.
 
-Updates: Nidavellir checks for a new version when it starts, shows what changed and installs it when you choose **Update now**. Versions before 0.5 must be updated by hand once.
+Updates: when a new version is available, an update button appears in the corner of the window. One click installs it, and after the restart Nidavellir shows what changed. Versions before 0.5 must be updated by hand once.
 
 Requirements:
 

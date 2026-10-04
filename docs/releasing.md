@@ -1,21 +1,22 @@
 # Releasing Nidavellir (installer + in-app updates)
 
 Installed apps check `https://github.com/kamilogic/nidavellir/releases/latest/download/latest.json`
-when they start, and every 6 hours while open.
+when they start and every 6 hours while open. A newer version replaces an older one already on
+offer, so a program left in the tray never offers a stale version.
 
-When a newer version exists, the user sees:
-- a window with the version and the release notes ("What's new");
-- the choice between **Update now** and **Later**. After Later, an "Update x.y.z" button stays in
-  the corner.
-
-Updating runs the signed NSIS installer in passive mode:
-- Windows asks for admin permission.
-- The Core Service stops, so the GPU returns to stock.
-- The service is replaced and restarted.
-- The app reopens.
+The flow works like Discord's:
+- When a newer version exists, a round update button appears in the corner of the window. It opens
+  to "Update to x.y.z" on hover, and Settings → Updates offers the same action.
+- One click runs the signed NSIS installer in passive mode:
+  - Windows asks for admin permission;
+  - the Core Service stops, so the GPU returns to stock;
+  - the installer waits for the Core process to exit, then replaces and restarts the service;
+  - the app reopens.
+- After the restart, "Updated to x.y.z" shows the notes of every version since the one that ran
+  before. All notes files ship inside the app.
 
 Install is blocked while a Forge run is active. A paused or interrupted run cannot resume on a new
-build; the dialog says so. Development builds (`tauri dev`) never offer an install.
+build, so the button asks first. Development builds (`tauri dev`) never offer an install.
 
 GitHub's `latest` ignores drafts and pre-releases. Nothing reaches users until a draft release is
 published.

@@ -4,7 +4,8 @@
   import { nvidiaGpu, recoverForge, requireServiceData } from "../forge-workflow.js";
   import AdvancedDiagnosticsHub from "../components/forge/AdvancedDiagnosticsHub.svelte";
   import ForgeThemeScreen from "../components/forge/ForgeThemeScreen.svelte";
-  import UpdatePrompt from "../components/forge/UpdatePrompt.svelte";
+  import UpdateButton from "../components/forge/UpdateButton.svelte";
+  import { updateHold } from "../updates.js";
 
   let { theme = "command", onThemeChange } = $props();
 
@@ -51,6 +52,10 @@
   let lastSlowRefreshAt = 0;
 
   const powerRunning = $derived(Boolean(powerSweep?.running));
+  // Updating restarts the Core: a run blocks it, and a saved run cannot resume afterwards.
+  $effect(() => {
+    updateHold.set({ forgeBusy: powerRunning, savedRun: ["paused", "interrupted"].includes(powerSweep?.phase) });
+  });
 
   function responseData(response, type, label) {
     return requireServiceData(response, type, label);
@@ -720,7 +725,7 @@
       onClose={closeAdvancedDiagnostics}
     />
   </ForgeThemeScreen>
-  <UpdatePrompt forgeBusy={powerRunning} savedRun={["paused", "interrupted"].includes(powerSweep?.phase)} />
+  <UpdateButton />
 
 </section>
 

@@ -7,6 +7,8 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    // The release notes live at the repo root and ship inside the app (bundled-notes.js).
+    fs: { allow: [".", "../../docs/release-notes"] },
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

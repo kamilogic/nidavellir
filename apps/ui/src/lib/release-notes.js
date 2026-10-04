@@ -22,8 +22,27 @@ export function parseNotes(text = "") {
   return notes;
 }
 
-/** "Oct 3, 2026" from the updater's RFC 3339 date; null when absent or unreadable. */
-export function releaseDate(date) {
-  const time = Date.parse(date ?? "");
-  return Number.isNaN(time) ? null : new Intl.DateTimeFormat("en", { dateStyle: "medium" }).format(time);
+/** -1, 0 or 1 for dotted numeric versions: "0.5.10" is newer than "0.5.9". */
+export function compareVersions(a, b) {
+  const left = String(a).split(".").map(Number);
+  const right = String(b).split(".").map(Number);
+  for (let index = 0; index < Math.max(left.length, right.length); index++) {
+    const difference = (left[index] || 0) - (right[index] || 0);
+    if (difference) return Math.sign(difference);
+  }
+  return 0;
+}
+
+/**
+ * The notes to show after an update, newest first: every release newer than `previous` up to
+ * `current`. Without a previous version (installed before it was recorded) only `current`.
+ * `files` maps a notes path ending in "vX.Y.Z.md" to its text.
+ */
+export function releasesSince(previous, current, files) {
+  return Object.entries(files)
+    .map(([path, text]) => ({ version: path.match(/v(\d+(?:\.\d+)*)\.md$/)?.[1], text }))
+    .filter(({ version }) => version && compareVersions(version, current) <= 0 &&
+      (previous ? compareVersions(version, previous) > 0 : compareVersions(version, current) === 0))
+    .sort((a, b) => compareVersions(b.version, a.version))
+    .map(({ version, text }) => ({ version, notes: parseNotes(text) }));
 }

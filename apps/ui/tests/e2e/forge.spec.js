@@ -5,6 +5,8 @@ async function openForge(page, scenario = "ready", theme = "command") {
   await page.addInitScript(({ scenario, theme }) => {
     localStorage.setItem("nidavellir-ui-theme", theme);
     if (!scenario.startsWith("onboarding")) localStorage.setItem("nidavellir-gpu-onboarded", "true");
+    // 0.5.0 ran before; the app now reports 0.5.2 (only once, so a reload keeps what WhatsNew wrote).
+    if (scenario === "updated" && !localStorage.getItem("nidavellir-last-version")) localStorage.setItem("nidavellir-last-version", "0.5.0");
     const pending = ["recover", "missing", "ack-failure", "double-click"].includes(scenario);
     const state = {
       calls: [], offline: scenario === "offline", acknowledged: false,
@@ -52,6 +54,11 @@ async function openForge(page, scenario = "ready", theme = "command") {
             ? { rid: 7, currentVersion: "0.5.0", version: "0.5.1", date: "2026-10-03T20:31:52Z", body: "Nidavellir now lives in the tray.\n\n- Right-click the tray icon to switch profiles.\n- Fixed: a console window opened next to Nidavellir.\n\nThe run stays saved.", rawJson: {} }
             : null;
         }
+        if (command === "plugin:updater|download_and_install") {
+          state.calls.push("download_and_install");
+          return null;
+        }
+        if (command === "plugin:app|version" && scenario === "updated") return "0.5.2";
         if (command !== "service_request") throw new Error(`Unexpected command ${command}`);
         state.calls.push(method);
         if (scenario === "connecting") return new Promise(() => {});
@@ -523,24 +530,45 @@ test("UX: automatic continuation is offered before a run starts", async ({ page 
   expect(await page.evaluate(() => window.__forgeTest.calls.some((m) => /^(Start|Resume)/.test(m)))).toBe(false);
 });
 
-test("Updates: the startup check shows what is new and holds the install during a run", async ({ page }, testInfo) => {
+test("Updates: a found update waits in the corner, a run holds it, and one click installs it", async ({ page }, testInfo) => {
   await openForge(page, "update");
-  const dialog = page.getByRole("dialog", { name: "Update available" });
-  await expect(dialog).toBeVisible({ timeout: 10000 });
-  await page.screenshot({ path: testInfo.outputPath("update-dialog.png"), animations: "disabled" });
-  await expect(dialog.getByLabel("Installed version 0.5.0")).toBeVisible();
-  await expect(dialog.getByLabel("New version 0.5.1")).toBeVisible();
-  await expect(dialog).toContainText("Released Oct 3, 2026");
-  await expect(dialog.getByRole("region", { name: "What's new" })).toContainText("Right-click the tray icon to switch profiles.");
-  await expect(dialog.getByRole("region", { name: "Fixes" })).toContainText("A console window opened next to Nidavellir.");
-  await expect(dialog).not.toContainText("- Right-click");
-  await dialog.getByRole("button", { name: "Later" }).click();
-  await expect(dialog).toBeHidden();
-  await page.getByRole("button", { name: "Update 0.5.1" }).click();
-  await expect(dialog).toBeVisible();
+  const update = page.getByRole("button", { name: /^Update to 0\.5\.1/ });
+  await expect(update).toBeVisible({ timeout: 10000 });
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("update-button.png"), animations: "disabled" });
+  await update.hover();
+  await page.waitForTimeout(300);
+  await page.screenshot({ path: testInfo.outputPath("update-button-hover.png"), clip: { x: 880, y: 700, width: 300, height: 120 } });
   await page.evaluate(() => Object.assign(window.__forgeTest.power, { running: true, phase: "power" }));
-  await expect(dialog.getByRole("button", { name: "Update now" })).toBeDisabled();
-  await expect(dialog).toContainText("A Forge run is active");
+  await expect(page.getByRole("button", { name: /^Update after the Forge run/ })).toBeDisabled();
+  await page.evaluate(() => Object.assign(window.__forgeTest.power, { running: false, phase: "paused" }));
+  await update.click();
+  const confirm = page.getByRole("dialog", { name: "Update now?" });
+  await expect(confirm).toContainText("cannot be resumed after updating");
+  await confirm.getByRole("button", { name: "Not now" }).click();
+  await expect(confirm).toBeHidden();
+  expect(await page.evaluate(() => window.__forgeTest.calls.includes("download_and_install"))).toBe(false);
+  await update.click();
+  await confirm.getByRole("button", { name: "Update anyway" }).click();
+  await expect.poll(() => page.evaluate(() => window.__forgeTest.calls.includes("download_and_install"))).toBe(true);
+  await expect(page.getByRole("button", { name: /^Updating/ })).toBeDisabled();
+});
+
+test("Updates: after an update, the notes since the previous version show once", async ({ page }, testInfo) => {
+  await openForge(page, "updated");
+  const dialog = page.getByRole("dialog", { name: "Updated to 0.5.2" });
+  await expect(dialog).toBeVisible({ timeout: 10000 });
+  await page.screenshot({ path: testInfo.outputPath("whats-new.png"), animations: "disabled" });
+  await expect(dialog.getByRole("heading", { name: "Version 0.5.2" })).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "Version 0.5.1" })).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "Version 0.5.0" })).toHaveCount(0);
+  await expect(dialog.getByRole("region", { name: "Version 0.5.1" }).getByRole("region", { name: "Fixes" })).toBeVisible();
+  await dialog.getByRole("button", { name: "Got it" }).click();
+  await expect(dialog).toBeHidden();
+  await page.reload();
+  await expect(page.locator(".plate-button")).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem("nidavellir-last-version"))).toBe("0.5.2");
+  await expect(page.getByRole("dialog", { name: "Updated to 0.5.2" })).toBeHidden();
 });
 
 test("Program: window and startup options save through the desktop bridge", async ({ page }, testInfo) => {
