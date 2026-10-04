@@ -36,6 +36,8 @@
   Delete "$INSTDIR\resources\pawnio-modules\README.md"
   Delete "$INSTDIR\resources\third_party\pawnio\PawnIO_setup.exe"
   Delete "$INSTDIR\resources\third_party\pawnio\README.md"
+  ; Core binaries an update moved aside while their process was still exiting.
+  Delete /REBOOTOK "$INSTDIR\nidavellir-service.*.old"
   ; Non-recursive: unrelated files remain. Never uninstall the shared PawnIO driver.
   RMDir "$INSTDIR\resources\pawnio-modules"
   RMDir "$INSTDIR\resources\third_party\pawnio"

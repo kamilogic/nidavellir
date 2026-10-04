@@ -8,7 +8,7 @@ function New-Fixture([bool]$Installed = $false) {
     $global:NidavellirInstallerFixture = @{
         Service = $(if ($Installed) { [pscustomobject]@{ State = 'Running'; ExitCode = 0; ServiceSpecificExitCode = 0; ProcessId = 4242 } } else { $null })
         Calls = [Collections.Generic.List[string]]::new(); Fail = ''; Pending = $false; FailedStop = $false; BinaryExists = $true; PathName = ''
-        Lingering = 0
+        Lingering = 0; Renamed = $null; Cleaned = $false
     }
 }
 function Get-CimInstance {
@@ -49,6 +49,19 @@ function Get-Process {
     $fixture.Lingering--
     [pscustomobject]@{ ProcessName = 'nidavellir-service'; Id = $Id }
 }
+# File operations on the install dir and the install log are recorded, never performed.
+function Rename-Item {
+    param($LiteralPath, $NewName, $ErrorAction)
+    if (-not $LiteralPath.EndsWith('\nidavellir-service.exe')) { throw "Unexpected rename: $LiteralPath" }
+    if ($global:NidavellirInstallerFixture.Fail -eq 'Rename') { throw 'Injected rename failure' }
+    $global:NidavellirInstallerFixture.Renamed = $NewName
+}
+function Remove-Item {
+    param($Path, [switch]$Force, $ErrorAction)
+    if (-not $Path.EndsWith('\nidavellir-service.*.old')) { throw "Unexpected removal: $Path" }
+    $global:NidavellirInstallerFixture.Cleaned = $true
+}
+function Add-Content { param($LiteralPath, $Value, $ErrorAction) }
 function Test-Path {
     param($LiteralPath, $PathType)
     if ($PathType -ne 'Leaf' -or -not $LiteralPath.EndsWith('\nidavellir-service.exe')) { throw "Unexpected binary path: $LiteralPath" }
@@ -71,6 +84,7 @@ try {
     New-Fixture
     & $helper -Action Install -InstallDir $installDir | Out-Null
     Assert-Calls 'Create,sc:failure,sc:failureflag,sc:sdset,StartService'
+    if (-not $global:NidavellirInstallerFixture.Cleaned) { throw 'Install must clear binaries an earlier update moved aside' }
     # Resolve like the helper does: CI's TEMP is an 8.3 path (RUNNER~1) that GetFullPath expands.
     $expectedPath = '"' + (Join-Path ([IO.Path]::GetFullPath($installDir)) 'nidavellir-service.exe') + '"'
     if ($global:NidavellirInstallerFixture.PathName -ne $expectedPath) { throw "Service executable path must retain quotes: $($global:NidavellirInstallerFixture.PathName)" }
@@ -127,9 +141,16 @@ try {
     $global:NidavellirInstallerFixture.Lingering = 2
     & $helper -Action Prepare -InstallDir $installDir | Out-Null
     if ($global:NidavellirInstallerFixture.Lingering -ne 0) { throw 'Prepare returned before the Core process exited' }
+    # A process that keeps exiting (0.5.3 update: >30 s) has its binary moved aside, not overwritten.
     New-Fixture $true
     $global:NidavellirInstallerFixture.Lingering = 1000
-    Assert-Failure 'Prepare' 'did not exit'
+    & $helper -Action Prepare -InstallDir $installDir -TimeoutSeconds 0 | Out-Null
+    if ($global:NidavellirInstallerFixture.Renamed -ne 'nidavellir-service.4242.old') { throw 'A lingering Core binary must be moved aside' }
+    Assert-Calls 'StopService'
+    New-Fixture $true
+    $global:NidavellirInstallerFixture.Lingering = 1000
+    $global:NidavellirInstallerFixture.Fail = 'Rename'
+    Assert-Failure 'Prepare' 'could not be moved aside'
 
     New-Fixture
     $global:NidavellirInstallerFixture.Fail = 'Read'

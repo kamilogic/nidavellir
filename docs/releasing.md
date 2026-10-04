@@ -10,7 +10,10 @@ The flow works like Discord's:
 - One click runs the signed NSIS installer in passive mode:
   - Windows asks for admin permission;
   - the Core Service stops, so the GPU returns to stock;
-  - the installer waits for the Core process to exit, then replaces and restarts the service;
+  - the installer waits for the Core process to exit, then replaces and restarts the service. A
+    process still exiting after 30 s has its binary moved aside as `nidavellir-service.<pid>.old`;
+    the next install deletes it. How long the exit took goes to
+    `C:\ProgramData\Nidavellir\installer.log`;
   - the app reopens.
 - After the restart, "Updated to x.y.z" shows the notes of every version since the one that ran
   before. All notes files ship inside the app.

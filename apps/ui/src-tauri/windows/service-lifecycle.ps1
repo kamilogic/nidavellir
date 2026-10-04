@@ -6,6 +6,13 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $serviceName = 'NidavellirCore'
+# Tauri externalBin removes the build-target suffix when installing the sidecar.
+$binary = Join-Path ([IO.Path]::GetFullPath($InstallDir)) 'nidavellir-service.exe'
+
+# The passive installer closes by itself; this log keeps what a stalled update needs.
+function Write-InstallLog([string]$Message) {
+    Add-Content -LiteralPath (Join-Path $env:ProgramData 'Nidavellir\installer.log') -Value "$([DateTime]::UtcNow.ToString('o')) $Action $Message" -ErrorAction SilentlyContinue
+}
 
 function Read-CoreService {
     Get-CimInstance -ClassName Win32_Service -Filter "Name='NidavellirCore'" -OperationTimeoutSec 10 -ErrorAction Stop
@@ -33,14 +40,31 @@ function Wait-CoreState([string]$Expected) {
 }
 
 # SCM reports Stopped before Windows releases the executable (the GPU driver may still be tearing
-# the process down), so replacing the binary waits for the process itself.
+# the process down), so replacing the binary waits for the process itself. One that lingers (0.5.3
+# update: >30 s) gets its binary moved aside: a running image can be renamed, not overwritten.
 function Wait-CoreProcessExit([int]$ProcessId) {
     if ($ProcessId -le 0) { return }
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    while (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq 'nidavellir-service' }) {
-        if ([DateTime]::UtcNow -ge $deadline) { throw "The Core process ($ProcessId) did not exit within ${TimeoutSeconds}s after stopping. Restart Windows and retry the installer." }
+    $started = [DateTime]::UtcNow
+    $deadline = $started.AddSeconds($TimeoutSeconds)
+    do {
+        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq 'nidavellir-service' }
+        if (-not $process) {
+            Write-InstallLog ("Core process {0} exited {1:n1}s after stopping" -f $ProcessId, ([DateTime]::UtcNow - $started).TotalSeconds)
+            return
+        }
+        if ([DateTime]::UtcNow -ge $deadline) { break }
         Start-Sleep -Milliseconds 250
-    }
+    } while ($true)
+    # WaitReason throws for a thread that is not waiting; diagnostics never fail the install.
+    $waits = try {
+        ($process.Threads | ForEach-Object { if ("$($_.ThreadState)" -eq 'Wait') { "Wait/$($_.WaitReason)" } else { "$($_.ThreadState)" } } |
+            Group-Object | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join '; '
+    } catch { 'unavailable' }
+    Write-InstallLog "Core process $ProcessId still running ${TimeoutSeconds}s after stopping (threads: $waits)"
+    if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { return }
+    try { Rename-Item -LiteralPath $binary -NewName "nidavellir-service.$ProcessId.old" -ErrorAction Stop }
+    catch { throw "The Core process ($ProcessId) did not exit within ${TimeoutSeconds}s after stopping, and its binary could not be moved aside. Restart Windows and retry the installer." }
+    Write-InstallLog "old Core binary moved aside as nidavellir-service.$ProcessId.old"
 }
 
 function Stop-CoreService($Service) {
@@ -67,9 +91,9 @@ if ($Action -eq 'Prepare' -or $Action -eq 'Uninstall') {
     return
 }
 
-# Tauri externalBin removes the build-target suffix when installing the sidecar.
-$binary = Join-Path ([IO.Path]::GetFullPath($InstallDir)) 'nidavellir-service.exe'
 if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "Installed Core Service binary is missing: $binary. Repair the installation." }
+# Binaries moved aside by an earlier update are free once their process is gone.
+Remove-Item -Path (Join-Path ([IO.Path]::GetFullPath($InstallDir)) 'nidavellir-service.*.old') -Force -ErrorAction SilentlyContinue
 $quotedBinary = '"' + $binary + '"'
 if ($service) {
     Stop-CoreService $service
