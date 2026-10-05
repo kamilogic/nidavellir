@@ -1630,6 +1630,19 @@ pub struct GpuCtx {
     crashed: Arc<AtomicBool>,
 }
 
+/// Implicit Vulkan layers (OBS capture hook, RivaTuner, Steam overlay and Fossilize) load into every
+/// process that creates a Vulkan instance, the SYSTEM Core included. On 2026-10-05 an OBS hook thread
+/// injected this way spun inside nvlddmkm for hours, slowed the whole desktop and outlived the Core's
+/// exit. Windows environment updates are thread-safe, and the first instance reads them.
+fn keep_implicit_vulkan_layers_out() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~implicit~");
+        // Loaders older than 1.3.234 ignore the filter above; OBS is the layer proven to hang.
+        std::env::set_var("DISABLE_VULKAN_OBS_CAPTURE", "1");
+    });
+}
+
 impl GpuCtx {
     pub fn new() -> Result<Self, String> {
         Self::new_with_backends(wgpu::Backends::VULKAN | wgpu::Backends::DX12)
@@ -1640,6 +1653,7 @@ impl GpuCtx {
     }
 
     fn new_with_backends(backends: wgpu::Backends) -> Result<Self, String> {
+        keep_implicit_vulkan_layers_out();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
             ..Default::default()
