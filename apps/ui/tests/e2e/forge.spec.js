@@ -70,6 +70,12 @@ async function openForge(page, scenario = "ready", theme = "command") {
         }
         if (method === "GetSafeLoopStatus") return ok(state.safe);
         if (method === "GetPowerSweepProgress") return ok(state.power);
+        if (method === "SetSentinelCanary") {
+          state.sentinelRequests = [...(state.sentinelRequests ?? []), args.params.enabled];
+          state.power.sentinel_canary = args.params.enabled;
+          if (args.params.enabled) state.power.sentinel_advice = null;
+          return ok(state.power);
+        }
         if (method === "GetAppliedProfile") return ok(state.applied);
         if (method === "GetSentinelStatus" && scenario === "slow-reset" && state.resetCompleted) {
           return new Promise(() => {});
@@ -583,6 +589,39 @@ test("Program: window and startup options save through the desktop bridge", asyn
   await start.click();
   await expect(start).toBeChecked();
   expect(await page.evaluate(() => window.__forgeTest.window)).toEqual({ closeToTray: true, minimizeToTray: false, startWithWindows: true });
+});
+
+test("Sentinel: the GPU check is off by default and is switched in Settings", async ({ page }, testInfo) => {
+  await openForge(page);
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const check = page.getByRole("switch", { name: /GPU check while gaming/ });
+  await expect(check).not.toBeChecked();
+  await page.getByRole("heading", { name: "Sentinel" }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("settings-sentinel.png") });
+  await expect(check).toBeEnabled();
+  await check.click();
+  await expect(check).toBeChecked();
+  expect(await page.evaluate(() => window.__forgeTest.sentinelRequests)).toEqual([true]);
+  await check.click();
+  await expect(check).not.toBeChecked();
+  expect(await page.evaluate(() => window.__forgeTest.sentinelRequests)).toEqual([true, false]);
+  expect(await page.evaluate(() => window.__forgeTest.calls.some((m) => /^(Start|Resume|Apply)/.test(m)))).toBe(false);
+});
+
+for (const theme of ["command", "instrument", "workshop"]) test(`Sentinel: a recorded problem asks for the GPU check and one click turns it on (${theme})`, async ({ page }, testInfo) => {
+  await openForge(page, "ready", theme);
+  const advice = "Sentinel recorded a problem. Turn on the GPU check to analyse the applied profile.";
+  await page.evaluate((text) => { window.__forgeTest.power.sentinel_advice = text; }, advice);
+  await expect(page.getByText(advice)).toBeVisible();
+  await page.getByText(advice).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath(`sentinel-advice-${theme}.png`) });
+  await page.getByRole("button", { name: "Turn on the GPU check" }).click();
+  await expect(page.getByText(advice)).toHaveCount(0);
+  expect(await page.evaluate(() => window.__forgeTest.sentinelRequests)).toEqual([true]);
+  // The check already runs: no advice even if the service still reported one.
+  await page.evaluate((text) => { window.__forgeTest.power.sentinel_advice = text; }, advice);
+  await page.waitForTimeout(1200);
+  await expect(page.getByText(advice)).toHaveCount(0);
 });
 
 test("Program: Exit during a Forge run asks first, then stops the run and exits", async ({ page }, testInfo) => {

@@ -20,6 +20,7 @@
     Zap,
   } from "@lucide/svelte";
   import ForgeSettingsPage from "./ForgeSettingsPage.svelte";
+  import SentinelAdvice from "./SentinelAdvice.svelte";
   import ForgeProgress from "./ForgeProgress.svelte";
   import AutoResumeToggle from "./AutoResumeToggle.svelte";
   import { distinctForgeProfiles, forgePrimaryAction, nvidiaGpu } from "../../forge-workflow.js";
@@ -708,7 +709,7 @@
     </header>
 
     {#if activeView === "settings"}
-      <div class="command-page"><ForgeSettingsPage {theme} onThemeChange={chooseTheme} /></div>
+      <div class="command-page"><ForgeSettingsPage {theme} onThemeChange={chooseTheme} {powerSweep} {serviceReady} /></div>
     {:else if activeView === "advanced"}
       <div class="command-page">{@render children?.()}</div>
     {:else}
@@ -743,7 +744,7 @@
             </label>
             </details>
             <small id="primary-action-reason">{primaryActionReason}</small>
-            <AutoResumeToggle {powerSweep} disabled={!serviceReady} />
+            <AutoResumeToggle {powerSweep} disabled={!serviceReady} /><SentinelAdvice {powerSweep} disabled={!serviceReady} />
           </div>
         </div>
       </section>
@@ -784,7 +785,7 @@
 
       <main class="instrument-content" class:diagnostics-view={activeView !== "forge"}>
         {#if activeView === "settings"}
-          <div class="instrument-page"><ForgeSettingsPage {theme} onThemeChange={chooseTheme} /></div>
+          <div class="instrument-page"><ForgeSettingsPage {theme} onThemeChange={chooseTheme} {powerSweep} {serviceReady} /></div>
         {:else if activeView === "advanced"}
           <div class="instrument-page">{@render children?.()}</div>
         {:else}
@@ -852,7 +853,7 @@
               <option value="long">Long — exhaustive proof</option>
             </select>
             <p>Standard is recommended. Other modes are optional.</p>
-            <AutoResumeToggle {powerSweep} disabled={!serviceReady} />
+            <AutoResumeToggle {powerSweep} disabled={!serviceReady} /><SentinelAdvice {powerSweep} disabled={!serviceReady} />
           </div>
           <div class="safe-loop-block">
             <span>SAFE LOOP</span>
@@ -880,7 +881,7 @@
 
     <main class="workshop-content" class:diagnostics-view={activeView !== "forge"}>
       {#if activeView === "settings"}
-        <div class="workshop-page"><ForgeSettingsPage {theme} onThemeChange={chooseTheme} /></div>
+        <div class="workshop-page"><ForgeSettingsPage {theme} onThemeChange={chooseTheme} {powerSweep} {serviceReady} /></div>
       {:else if activeView === "advanced"}
         <div class="workshop-page">{@render children?.()}</div>
       {:else}
@@ -892,7 +893,7 @@
             <button class="workshop-forge" onclick={runForge} disabled={primaryActionDisabled}><Anvil size={25} />{actionLabel}</button>
             <label><select value={forgeMode} onchange={selectMode} disabled={runModeDisabled}><option value="clean">Clean Run · Remeasures positives</option><option value="standard">Standard · Compact proof</option><option value="long">Long · Exhaustive proof</option></select><ChevronDown size={20} /></label>
         </div>
-        <div class="workshop-auto-resume"><AutoResumeToggle {powerSweep} disabled={!serviceReady} /></div>
+        <div class="workshop-auto-resume"><AutoResumeToggle {powerSweep} disabled={!serviceReady} /><SentinelAdvice {powerSweep} disabled={!serviceReady} /></div>
       </section>
 
       {#if hasForgeRun}
@@ -2446,8 +2447,15 @@
 
   .workshop-auto-resume {
     display: flex;
-    justify-content: center;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
     margin-top: 18px;
+  }
+
+  /* The hero shifts its children down 16 px; leave room when the Sentinel advice adds height. */
+  .workshop-auto-resume:has(:global(.sentinel-advice)) {
+    margin-bottom: 28px;
   }
 
   .workshop-forge {

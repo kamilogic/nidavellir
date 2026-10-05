@@ -2,11 +2,38 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { AppWindow, Check, Languages, Palette, RefreshCw, Settings } from "@lucide/svelte";
+  import { AppWindow, Check, Languages, Palette, RefreshCw, Settings, ShieldCheck } from "@lucide/svelte";
   import { locale } from "../../i18n.js";
+  import { serviceCall } from "../../service.js";
   import { checkForUpdate, requestUpdate, updateHold, updateState } from "../../updates.js";
 
-  let { theme = "command", onThemeChange } = $props();
+  let { theme = "command", onThemeChange, powerSweep = null, serviceReady = false } = $props();
+
+  let sentinelOverride = $state(null);
+  let sentinelSaving = $state(false);
+  let sentinelError = $state(null);
+  const sentinelOn = $derived(sentinelOverride ?? Boolean(powerSweep?.sentinel_canary));
+
+  $effect(() => {
+    powerSweep?.sentinel_canary;
+    sentinelOverride = null;
+  });
+
+  async function saveSentinel(input) {
+    sentinelSaving = true;
+    sentinelOverride = input.checked;
+    sentinelError = null;
+    try {
+      const response = await serviceCall("SetSentinelCanary", { enabled: input.checked });
+      if (response?.ok === false) throw new Error(response.error ?? "The service refused the change.");
+    } catch (error) {
+      sentinelOverride = null;
+      input.checked = Boolean(powerSweep?.sentinel_canary);
+      sentinelError = `The setting was not saved: ${error?.message ?? error}`;
+    } finally {
+      sentinelSaving = false;
+    }
+  }
 
   let appVersion = $state(null);
   let versionUnavailable = $state(false);
@@ -181,6 +208,36 @@
           {/if}
         {:else}
           <p class="setting-note">{windowUnavailable ? "Available in the installed app." : "Reading…"}</p>
+        {/if}
+      </div>
+    </section>
+
+    <section class="settings-row" aria-labelledby="sentinel-setting-title">
+      <div class="setting-label">
+        <ShieldCheck size={23} strokeWidth={1.6} />
+        <div>
+          <h2 id="sentinel-setting-title">Sentinel</h2>
+          <p>Driver-crash detection is always on and costs nothing. The GPU check is optional, and Nidavellir asks you to turn it on when something calls for an analysis.</p>
+        </div>
+      </div>
+
+      <div class="setting-control">
+        <div class="toggle-list" role="group" aria-label="Sentinel">
+          <label class="toggle-row">
+            <span><strong>GPU check while gaming</strong><small>Every 20 s under load, a short self-test looks for silent errors at the applied profile. It can cause brief stutters in games.</small></span>
+            <input
+              type="checkbox"
+              role="switch"
+              checked={sentinelOn}
+              disabled={sentinelSaving || !serviceReady}
+              onchange={(event) => saveSentinel(event.currentTarget)}
+            />
+          </label>
+        </div>
+        {#if sentinelError}
+          <p class="setting-error" role="alert">{sentinelError}</p>
+        {:else if !serviceReady}
+          <p class="setting-note">Available while the Core Service is running.</p>
         {/if}
       </div>
     </section>

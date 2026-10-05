@@ -371,7 +371,7 @@
       </section>
 
       <p class="panel-footnote">
-        Sentinel is automatic and has no manual switch here. This panel reports events; it does not change GPU tuning.
+        Driver-crash detection is automatic. The GPU check while gaming is switched in Settings. This panel reports events; it does not change GPU tuning.
       </p>
     </div>
   {:else if activeTab === "game-trace"}
