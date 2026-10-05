@@ -135,11 +135,36 @@ impl NvmlSampler {
     }
 }
 
+/// One NVML session for every read (sensors, Forge readiness, canary, measurements). Each
+/// init/shutdown pair left about 22 NVRM allocations in the driver until the process exited
+/// (measured 2026-10-05). At ~2.5 cycles/s that grew to 3.4M allocations and 1.1 GB overnight,
+/// slowed the whole driver, and made the Core's exit take hours.
+static READ_SESSION: std::sync::Mutex<Option<nvml_wrapper::Nvml>> = std::sync::Mutex::new(None);
+
+/// Drop the shared read session so a GPU write's own `Nvml::init()` is a real initialization, as
+/// before, not a reference-count bump on state that may predate a driver reset (TDR). Never waits:
+/// a read in progress keeps its session, and the write proceeds exactly as with a concurrent read.
+pub fn release_read_session() {
+    if let Ok(mut session) = READ_SESSION.try_lock() {
+        *session = None;
+    }
+}
+
+/// Every device lost both temperature and utilization, or none answered: GPU lost or driver reset.
+// ponytail: a GPU that keeps answering nothing re-initializes on every read (the old churn), but
+// only in a state that already requires a reboot.
+fn session_looks_broken(readings: &[NvmlGpuReading]) -> bool {
+    readings
+        .iter()
+        .all(|r| r.temperature_c.is_none() && r.utilization_pct.is_none())
+}
+
 /// Request a GPU core ceiling via NVML locked clocks, keeping the minimum low for idle.
 /// API success confirms the request, not continuous physical containment. Qualification
 /// must independently check measured work clocks (a +15 MHz excursion was seen on 2026-09-17).
 pub fn lock_core_clock_max_mhz(max_mhz: u32) -> Result<(), String> {
     use nvml_wrapper::enums::device::GpuLockedClocksSetting;
+    release_read_session();
     let nvml = nvml_wrapper::Nvml::init().map_err(|e| format!("NVML init: {e}"))?;
     let mut device = nvml.device_by_index(0).map_err(|e| format!("NVML device: {e}"))?;
     device
@@ -155,6 +180,7 @@ pub fn lock_core_clock_max_mhz(max_mhz: u32) -> Result<(), String> {
 /// test: hold the clock, drop the voltage, find the lowest that's stable.
 pub fn pin_core_clock_mhz(mhz: u32) -> Result<(), String> {
     use nvml_wrapper::enums::device::GpuLockedClocksSetting;
+    release_read_session();
     let nvml = nvml_wrapper::Nvml::init().map_err(|e| format!("NVML init: {e}"))?;
     let mut device = nvml.device_by_index(0).map_err(|e| format!("NVML device: {e}"))?;
     device
@@ -164,6 +190,7 @@ pub fn pin_core_clock_mhz(mhz: u32) -> Result<(), String> {
 
 /// Release the core clock cap (back to the stock boost ceiling).
 pub fn reset_core_clock_lock() -> Result<(), String> {
+    release_read_session();
     let nvml = nvml_wrapper::Nvml::init().map_err(|e| format!("NVML init: {e}"))?;
     let mut device = nvml.device_by_index(0).map_err(|e| format!("NVML device: {e}"))?;
     device
@@ -172,11 +199,23 @@ pub fn reset_core_clock_lock() -> Result<(), String> {
 }
 
 pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
-    let nvml = match nvml_wrapper::Nvml::init() {
-        Ok(n) => n,
-        Err(_) => return vec![],
+    let mut session = READ_SESSION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if session.is_none() {
+        *session = nvml_wrapper::Nvml::init().ok();
+    }
+    let Some(nvml) = session.as_ref() else {
+        return vec![];
     };
+    let readings = read_gpus(nvml);
+    if session_looks_broken(&readings) {
+        *session = None;
+    }
+    readings
+}
 
+fn read_gpus(nvml: &nvml_wrapper::Nvml) -> Vec<NvmlGpuReading> {
     let count = match nvml.device_count() {
         Ok(c) => c,
         Err(_) => return vec![],
@@ -248,4 +287,39 @@ pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reading(temperature_c: Option<f32>, utilization_pct: Option<f64>) -> NvmlGpuReading {
+        NvmlGpuReading {
+            index: 0,
+            name: "GPU".into(),
+            uuid: None,
+            utilization_pct,
+            vram_used_mb: None,
+            vram_total_mb: None,
+            core_clock_mhz: None,
+            memory_clock_mhz: None,
+            fan_speed_pct: None,
+            temperature_c,
+            power_w: None,
+            power_limit_w: None,
+            power_capped: None,
+            thermal_throttled: None,
+            source: SensorSource::Nvml,
+            quality: SensorQuality::Live,
+        }
+    }
+
+    #[test]
+    fn read_session_is_dropped_only_when_no_device_answers() {
+        assert!(session_looks_broken(&[]));
+        assert!(session_looks_broken(&[reading(None, None)]));
+        // One unsupported field is normal; the session stays.
+        assert!(!session_looks_broken(&[reading(Some(45.0), None)]));
+        assert!(!session_looks_broken(&[reading(None, Some(3.0)), reading(None, None)]));
+    }
 }

@@ -140,6 +140,8 @@ pub(crate) fn mark_gpu_reboot_required(timestamp: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot = Some(timestamp.to_string());
+    // Driver state is unreliable from here on: the next NVML read opens a fresh session.
+    nidavellir_core::nvml_gpu::release_read_session();
 }
 
 pub(crate) fn reboot_required_event() -> Option<String> {
