@@ -1,6 +1,6 @@
 [package]
 name = "nidavellir-gpu-nvapi"
-version = "0.5.4"
+version = "0.5.5"
 description = "NVAPI-backed GPU tuning for Nidavellir (read now, write next)"
 edition.workspace = true
 license.workspace = true

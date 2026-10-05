@@ -2339,7 +2339,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nidavellir-core"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "chrono",
  "hex",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "nidavellir-driver-pawnio"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "libloading 0.8.9",
  "nidavellir-core",
@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "nidavellir-gpu-nvapi"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "nvapi",
  "nvapi-sys",
@@ -2374,7 +2374,7 @@ dependencies = [
 
 [[package]]
 name = "nidavellir-gpu-stress"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "bytemuck",
  "nidavellir-core",
@@ -2386,7 +2386,7 @@ dependencies = [
 
 [[package]]
 name = "nidavellir-service"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "chrono",
  "nidavellir-core",
@@ -2404,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "nidavellir-ui"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "nidavellir-core",
  "serde",
