@@ -168,6 +168,7 @@ pub fn run_service() -> windows_service::Result<()> {
 
     crate::auto_resume::spawn(Arc::clone(&state));
     crate::program_session::spawn_watchdog(Arc::clone(&state));
+    crate::health::spawn();
     let pipe_state = Arc::clone(&state);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {

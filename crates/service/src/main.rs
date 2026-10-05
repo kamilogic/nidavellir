@@ -13,6 +13,7 @@ mod gpu_real;
 mod gpu_sweep_real;
 mod gpu_undervolt;
 mod gpu_verify;
+mod health;
 mod ipc_server;
 mod manual_point;
 mod program_session;
