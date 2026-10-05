@@ -1230,18 +1230,25 @@ fn forge_options_path() -> std::path::PathBuf {
 
 /// A user preference, not learning: Full Reset keeps it.
 #[cfg(windows)]
-fn load_auto_resume_option() -> bool {
+pub(crate) fn load_forge_option(key: &str) -> bool {
     std::fs::read_to_string(forge_options_path())
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| value.get("auto_resume")?.as_bool())
+        .and_then(|value| value.get(key)?.as_bool())
         .unwrap_or(false)
 }
 
+/// Writes one key and keeps the others: auto-resume and the Sentinel options share the file.
 #[cfg(windows)]
-fn save_auto_resume_option(enabled: bool) -> Result<(), String> {
+pub(crate) fn save_forge_option(key: &str, enabled: bool) -> Result<(), String> {
     std::fs::create_dir_all(nidavellir_core::safe_loop::default_data_dir()).map_err(|e| e.to_string())?;
-    std::fs::write(forge_options_path(), serde_json::json!({ "auto_resume": enabled }).to_string())
+    let mut options = std::fs::read_to_string(forge_options_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    options[key] = serde_json::Value::Bool(enabled);
+    std::fs::write(forge_options_path(), options.to_string())
         .map_err(|error| format!("forge_options.json não pôde ser gravado: {error}"))
 }
 
@@ -1587,7 +1594,7 @@ impl PowerSweepHandle {
     /// Opt in or out of automatic Resume (2026-10-01). Turning it off also cancels a countdown.
     #[cfg(windows)]
     pub fn set_auto_resume(&self, enabled: bool) -> Result<PowerSweepProgress, String> {
-        save_auto_resume_option(enabled)?;
+        save_forge_option("auto_resume", enabled)?;
         self.auto_resume.store(enabled, Ordering::SeqCst);
         if !enabled {
             self.auto_resume_at_ms.store(0, Ordering::SeqCst);
@@ -2835,7 +2842,7 @@ pub(crate) fn current_gpu_key() -> String {
 #[cfg(windows)]
 pub fn restore_handle() -> PowerSweepHandle {
     let handle = PowerSweepHandle::default();
-    handle.auto_resume.store(load_auto_resume_option(), Ordering::SeqCst);
+    handle.auto_resume.store(load_forge_option("auto_resume"), Ordering::SeqCst);
     let gpu_key = current_gpu_key();
     if let Some(mut prog) = load_forge_state(&gpu_key) {
         let store = SafeLoopStore::system();

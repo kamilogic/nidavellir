@@ -804,6 +804,65 @@ fn write_sentinel_status(json: &str) {
         nidavellir_core::safe_loop::default_data_dir().join("sentinel_status.json"),
         json,
     );
+    // Every Sentinel action is a problem worth an analysis while the GPU check is off.
+    PROBLEM_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = crate::gpu_power_sweep::save_forge_option("sentinel_problem", true);
+}
+
+/// The silent canary's daily-use switch (user decision, 2026-10-05). Its 700 ms GPU check every
+/// 20 s under load stutters games, so it is off by default and the user turns it on to analyse a
+/// profile. Diagnostics still run it, and Event Log driver-crash detection never depends on it.
+static CANARY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A Sentinel event was recorded since the user last turned the check on.
+static PROBLEM_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn canary_enabled() -> bool {
+    CANARY_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Turning the check on also clears the recorded problem: the analysis is now running.
+pub(crate) fn set_canary_enabled(enabled: bool) -> Result<(), String> {
+    crate::gpu_power_sweep::save_forge_option("sentinel_canary", enabled)?;
+    CANARY_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst);
+    if enabled {
+        crate::gpu_power_sweep::save_forge_option("sentinel_problem", false)?;
+        PROBLEM_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+/// Why the user should turn the GPU check on, while it is off.
+pub(crate) fn analysis_advice(
+    applied_point: Option<&nidavellir_core::ipc::PowerSweepPoint>,
+) -> Option<String> {
+    analysis_advice_for(
+        canary_enabled(),
+        PROBLEM_SEEN.load(std::sync::atomic::Ordering::SeqCst),
+        applied_point,
+    )
+}
+
+/// Low confidence means less evidence than one full clean validation (0.85, the balanced classifier
+/// threshold of `frontier_confidence_from_evidence`) or low-quality dwell telemetry.
+fn analysis_advice_for(
+    enabled: bool,
+    problem_seen: bool,
+    applied_point: Option<&nidavellir_core::ipc::PowerSweepPoint>,
+) -> Option<String> {
+    use nidavellir_core::ipc::DwellQuality;
+    if enabled {
+        return None;
+    }
+    if problem_seen {
+        return Some("Sentinel recorded a problem. Turn on the GPU check to analyse the applied profile.".into());
+    }
+    let point = applied_point?;
+    let low_confidence = point.confidence.is_some_and(|c| c < 0.85);
+    let low_telemetry = matches!(point.telemetry_quality, Some(DwellQuality::Low))
+        || matches!(point.voltage_quality, Some(DwellQuality::Low));
+    (low_confidence || low_telemetry).then(|| {
+        "The applied profile has low-confidence evidence. Turn on the GPU check to analyse it.".into()
+    })
 }
 
 fn append_sentinel_log(entry: &str) {
@@ -1327,6 +1386,8 @@ fn watcher_event_is_new(last_handled: Option<&str>, start_floor: &str, newest: &
 /// function returns only after the watcher thread durably persists that seed/floor and acknowledges
 /// it is active; callers must treat every error as a hard block on reapply and hardware work.
 pub fn spawn(store: SafeLoopStore, initial_baseline: Option<String>) -> Result<(), String> {
+    CANARY_ENABLED.store(crate::gpu_power_sweep::load_forge_option("sentinel_canary"), std::sync::atomic::Ordering::SeqCst);
+    PROBLEM_SEEN.store(crate::gpu_power_sweep::load_forge_option("sentinel_problem"), std::sync::atomic::Ordering::SeqCst);
     // Shared bump budget across BOTH layers: one automatic bump per service session, total.
     let bumps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let watcher_started = nidavellir_core::f2_observation::now_rfc3339();
@@ -1513,6 +1574,8 @@ pub fn spawn(store: SafeLoopStore, initial_baseline: Option<String>) -> Result<(
             };
             if (applied.is_none() && diagnostic.is_none())
                 || (store.is_boot_flag_armed() && diagnostic.is_none())
+                // The daily-use check is opt-in; a diagnostic the user started always runs it.
+                || (diagnostic.is_none() && !canary_enabled())
                 // Audit #2: never spin a second GPU context or act while a forge run owns the card.
                 || crate::gpu_power_sweep::FORGE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
             {
@@ -1560,6 +1623,21 @@ pub fn spawn(store: SafeLoopStore, initial_baseline: Option<String>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analysis_advice_asks_for_the_gpu_check_only_while_it_is_off_and_something_calls_for_it() {
+        use nidavellir_core::ipc::{DwellQuality, PowerSweepPoint};
+        let solid = PowerSweepPoint { confidence: Some(0.99), ..Default::default() };
+        let thin = PowerSweepPoint { confidence: Some(0.6), ..Default::default() };
+        let noisy = PowerSweepPoint { confidence: Some(0.99), telemetry_quality: Some(DwellQuality::Low), ..Default::default() };
+        assert_eq!(analysis_advice_for(false, false, Some(&solid)), None);
+        assert_eq!(analysis_advice_for(false, false, None), None);
+        assert!(analysis_advice_for(false, true, Some(&solid)).unwrap().contains("recorded a problem"));
+        assert!(analysis_advice_for(false, false, Some(&thin)).unwrap().contains("low-confidence"));
+        assert!(analysis_advice_for(false, false, Some(&noisy)).unwrap().contains("low-confidence"));
+        // Already analysing: nothing to ask.
+        assert_eq!(analysis_advice_for(true, true, Some(&thin)), None);
+    }
 
     #[test]
     fn silent_canary_planner_preserves_clock_and_stops_at_the_finite_budget() {

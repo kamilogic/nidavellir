@@ -599,11 +599,12 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             Ok(progress) => IpcResponse::success(ResponseData::PowerSweep(progress)),
             Err(error) => IpcResponse::failure(error),
         },
+        IpcRequest::SetSentinelCanary { enabled } => match crate::tdr_sentinel::set_canary_enabled(*enabled) {
+            Ok(()) => IpcResponse::success(ResponseData::PowerSweep(power_sweep_status(&guard))),
+            Err(error) => IpcResponse::failure(error),
+        },
         IpcRequest::GetPowerSweepProgress => {
-            let mut progress = guard.power_sweep.progress();
-            progress.start_block_reason = crate::gpu_power_sweep::forge_start_block_reason(&guard.safe_store);
-            progress.development_validation_note = crate::development_validation::status_note();
-            IpcResponse::success(ResponseData::PowerSweep(progress))
+            IpcResponse::success(ResponseData::PowerSweep(power_sweep_status(&guard)))
         }
         IpcRequest::ApplyPowerGodforge => {
             let prog = guard.power_sweep.progress();
@@ -972,6 +973,30 @@ fn apply_undervolt_profile(
 }
 
 /// Build the apply-status payload from the persisted profile.
+/// The Forge progress the UI polls, with its readiness and Sentinel fields.
+fn power_sweep_status(state: &AppState) -> nidavellir_core::ipc::PowerSweepProgress {
+    let mut progress = state.power_sweep.progress();
+    progress.start_block_reason = crate::gpu_power_sweep::forge_start_block_reason(&state.safe_store);
+    progress.development_validation_note = crate::development_validation::status_note();
+    progress.sentinel_canary = crate::tdr_sentinel::canary_enabled();
+    progress.sentinel_advice = crate::tdr_sentinel::analysis_advice(applied_point(&progress).as_ref());
+    progress
+}
+
+/// The Forge profile point the applied F2 undervolt came from, by its exact target and anchor.
+fn applied_point(
+    progress: &nidavellir_core::ipc::PowerSweepProgress,
+) -> Option<nidavellir_core::ipc::PowerSweepPoint> {
+    let undervolt = crate::gpu_apply::load_applied()?.undervolt?;
+    [progress.godforge, progress.brokkrs, progress.deep_calm]
+        .into_iter()
+        .flatten()
+        .find(|point| {
+            point.target_clock_mhz == Some(undervolt.target_mhz)
+                && point.vf_table_voltage_mv == Some(undervolt.anchor_mv)
+        })
+}
+
 fn applied_status(message: String) -> nidavellir_core::ipc::GpuApplyStatus {
     let ap = crate::gpu_apply::load_applied().unwrap_or_default();
     nidavellir_core::ipc::GpuApplyStatus {

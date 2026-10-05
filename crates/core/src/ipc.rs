@@ -79,6 +79,9 @@ pub enum IpcRequest {
     /// Opt in or out of automatic Resume after a staircase-edge TDR (2026-10-01). No hardware work;
     /// turning it off also cancels a pending countdown. Additive.
     SetForgeAutoResume { enabled: bool },
+    /// Turn the Sentinel's GPU check while gaming on or off (2026-10-05). Off by default; driver-crash
+    /// detection stays on either way. No hardware work. Answers like `GetPowerSweepProgress`. Additive.
+    SetSentinelCanary { enabled: bool },
     GetPowerSweepProgress,
     ApplyPowerGodforge,
     ApplyPowerBrokkrs,
@@ -589,6 +592,15 @@ pub struct PowerSweepProgress {
     /// Epoch ms when a pending automatic Resume fires; `None` when none is scheduled.
     #[serde(default)]
     pub auto_resume_at_ms: Option<u64>,
+    /// The Sentinel's GPU check while gaming (2026-10-05): a short self-check every 20 s under load
+    /// that can catch silent errors at the applied profile, at the cost of brief stutters. Off by
+    /// default; filled by `GetPowerSweepProgress` and `SetSentinelCanary`.
+    #[serde(default)]
+    pub sentinel_canary: bool,
+    /// Why the user should turn that check on, while it is off: a recorded Sentinel event, or an
+    /// applied profile with low-confidence evidence. `None` when nothing calls for it.
+    #[serde(default)]
+    pub sentinel_advice: Option<String>,
     /// Stable identifier for the active backend task; the UI must not infer this from log text.
     #[serde(default)]
     pub current_task: Option<String>,
