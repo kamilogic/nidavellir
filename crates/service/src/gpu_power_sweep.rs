@@ -2809,12 +2809,18 @@ fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
 
 #[cfg(windows)]
 pub(crate) fn current_gpu_key() -> String {
+    // The UUID cannot change while the Core runs, and the Forge readiness check asks for it every
+    // 500 ms. Only the UUID key is kept; the fallbacks are retried until NVML answers.
+    static UUID_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(key) = UUID_KEY.get() {
+        return key.clone();
+    }
     if let Some(gpu) = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml()
         .into_iter()
         .next()
     {
         if let Some(uuid) = gpu.uuid {
-            return format!("nvml:{uuid}");
+            return UUID_KEY.get_or_init(|| format!("nvml:{uuid}")).clone();
         }
         return format!("nvml-index-{}:{}", gpu.index, gpu.name);
     }
