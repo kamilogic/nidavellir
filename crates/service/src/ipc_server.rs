@@ -261,8 +261,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             IpcResponse::success(ResponseData::Hardware(hw))
         }
         IpcRequest::ReadSensors => {
-            let input =
-                crate::sensor_gather::gather_sensor_input(&guard.driver, &guard.motherboard);
+            let input = crate::sensor_gather::gather_sensor_input(&guard.motherboard);
             let sensors = guard.sensor_engine.read(&input);
             IpcResponse::success(ResponseData::Sensors(sensors))
         }

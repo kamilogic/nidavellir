@@ -1,30 +1,12 @@
 use nidavellir_core::detector::MotherboardInfo;
 use nidavellir_core::sensor_input::SensorInput;
-use nidavellir_core::sensor_meta::{SensorQuality, SensorSource};
-use nidavellir_core::superio_profile;
-use nidavellir_driver_pawnio::DriverManager;
+use nidavellir_core::sensor_meta::SensorSource;
 
-pub fn gather_sensor_input(driver: &DriverManager, motherboard: &MotherboardInfo) -> SensorInput {
-    let probe = driver.probe_superio();
-    let resolved = superio_profile::resolve_superio(motherboard, probe.as_ref());
-    let cpu_temp_c = driver.read_cpu_temperature_c();
-
-    let mut input = SensorInput::from_driver_parts(
-        motherboard.clone(),
-        resolved,
-        cpu_temp_c,
-        cpu_temp_c.is_some(),
-    );
-
-    if input.cpu_vcore_mv.is_none() {
-        if let Some(mv) = driver.read_vcore_intel_mv() {
-            if (400..=2500).contains(&mv) {
-                input.cpu_vcore_mv = Some(mv);
-                input.cpu_vcore_source = Some(SensorSource::Msr);
-                input.cpu_vcore_quality = SensorQuality::Nominal;
-            }
-        }
-    }
+/// GPU-only product (2026-10-05): CPU temperature, Vcore and Super I/O rails are no longer read
+/// through PawnIO. Each read was a driver round trip every 2 s, and without LpcIO.bin every read also
+/// logged a warning (25k lines a day).
+pub fn gather_sensor_input(motherboard: &MotherboardInfo) -> SensorInput {
+    let mut input = SensorInput::from_driver_parts(motherboard.clone(), None, None, false);
 
     if let Some(mv) = nidavellir_gpu_nvapi::read_core_voltage_mv()
         .filter(|mv| (400..=1500).contains(mv))

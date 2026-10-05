@@ -260,14 +260,8 @@ fn read_gpu_sensors() -> Vec<GpuSensors> {
         );
     }
 
-    let smi_list = read_gpu_sensors_nvidia_smi().unwrap_or_default();
-    for smi in smi_list {
-        by_name
-            .entry(smi.name.clone())
-            .and_modify(|g| merge_gpu_smi(g, &smi))
-            .or_insert(smi);
-    }
-
+    // No nvidia-smi merge (2026-10-05): it spawned a process with its own NVML session on every
+    // read, and the max clocks it alone supplied are shown nowhere.
     if by_name.is_empty() {
         return read_gpu_sensors_wmi();
     }
@@ -275,94 +269,6 @@ fn read_gpu_sensors() -> Vec<GpuSensors> {
     let mut out: Vec<_> = by_name.into_values().collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
-}
-
-fn merge_gpu_smi(dst: &mut GpuSensors, smi: &GpuSensors) {
-    if dst.utilization_pct.is_none() {
-        dst.utilization_pct = smi.utilization_pct;
-    }
-    if dst.vram_used_mb.is_none() {
-        dst.vram_used_mb = smi.vram_used_mb;
-    }
-    if dst.vram_total_mb.is_none() {
-        dst.vram_total_mb = smi.vram_total_mb;
-    }
-    if dst.core_clock_mhz.is_none() {
-        dst.core_clock_mhz = smi.core_clock_mhz;
-    }
-    if dst.memory_clock_mhz.is_none() {
-        dst.memory_clock_mhz = smi.memory_clock_mhz;
-    }
-    if dst.fan_speed_pct.is_none() {
-        dst.fan_speed_pct = smi.fan_speed_pct;
-    }
-    dst.max_core_clock_mhz = smi.max_core_clock_mhz.or(dst.max_core_clock_mhz);
-    dst.max_memory_clock_mhz = smi.max_memory_clock_mhz.or(dst.max_memory_clock_mhz);
-}
-
-fn read_gpu_sensors_nvidia_smi() -> Option<Vec<GpuSensors>> {
-    let output = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,utilization.gpu,memory.used,memory.total,clocks.current.graphics,clocks.current.memory,clocks.max.graphics,clocks.max.memory,power.draw,fan.speed",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let parts: Vec<_> = line.split(',').map(|p| p.trim()).collect();
-        if parts.len() < 8 {
-            continue;
-        }
-        let name = parts[0].to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let power_w = parts.get(8).and_then(|s| parse_power_w(s));
-        let fan_speed_pct = parts.get(9).and_then(|s| parse_percentage(s));
-        out.push(GpuSensors {
-            name,
-            utilization_pct: parts[1].parse::<f64>().ok(),
-            vram_used_mb: parts[2].parse::<u64>().ok(),
-            vram_total_mb: parts[3].parse::<u64>().ok(),
-            core_clock_mhz: parts[4].parse::<u32>().ok(),
-            memory_clock_mhz: parts[5].parse::<u32>().ok(),
-            max_core_clock_mhz: parts[6].parse::<u32>().ok(),
-            max_memory_clock_mhz: parts[7].parse::<u32>().ok(),
-            fan_speed_pct,
-            voltage_mv: None,
-            voltage_source: None,
-            temperature_c: None,
-            power_w,
-            temperature_source: None,
-            power_source: power_w.map(|_| SensorSource::NvidiaSmi.as_str().to_string()),
-        });
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-fn parse_power_w(s: &str) -> Option<f32> {
-    let t = s.trim();
-    if t.is_empty() || t.eq_ignore_ascii_case("N/A") || t.eq_ignore_ascii_case("[N/A]") {
-        return None;
-    }
-    t.parse::<f32>().ok().filter(|&v| v >= 0.0)
-}
-
-fn parse_percentage(s: &str) -> Option<u32> {
-    let value = s.trim().trim_end_matches('%').trim();
-    if value.is_empty() || value.eq_ignore_ascii_case("N/A") || value.eq_ignore_ascii_case("[N/A]") {
-        return None;
-    }
-    value.parse::<u32>().ok().filter(|value| *value <= 100)
 }
 
 fn read_gpu_sensors_wmi() -> Vec<GpuSensors> {
@@ -453,19 +359,5 @@ fn check_whea_errors() -> WheaInfo {
             last_error: None,
             events: vec![],
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_percentage;
-
-    #[test]
-    fn percentage_parser_preserves_unavailable_instead_of_fabricating_zero() {
-        assert_eq!(parse_percentage("37"), Some(37));
-        assert_eq!(parse_percentage("37 %"), Some(37));
-        assert_eq!(parse_percentage("N/A"), None);
-        assert_eq!(parse_percentage("[N/A]"), None);
-        assert_eq!(parse_percentage("101"), None);
     }
 }
