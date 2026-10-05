@@ -1,6 +1,6 @@
 [package]
 name = "nidavellir-service"
-version = "0.5.5"
+version = "0.5.6"
 description = "Nidavellir Core Service — privileged hardware access"
 edition.workspace = true
 license.workspace = true
