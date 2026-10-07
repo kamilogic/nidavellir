@@ -20,6 +20,20 @@ const HEARTBEAT: Duration = Duration::from_secs(5);
 const FORGE_STOP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Set while exiting: no heartbeats, and a stopped Core is not started again.
 static EXITING: AtomicBool = AtomicBool::new(false);
+/// The window is on screen: not hidden in the tray, not minimized. The UI polls the Core only
+/// then (2026-10-07: polling unseen, the WebView spent about 20x the Core's CPU).
+static UI_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+fn set_ui_visible(app: &AppHandle, visible: bool) {
+    if UI_VISIBLE.swap(visible, Ordering::SeqCst) != visible {
+        let _ = app.emit("window-visibility", visible);
+    }
+}
+
+#[tauri::command]
+pub fn window_visible() -> bool {
+    UI_VISIBLE.load(Ordering::SeqCst)
+}
 
 /// Tray id, menu label and apply request of each forged profile, in menu order.
 const PROFILES: [(&str, &str, &str); 3] = [
@@ -103,6 +117,7 @@ pub fn show_main(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        set_ui_visible(app, true);
     }
 }
 
@@ -121,14 +136,18 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
             api.prevent_close();
             if settings(window.app_handle()).close_to_tray {
                 let _ = window.hide();
+                set_ui_visible(window.app_handle(), false);
             } else {
                 request_exit(window.app_handle());
             }
         }
-        WindowEvent::Resized(_)
-            if settings(window.app_handle()).minimize_to_tray && window.is_minimized().unwrap_or(false) =>
-        {
-            let _ = window.hide();
+        WindowEvent::Resized(_) => {
+            let minimized = window.is_minimized().unwrap_or(false);
+            if minimized && settings(window.app_handle()).minimize_to_tray {
+                let _ = window.hide();
+            }
+            // Restoring from the taskbar does not pass through show_main.
+            set_ui_visible(window.app_handle(), !minimized && window.is_visible().unwrap_or(true));
         }
         _ => {}
     }

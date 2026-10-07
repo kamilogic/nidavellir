@@ -26,7 +26,8 @@ pub fn run() {
             service_ping,
             program::get_window_settings,
             program::set_window_settings,
-            program::exit_program
+            program::exit_program,
+            program::window_visible
         ])
         .setup(|app| {
             program::setup(app)?;

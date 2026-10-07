@@ -6,6 +6,7 @@
   import ForgeThemeScreen from "../components/forge/ForgeThemeScreen.svelte";
   import UpdateButton from "../components/forge/UpdateButton.svelte";
   import { updateHold } from "../updates.js";
+  import { windowVisible } from "../visibility.js";
 
   let { theme = "command", onThemeChange } = $props();
 
@@ -77,9 +78,18 @@
     }
   }
 
+  // Without a run nothing changes fast: the timer refreshes every 2 s instead of every 500 ms.
+  // Explicit refreshes after an action always run.
+  const IDLE_REFRESH_MS = 2000;
+  let lastRefreshAt = 0;
+  function tick() {
+    if (powerRunning || Date.now() - lastRefreshAt >= IDLE_REFRESH_MS) void refresh();
+  }
+
   async function refresh(forceSlow = false) {
     if (refreshInFlight || fullResetBusy) return;
     refreshInFlight = true;
+    lastRefreshAt = Date.now();
     try {
       const now = Date.now();
       const slowDue = forceSlow || !powerRunning || now - lastSlowRefreshAt >= 3000;
@@ -628,6 +638,8 @@
   });
 
   $effect(() => {
+    // Hidden in the tray or minimized: no polling. Showing the window again catches up at once.
+    if (!$windowVisible) return;
     loadHardware();
     refresh();
     refreshSentinel();
@@ -635,7 +647,7 @@
     refreshGameTrace();
     refreshManualPoint();
     refreshDetectorLab();
-    timer = setInterval(refresh, 500);
+    timer = setInterval(tick, 500);
     const sentinelTimer = setInterval(refreshSentinel, 10_000);
     const sensorTimer = setInterval(refreshSensors, 2000);
     const gameTraceTimer = setInterval(refreshGameTrace, 1000);

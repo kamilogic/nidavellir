@@ -624,6 +624,24 @@ for (const theme of ["command", "instrument", "workshop"]) test(`Sentinel: a rec
   await expect(page.getByText(advice)).toHaveCount(0);
 });
 
+test("Program: hidden in the tray the window stops polling the Core, and catches up when shown", async ({ page }) => {
+  await openForge(page);
+  const count = (method) => page.evaluate((m) => window.__forgeTest.calls.filter((c) => c === m).length, method);
+  await page.waitForFunction(() => window.__tauriListening("window-visibility"));
+  // Idle (no run): the status refreshes about every 2 s, not every 500 ms.
+  const idleStart = await count("GetPowerSweepProgress");
+  await page.waitForTimeout(4200);
+  expect((await count("GetPowerSweepProgress")) - idleStart).toBeLessThanOrEqual(3);
+  await page.evaluate(() => window.__tauriEmit("window-visibility", false));
+  await page.waitForTimeout(300);
+  const hidden = await page.evaluate(() => window.__forgeTest.calls.length);
+  await page.waitForTimeout(3000);
+  expect(await page.evaluate(() => window.__forgeTest.calls.length)).toBe(hidden);
+  await page.evaluate(() => window.__tauriEmit("window-visibility", true));
+  await expect.poll(() => count("ReadSensors")).toBeGreaterThan(0);
+  await expect.poll(() => page.evaluate(() => window.__forgeTest.calls.length)).toBeGreaterThan(hidden);
+});
+
 test("Program: Exit during a Forge run asks first, then stops the run and exits", async ({ page }, testInfo) => {
   await openForge(page);
   await page.waitForFunction(() => window.__tauriListening("exit-requested"));
