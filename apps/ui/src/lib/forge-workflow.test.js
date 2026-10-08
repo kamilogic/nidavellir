@@ -59,6 +59,15 @@ test("J03/J04: pending recovery is distinct from proven Resume", () => {
   assert.equal(forgePrimaryAction({ ...ready, safeLoop: { ...safe, safe_mode: true } }).kind, "reset");
 });
 
+test("an apply's survival window waits; a leftover boot flag still offers Return to stock", () => {
+  const armed = { ...safe, boot_flag_armed: true };
+  assert.equal(forgePrimaryAction({ ...ready, safeLoop: armed }).kind, "reset");
+  const verifying = forgePrimaryAction({ ...ready, safeLoop: { ...armed, survival_window: true } });
+  assert.equal(verifying.kind, "wait");
+  assert.equal(verifying.disabled, true);
+  assert.equal(forgePrimaryAction({ ...ready, safeLoop: { ...armed, survival_window: true, safe_mode: true } }).kind, "reset");
+});
+
 function transport({ resumable = true, failAt, malformedAt, pendingAfterAck = false, reboot = false, running = false } = {}) {
   const calls = [];
   let acknowledged = false;

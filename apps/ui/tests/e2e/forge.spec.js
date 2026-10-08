@@ -518,6 +518,27 @@ test("UX: an active Forge with its armed candidate is not a Safe Loop alert", as
   await expect(page.getByText("Safe Loop needs attention", { exact: true })).toHaveCount(0);
 });
 
+test("UX: an apply's survival window reads as Verifying; a leftover flag is still an alert", async ({ page }, testInfo) => {
+  await openForge(page, "qualified");
+  await page.evaluate(() => {
+    window.__forgeTest.applied = { type: "GpuApply", label: "Brokkr's Best", core: { freq_mhz: 1800, voltage_mv: 950 } };
+    Object.assign(window.__forgeTest.safe, { boot_flag_armed: true, survival_window: true });
+  });
+  const safeLoop = page.locator(".system-item").filter({ hasText: "SAFE LOOP" });
+  const primary = page.locator(".plate-button");
+  await expect(safeLoop).toContainText("Verifying");
+  await expect(primary).toHaveText("Verifying profile…");
+  await expect(primary).toBeDisabled();
+  await expect(page.getByText("Safe Loop needs attention", { exact: true })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("survival-window.png"), fullPage: true });
+  await page.evaluate(() => { window.__forgeTest.safe.survival_window = false; });
+  await expect(page.getByText("Safe Loop needs attention", { exact: true })).toBeVisible();
+  await expect(primary).toHaveText("Return to stock");
+  await page.evaluate(() => { window.__forgeTest.safe.boot_flag_armed = false; });
+  await expect(safeLoop).toContainText("Protected");
+  await expect(page.getByRole("button", { name: "Return to stock", exact: true })).toBeEnabled();
+});
+
 test("UX: profile cards show clock, voltage and typical power before expanding", async ({ page }) => {
   await openForge(page, "qualified");
   const brokkrs = page.locator(".profile-disclosure").filter({ hasText: "Brokkr’s Best" });

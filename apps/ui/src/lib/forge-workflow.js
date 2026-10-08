@@ -41,7 +41,8 @@ export function forgePrimaryAction({ serviceStatus, gpuDetected, safeLoop, power
   if (powerSweep.running) return action("wait", "Forging…", "Measurements are running. Stop remains available.", true);
   if (safeLoop.gpu_reboot_required) return action("reboot", "Restart Windows", "Restart Windows once; the incident and safety history are saved.", true);
   if (safeLoop.recovery_pending_ack) return action("recover", "Recover Forge", "Return to stock and review recovery. Resume is checked against the saved run, build, GPU and driver.");
-  if (safeLoop.safe_mode || safeLoop.state === "unstable" || safeLoop.boot_flag_armed) return action("reset", "Return to stock", "Release recovery at stock. The saved run and safety history stay preserved.");
+  if (safeLoop.safe_mode || safeLoop.state === "unstable" || (safeLoop.boot_flag_armed && !safeLoop.survival_window)) return action("reset", "Return to stock", "Release recovery at stock. The saved run and safety history stay preserved.");
+  if (safeLoop.boot_flag_armed) return action("wait", "Verifying profile…", "Safe Loop is watching the first seconds after the apply.", true);
   if (powerSweep.start_block_reason) return action("review", "Review safety block", powerSweep.start_block_reason);
   if (powerSweep.resume_available) return action("resume", "Resume Forge", "Continue the same compatible run and its original mode.");
   if (["paused", "interrupted", "needs_attention"].includes(powerSweep.phase)) return action("start_over", "Start over", "The saved run cannot resume. Review Full Reset to forget all GPU learning, or Soft Reset to keep known failures.");

@@ -137,9 +137,11 @@
   const forgePaused = $derived(powerSweep?.phase === "paused");
   const rebootRequired = $derived(Boolean(safeLoop?.gpu_reboot_required));
   const forgeBlocked = $derived(Boolean(powerSweep?.start_block_reason));
-  // A running Forge arms the boot flag for every candidate by design; only a leftover flag needs review.
+  // A running Forge arms the boot flag for every candidate by design, and so does an apply for its
+  // 8-s survival window; only a leftover flag needs review.
+  const verifying = $derived(Boolean(safeLoop?.boot_flag_armed && safeLoop?.survival_window && !powerRunning));
   const safetyNeedsAttention = $derived(
-    Boolean(safeLoop?.safe_mode || safeLoop?.state === "unstable" || (safeLoop?.boot_flag_armed && !powerRunning) || safeLoop?.recovery_pending_ack),
+    Boolean(safeLoop?.safe_mode || safeLoop?.state === "unstable" || (safeLoop?.boot_flag_armed && !powerRunning && !verifying) || safeLoop?.recovery_pending_ack),
   );
   const runFinished = $derived(powerSweep?.phase === "finished");
   const runNeedsAttention = $derived(
@@ -173,7 +175,7 @@
         : recoveryPending
           ? "Recovery needed"
           : protectedState
-            ? "Protected"
+            ? (verifying ? "Verifying" : "Protected")
             : "Needs attention",
   );
   const protectionMessage = $derived(
@@ -184,7 +186,8 @@
       : recoveryPending
         ? "A previous Forge was interrupted. Recover Forge to return to stock and check whether that run can continue. Safety history is saved."
       : protectedState
-        ? (forgeBlocked ? "Safe Loop recovery is clear. Automatic tuning is blocked separately; review the reason below." : "Your GPU is monitored and ready.")
+        ? (verifying ? "Profile applied. Safe Loop is watching its first seconds."
+          : forgeBlocked ? "Safe Loop recovery is clear. Automatic tuning is blocked separately; review the reason below." : "Your GPU is monitored and ready.")
         : "Choose Return to stock to clear the active recovery state. If an incident remains pending, choose Recover Forge to acknowledge it. Safety history stays preserved.",
   );
   const primaryAction = $derived(forgePrimaryAction({
@@ -212,6 +215,7 @@
         field_rejected: "A profile was marked unstable in real use. Forge again to replace it.",
       }[powerSweep?.phase] ?? "The last run ended without new profiles. Open Run details below for the reason.";
     }
+    if (verifying) return protectionMessage;
     if (state === "FORGED") return "Profiles are qualified and ready for daily use.";
     if (state === "REFINED") return "Measured profiles are ready for review.";
     if (state === "FORGING") return "Qualification is active; progress and safety take priority below.";
@@ -404,7 +408,7 @@
 
   function canApply(key) {
     const point = pointFor(key);
-    if (actionBusy || fullResetBusy || recoveryPending || !profilesReady || !point || profileActive(key) || !serviceReady || !gpuDetected || !safeLoopKnown || rebootRequired || safetyNeedsAttention || forgeBlocked) return false;
+    if (actionBusy || fullResetBusy || recoveryPending || !profilesReady || !point || profileActive(key) || !serviceReady || !gpuDetected || !safeLoopKnown || rebootRequired || safetyNeedsAttention || verifying || forgeBlocked) return false;
     if (!isUndervolt) return true;
     const sustainedP99 = finite(point.power_p99_w);
     return Boolean(
@@ -699,7 +703,7 @@
         <span class="system-item" class:pending={!gpuDetected} title={gpuName}>
           <small>GPU</small><strong><i></i>{gpuConnectionLabel}</strong>
         </span>
-        <span class="system-item" class:pending={!protectedState} class:problem={rebootRequired || safetyNeedsAttention}>
+        <span class="system-item" class:pending={!protectedState || verifying} class:problem={rebootRequired || safetyNeedsAttention}>
           <small>SAFE LOOP</small><strong><i></i>{protectionLabel}</strong>
         </span>
         <span class="system-item profile-state">
@@ -721,7 +725,7 @@
           <span class="gpu-source">{gpuDetected ? (primaryGpu?.driver ?? "Identified by local sensors") : "Waiting for local hardware detection"}</span>
           <div class="state-status">
             <div><span>STATE</span><strong class="state-value" class:problem={["OFFLINE", "ATTENTION"].includes(state)} class:pending={["CONNECTING", "WAITING"].includes(state)} class:working={["RAW", "FORGING", "REFINED"].includes(state)}>{state}</strong></div>
-            <div><span>STATUS</span><strong class="protected" class:pending={!safeLoopKnown} class:problem={rebootRequired || safetyNeedsAttention}><ShieldCheck size={38} />{protectionLabel}</strong></div>
+            <div><span>STATUS</span><strong class="protected" class:pending={!safeLoopKnown || verifying} class:problem={rebootRequired || safetyNeedsAttention}><ShieldCheck size={38} />{protectionLabel}</strong></div>
           </div>
           <p>{heroMessage}</p>
         </div>
@@ -857,7 +861,7 @@
           </div>
           <div class="safe-loop-block">
             <span>SAFE LOOP</span>
-            <strong class:pending={!safeLoopKnown}><ShieldCheck size={64} /> {protectionLabel.toUpperCase()}</strong>
+            <strong class:pending={!safeLoopKnown || verifying}><ShieldCheck size={64} /> {protectionLabel.toUpperCase()}</strong>
             <p>Continuous monitoring. Automatic recovery if anything leaves safe limits.</p>
           </div>
           <div class="instrument-runtime">
