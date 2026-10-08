@@ -59,6 +59,8 @@ async function openForge(page, scenario = "ready", theme = "command") {
           return null;
         }
         if (command === "plugin:app|version" && scenario === "updated") return "0.5.2";
+        // Other scenarios answer like a page without the program: no reapply to wait for.
+        if (command === "core_session_ready" && scenario === "starting") return false;
         if (command !== "service_request") throw new Error(`Unexpected command ${command}`);
         state.calls.push(method);
         if (scenario === "connecting") return new Promise(() => {});
@@ -683,6 +685,35 @@ test("Program: a failed tray action is shown in the window", async ({ page }) =>
   await page.waitForFunction(() => window.__tauriListening("tray-notice"));
   await page.evaluate(() => window.__tauriEmit("tray-notice", "Could not apply Godforge: Exact qualified descriptor was refused"));
   await expect(page.getByRole("alert").filter({ hasText: "Could not apply Godforge" })).toBeVisible();
+});
+
+test("Startup: a startup screen covers the Core start and the profile reapply", async ({ page }, testInfo) => {
+  await openForge(page, "starting");
+  await page.waitForFunction(() => window.__tauriListening("core-session"));
+  const forge = page.locator("section.forge");
+  const done = page.locator(".startup li.done");
+  const running = page.locator(".startup li[aria-current='step']");
+  await expect(done).toHaveText(["Starting the Core Service", "Checking Safe Loop"]);
+  // The program names the profile the Core saved, whichever the user applied.
+  await page.evaluate(() => window.__tauriEmit("core-session", { ready: false, profile: "Brokkr's Best" }));
+  await expect(running).toHaveText("Applying Brokkr’s Best…");
+  await expect(forge).toHaveAttribute("inert", "");
+  await page.waitForTimeout(300); // the new step's entrance
+  await page.screenshot({ path: testInfo.outputPath("startup.png") });
+  await page.evaluate(() => window.__tauriEmit("core-session", { ready: true }));
+  await expect(page.locator(".startup")).toHaveCount(0);
+  await expect(forge).not.toHaveAttribute("inert");
+  await expect(page.locator(".plate-button")).toHaveText("Forge GPU");
+});
+
+test("Startup: with no saved profile the startup screen shows the stock confirmation", async ({ page }) => {
+  await openForge(page, "starting");
+  await page.waitForFunction(() => window.__tauriListening("core-session"));
+  await page.evaluate(() => window.__tauriEmit("core-session", { ready: false, profile: null }));
+  await expect(page.locator(".startup li[aria-current='step']")).toHaveText("Confirming stock settings…");
+  await expect(page.locator(".startup li").filter({ hasText: "Applying" })).toHaveCount(0);
+  await page.evaluate(() => window.__tauriEmit("core-session", { ready: true }));
+  await expect(page.locator(".startup")).toHaveCount(0);
 });
 
 test("UX: the state divider follows a long state word", async ({ page }) => {

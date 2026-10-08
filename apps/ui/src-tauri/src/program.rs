@@ -16,6 +16,10 @@ use tauri::{App, AppHandle, Emitter, Manager, Window, WindowEvent, Wry};
 use crate::ipc_client::call_service_with_params as call;
 
 const HEARTBEAT: Duration = Duration::from_secs(5);
+/// Until the Core first answers, the heartbeat retries at this pace: that first heartbeat reapplies
+/// the profile (2026-10-07: at the 5 s pace a started Core sat idle ~5 s before every reapply).
+const FIRST_CONTACT_RETRY: Duration = Duration::from_millis(250);
+const FIRST_CONTACT_WINDOW: Duration = Duration::from_secs(30);
 /// A stopped run lands within a dwell; this bounds the wait after the user confirmed Exit.
 const FORGE_STOP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Set while exiting: no heartbeats, and a stopped Core is not started again.
@@ -33,6 +37,15 @@ fn set_ui_visible(app: &AppHandle, visible: bool) {
 #[tauri::command]
 pub fn window_visible() -> bool {
     UI_VISIBLE.load(Ordering::SeqCst)
+}
+
+/// The Core answered the program's first heartbeat, so its profile reapply is done. The window
+/// shows its startup screen until then.
+static SESSION_READY: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+pub fn core_session_ready() -> bool {
+    SESSION_READY.load(Ordering::SeqCst)
 }
 
 /// Tray id, menu label and apply request of each forged profile, in menu order.
@@ -189,14 +202,27 @@ fn notify(app: &AppHandle, message: String) {
 
 async fn heartbeat_loop(app: AppHandle) {
     ensure_core().await;
+    let started = Instant::now();
     loop {
         if !EXITING.load(Ordering::SeqCst) {
-            if call("ProgramHeartbeat", None).await.is_err() && !EXITING.load(Ordering::SeqCst) {
+            if !SESSION_READY.load(Ordering::SeqCst) {
+                // The startup screen names the profile this first heartbeat reapplies.
+                if let Ok(applied) = call("GetAppliedProfile", None).await {
+                    let _ = app.emit("core-session", json!({ "ready": false, "profile": applied["data"]["label"] }));
+                }
+            }
+            if call("ProgramHeartbeat", None).await.is_ok() {
+                // Set before the event: a window that asks after it missed the event reads true.
+                if !SESSION_READY.swap(true, Ordering::SeqCst) {
+                    let _ = app.emit("core-session", json!({ "ready": true }));
+                }
+            } else if !EXITING.load(Ordering::SeqCst) {
                 ensure_core().await;
             }
             refresh_tray(&app).await;
         }
-        tokio::time::sleep(HEARTBEAT).await;
+        let first_contact = !SESSION_READY.load(Ordering::SeqCst) && started.elapsed() < FIRST_CONTACT_WINDOW;
+        tokio::time::sleep(if first_contact { FIRST_CONTACT_RETRY } else { HEARTBEAT }).await;
     }
 }
 

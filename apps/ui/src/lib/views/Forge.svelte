@@ -1,9 +1,12 @@
 <script>
+  import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-shell";
   import { serviceCall } from "../service.js";
   import { nvidiaGpu, recoverForge, requireServiceData } from "../forge-workflow.js";
   import AdvancedDiagnosticsHub from "../components/forge/AdvancedDiagnosticsHub.svelte";
   import ForgeThemeScreen from "../components/forge/ForgeThemeScreen.svelte";
+  import StartupScreen from "../components/forge/StartupScreen.svelte";
   import UpdateButton from "../components/forge/UpdateButton.svelte";
   import { updateHold } from "../updates.js";
   import { windowVisible } from "../visibility.js";
@@ -51,6 +54,21 @@
   let lastHardwareAttemptAt = 0;
   let refreshInFlight = false;
   let lastSlowRefreshAt = 0;
+  // Offline means the Core is gone, not starting or busy: a starting Core needs a few seconds and an
+  // apply holds its single pipe for ~9 s. Until then a failed read keeps the last state.
+  const OFFLINE_GRACE_MS = 20_000;
+  let lastContactAt = Date.now();
+  // Startup screen: the Core starts, then the program's first heartbeat reapplies the profile (~10 s
+  // with one). It ends with the first status read after that, so the window never steps through
+  // Offline and the reapply's armed Safe Loop on the way.
+  const STARTUP_LIMIT_MS = 25_000;
+  let booting = $state(true);
+  let coreAnswered = $state(false);
+  // What the program's first heartbeat does: reapply this profile name, or only confirm stock
+  // (null). Undefined when this window did not see that heartbeat start.
+  let sessionProfile = $state(undefined);
+  let sessionReadyAt = $state(0);
+  let snapshotAt = $state(0);
 
   const powerRunning = $derived(Boolean(powerSweep?.running));
   // Updating restarts the Core: a run blocks it, and a saved run cannot resume afterwards.
@@ -103,13 +121,19 @@
         const ap = await serviceCall("GetAppliedProfile");
         applied = responseData(ap, "GpuApply", "applied profile");
         lastSlowRefreshAt = now;
-        void loadHardware();
+        // First contact identifies the GPU at once instead of after the retry pause.
+        void loadHardware(serviceStatus !== "online");
       }
       serviceStatus = "online";
       serviceError = null;
+      lastContactAt = Date.now();
+      snapshotAt = now;
     } catch (e) {
-      serviceStatus = "offline";
-      serviceError = String(e);
+      // A pipe that vanished after contact means the Core stopped: offline at once.
+      if ((serviceStatus === "online" && /unavailable/i.test(String(e))) || Date.now() - lastContactAt >= OFFLINE_GRACE_MS) {
+        serviceStatus = "offline";
+        serviceError = String(e);
+      }
     } finally {
       refreshInFlight = false;
     }
@@ -157,7 +181,7 @@
     applied = ap.data;
     serviceStatus = "online";
     serviceError = null;
-    lastSlowRefreshAt = Date.now();
+    lastContactAt = lastSlowRefreshAt = Date.now();
     void refreshSentinel();
   }
 
@@ -637,6 +661,55 @@
     }
   });
 
+  // Only steps the window can observe. The Core runs its Safe Loop startup check before it accepts
+  // a connection, so that step is done as soon as the Core answers. Its first heartbeat always
+  // confirms stock first (~3 s), then reapplies the saved profile if there is one.
+  const startupSteps = $derived.by(() => {
+    const coreUp = coreAnswered || serviceStatus === "online";
+    const steps = [{ label: "Starting the Core Service", done: coreUp }];
+    if (coreUp) steps.push({ label: "Checking Safe Loop", done: true });
+    if (sessionProfile !== undefined) {
+      steps.push({
+        label: sessionProfile ? `Applying ${sessionProfile.replaceAll("'", "’")}` : "Confirming stock settings",
+        done: Boolean(sessionReadyAt),
+      });
+    }
+    return steps;
+  });
+
+  function sessionReady() {
+    coreAnswered = true;
+    sessionReadyAt = Date.now();
+    lastRefreshAt = 0; // the next tick reads the Core as the reapply left it
+  }
+
+  $effect(() => {
+    // Listen first: the program sets its flag before it emits, so asking afterwards cannot miss it.
+    const stop = listen("core-session", ({ payload }) => {
+      if (payload?.ready) return sessionReady();
+      coreAnswered = true;
+      sessionProfile = payload?.profile ?? null;
+    }).catch(() => () => {});
+    stop.then(() => invoke("core_session_ready"))
+      // Ready before this view existed (after onboarding, or a reloaded page): every read is
+      // already after the reapply.
+      .then((ready) => { if (ready && !sessionReadyAt) { coreAnswered = true; sessionReadyAt = 1; } })
+      // No program around this page (browser preview, tests): no reapply to wait for.
+      .catch(() => { if (!sessionReadyAt) sessionReadyAt = 1; });
+    return () => stop.then((unlisten) => unlisten());
+  });
+
+  $effect(() => {
+    if (booting && sessionReadyAt && snapshotAt > sessionReadyAt && hardware) booting = false;
+  });
+
+  $effect(() => {
+    // Counted on screen only: a program started in the tray shows its window later.
+    if (!booting || !$windowVisible) return;
+    const limit = setTimeout(() => (booting = false), STARTUP_LIMIT_MS);
+    return () => clearTimeout(limit);
+  });
+
   $effect(() => {
     // Hidden in the tray or minimized: no polling. Showing the window again catches up at once.
     if (!$windowVisible) return;
@@ -664,7 +737,8 @@
   });
 </script>
 
-<section class={`forge theme-${theme}`}>
+<StartupScreen visible={booting} steps={startupSteps} />
+<section class={`forge theme-${theme}`} inert={booting}>
   <ForgeThemeScreen
     {theme}
     {hardware}

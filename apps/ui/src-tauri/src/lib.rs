@@ -27,7 +27,8 @@ pub fn run() {
             program::get_window_settings,
             program::set_window_settings,
             program::exit_program,
-            program::window_visible
+            program::window_visible,
+            program::core_session_ready
         ])
         .setup(|app| {
             program::setup(app)?;
