@@ -1842,6 +1842,36 @@
     font-size: 12px;
   }
 
+  /* Return to stock sits after the divider instead of taking the divider's column. */
+  .section-label:has(> button) {
+    grid-template-columns: auto auto minmax(24px, 1fr) auto;
+  }
+
+  .section-label > button {
+    grid-column: 4;
+    grid-row: 1;
+    border: 0;
+    border-radius: 8px;
+    padding: 0 14px;
+    background: transparent;
+    box-shadow: inset 0 0 0 1px rgba(133, 141, 143, 0.32);
+    color: #aeb4b4;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 670;
+    cursor: pointer;
+  }
+
+  .section-label > button:hover:not(:disabled) {
+    background-color: rgba(133, 141, 143, 0.12);
+    color: #f0eee9;
+  }
+
+  .section-label > button:disabled {
+    cursor: default;
+    opacity: 0.52;
+  }
+
   .command-body :global(.forge-progress) {
     border-radius: 11px;
     box-shadow: 0 14px 38px rgba(0, 0, 0, 0.16);
