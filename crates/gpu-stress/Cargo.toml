@@ -1,6 +1,6 @@
 [package]
 name = "nidavellir-gpu-stress"
-version = "0.5.8"
+version = "0.5.9"
 description = "Real GPU compute-validation battery (wgpu) for Nidavellir stability testing"
 edition.workspace = true
 license.workspace = true
