@@ -887,6 +887,10 @@ pub struct SafeLoopStatus {
     pub consecutive_crashes: u32,
     pub crash_threshold: u32,
     pub boot_flag_armed: bool,
+    /// The armed flag belongs to a successful apply's survival window (8 s), which clears it by
+    /// itself: verification in progress, not a leftover recovery flag. Every guard still refuses.
+    #[serde(default)]
+    pub survival_window: bool,
     pub last_validated: Option<TuningPoint>,
     pub blacklist: Vec<BlacklistRegion>,
     pub recent_crashes: Vec<CrashClass>,

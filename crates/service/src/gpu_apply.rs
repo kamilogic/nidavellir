@@ -805,8 +805,33 @@ fn exact_undervolt_apply_preflight(
     Ok(())
 }
 
+/// The transaction whose survival timer is running. Status shows that armed flag as verification
+/// in progress; the flag itself and every guard that reads it are unchanged.
+static SURVIVAL_WINDOW: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub(crate) fn in_survival_window(flag: &BootFlag) -> bool {
+    !flag.transaction_id.is_empty()
+        && SURVIVAL_WINDOW.lock().is_ok_and(|owner| owner.as_deref() == Some(flag.transaction_id.as_str()))
+}
+
+fn open_survival_window(flag: &BootFlag) {
+    if let Ok(mut owner) = SURVIVAL_WINDOW.lock() {
+        *owner = Some(flag.transaction_id.clone());
+    }
+}
+
+/// A newer apply's window stays open.
+fn close_survival_window(flag: &BootFlag) {
+    if let Ok(mut owner) = SURVIVAL_WINDOW.lock() {
+        if owner.as_deref() == Some(flag.transaction_id.as_str()) {
+            *owner = None;
+        }
+    }
+}
+
 #[cfg(windows)]
 fn spawn_owned_boot_flag_clear(store: SafeLoopStore, flag: BootFlag) {
+    open_survival_window(&flag);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(8));
         match store.clear_boot_flag_if_matches(&flag) {
@@ -823,6 +848,8 @@ fn spawn_owned_boot_flag_clear(store: SafeLoopStore, flag: BootFlag) {
                 flag.transaction_id
             ),
         }
+        // After the clear: a flag that could not be cleared reads as a leftover from now on.
+        close_survival_window(&flag);
     });
 }
 
@@ -1362,6 +1389,26 @@ mod tests {
         std::fs::remove_dir(base.join("forge_state.json")).unwrap();
         super::forget_all_gpu_learning(&store).unwrap();
         assert!(!super::full_reset_pending(&base));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn survival_window_marks_only_its_own_armed_flag() {
+        use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
+        let base = std::env::temp_dir().join(format!("nidavellir-survival-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let store = SafeLoopStore::new(&base);
+        let flag = BootFlag::new(TuningPoint::from_axes([("gpu_freq_mhz", 1890)]), "gpu_apply_undervolt");
+        store.arm_boot_flag(&flag).unwrap();
+        let status = || crate::safe_loop_runtime::status_snapshot(&store);
+        assert!(status().boot_flag_armed && !status().survival_window, "a leftover flag needs attention");
+        super::open_survival_window(&flag);
+        assert!(status().boot_flag_armed && status().survival_window);
+        let newer = BootFlag::new(TuningPoint::from_axes([("gpu_freq_mhz", 1800)]), "gpu_apply_undervolt");
+        super::close_survival_window(&newer);
+        assert!(status().survival_window, "another transaction cannot close this window");
+        super::close_survival_window(&flag);
+        assert!(status().boot_flag_armed && !status().survival_window, "a flag the timer could not clear is a leftover");
         std::fs::remove_dir_all(base).unwrap();
     }
 

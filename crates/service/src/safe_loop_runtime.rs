@@ -190,7 +190,10 @@ pub fn status_snapshot(store: &SafeLoopStore) -> SafeLoopStatus {
             ..SafeLoopRecord::default()
         }
     });
-    let boot_flag_armed = match store.read_boot_flag_checked() {
+    let boot_flag = store.read_boot_flag_checked();
+    let survival_window =
+        matches!(&boot_flag, Ok(Some(flag)) if crate::gpu_apply::in_survival_window(flag));
+    let boot_flag_armed = match boot_flag {
         Ok(flag) => flag.is_some(),
         Err(error) => {
             warn!("Safe Loop status: boot flag is unreadable; exposing fail-closed Safe Mode: {error}");
@@ -221,6 +224,7 @@ pub fn status_snapshot(store: &SafeLoopStore) -> SafeLoopStatus {
         consecutive_crashes: record.consecutive_crashes,
         crash_threshold: safe_loop::SAFE_MODE_CRASH_THRESHOLD,
         boot_flag_armed,
+        survival_window,
         last_validated: record.last_validated,
         blacklist: record.blacklist,
         recent_crashes: record.crash_log,
