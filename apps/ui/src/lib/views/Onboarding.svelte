@@ -10,6 +10,11 @@
   let detecting = $state(true);
   let error = $state(null);
   let gpu = $state(null);
+  // A first launch starts the Core while this page loads, and its first ~3 s go to confirming
+  // stock: until then a refused or busy connection is a wait, not a detection result.
+  const CORE_WAIT_MS = 30_000;
+  const openedAt = Date.now();
+  let waitingForCore = $state(false);
 
   async function detect() {
     detecting = true;
@@ -21,10 +26,16 @@
       }
     } catch (e) {
       gpu = null;
-      error = e?.message ?? String(e);
-    } finally {
-      detecting = false;
+      const message = e?.message ?? String(e);
+      if (/^Core Service (unavailable|is busy|connection lost)/.test(message) && Date.now() - openedAt < CORE_WAIT_MS) {
+        waitingForCore = true;
+        setTimeout(detect, 1000);
+        return;
+      }
+      error = message;
     }
+    waitingForCore = false;
+    detecting = false;
   }
 
   onMount(() => {
@@ -50,9 +61,9 @@
       {/if}
     </span>
     <div class="gpu-copy">
-      <span class="kicker">{detecting ? "Detecting" : gpu ? "GPU found" : "GPU not ready"}</span>
+      <span class="kicker">{detecting ? (waitingForCore ? "Starting" : "Detecting") : gpu ? "GPU found" : "GPU not ready"}</span>
       {#if detecting}
-        <strong>Looking for your NVIDIA GPU…</strong>
+        <strong>{waitingForCore ? "Starting the Core Service…" : "Looking for your NVIDIA GPU…"}</strong>
       {:else if gpu}
         <strong>{gpu.model}</strong>
         <small>{gpu.driver ? `Driver ${gpu.driver}` : "Detected by the Nidavellir Core"}</small>

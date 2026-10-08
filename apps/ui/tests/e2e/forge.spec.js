@@ -65,6 +65,10 @@ async function openForge(page, scenario = "ready", theme = "command") {
         state.calls.push(method);
         if (scenario === "connecting") return new Promise(() => {});
         if (state.offline) throw new Error("Core Service unavailable");
+        // A first launch: the program is still starting the Core for the first two detections.
+        if (scenario === "onboarding-starting" && method === "DetectHardware" && state.calls.filter((m) => m === method).length < 3) {
+          throw new Error("Core Service unavailable: The system cannot find the file specified. (os error 2)");
+        }
         const ok = (data) => ({ ok: true, data: structuredClone(data) });
         if (method === "DetectHardware") {
           if (scenario === "onboarding-malformed") return ok({ type: "Unexpected" });
@@ -265,6 +269,16 @@ test("J01: onboarding finds the NVIDIA GPU by itself and needs no CPU driver ste
   await page.getByRole("button", { name: "I understand, open the Forge" }).click();
   await expect(page.locator(".plate-button")).toHaveText("Forge GPU");
   expect(await page.evaluate(() => window.__forgeTest.calls.includes("GetDriverStatus"))).toBe(false);
+});
+
+test("J01: a first launch waits for the starting Core instead of reporting an error", async ({ page }, testInfo) => {
+  await openForge(page, "onboarding-starting");
+  await expect(page.getByLabel("GPU detection")).toContainText("Starting the Core Service…");
+  await page.screenshot({ path: testInfo.outputPath("first-launch.png"), animations: "disabled" });
+  await expect(page.getByLabel("GPU detection")).toContainText("NVIDIA GeForce RTX 3060 Ti");
+  await expect(page.getByRole("button", { name: "I understand, open the Forge" })).toBeEnabled();
+  await expect(page.locator(".welcome .error")).toHaveCount(0);
+  expect(await page.evaluate(() => window.__forgeTest.calls.filter((m) => m === "DetectHardware").length)).toBe(3);
 });
 
 for (const scenario of ["onboarding-unsupported", "onboarding-malformed"]) {
