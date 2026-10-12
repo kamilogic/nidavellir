@@ -294,7 +294,6 @@ nidavellir/
 │   ├── core/               Shared core logic
 │   ├── gpu-nvapi/          NVIDIA GPU control and V/F curve access
 │   ├── gpu-stress/         GPU qualification workloads (DX11, DX12, Vulkan)
-│   ├── driver-pawnio/      Legacy PawnIO backend (CPU work, out of scope)
 │   └── service/            Windows service and tuning orchestration
 ├── docs/
 │   └── release-notes/      What users see in the update window

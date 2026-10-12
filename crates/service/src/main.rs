@@ -26,15 +26,12 @@ use windows_service::define_windows_service;
 
 use gpu_power_sweep::PowerSweepHandle;
 use nidavellir_core::safe_loop::SafeLoopStore;
-use nidavellir_driver_pawnio::DriverManager;
 
 pub const SERVICE_NAME: &str = "NidavellirCore";
 pub const PIPE_NAME: &str = r"\\.\pipe\NidavellirCore";
 
 pub struct AppState {
-    pub driver: DriverManager,
     pub sensor_engine: nidavellir_core::sensors::SensorEngine,
-    pub motherboard: nidavellir_core::detector::MotherboardInfo,
     pub safe_store: SafeLoopStore,
     pub power_sweep: PowerSweepHandle,
     pub game_trace: game_trace::GameTraceHandle,
@@ -496,10 +493,7 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     program_session::startup(reapply_allowed);
 
     let state = Arc::new(Mutex::new(AppState {
-        driver: DriverManager::new(),
         sensor_engine: nidavellir_core::sensors::SensorEngine::new(),
-        // Only the board is needed here; the full probe spawns PowerShell (~2 s) on every start.
-        motherboard: nidavellir_core::detector::detect_motherboard(),
         safe_store,
         // Seed from the persisted forge result so a restart restores forged
         // profiles/points instead of showing an unforged GPU.

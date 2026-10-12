@@ -265,12 +265,6 @@ pub fn parse_bugcheck_code(text: &str) -> Option<u64> {
     u64::from_str_radix(&hex, 16).ok()
 }
 
-/// Layer-1 detection (roadmap §4.3): a rise in WHEA correctable errors during
-/// the dwell window is a *soft fail* — instability before the hard crash.
-pub fn whea_soft_fail(count_before: u32, count_after: u32) -> bool {
-    count_after > count_before
-}
-
 /// Everything the loop must remember across reboots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SafeLoopRecord {
@@ -1027,13 +1021,6 @@ mod tests {
         assert_eq!(parse_bugcheck_code(msg), Some(0x124));
         assert_eq!(parse_bugcheck_code("0x101"), Some(0x101));
         assert_eq!(parse_bugcheck_code("no code here"), None);
-    }
-
-    #[test]
-    fn whea_delta_is_soft_fail() {
-        assert!(whea_soft_fail(2, 5));
-        assert!(!whea_soft_fail(5, 5));
-        assert!(!whea_soft_fail(5, 4));
     }
 
     #[test]

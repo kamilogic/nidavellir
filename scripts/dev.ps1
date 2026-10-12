@@ -5,7 +5,7 @@
 #      Rust change if `cargo-watch` is installed (else runs once; install hint printed).
 #   2. The Tauri UI — normal user, in THIS window, with frontend hot-reload (Vite/tauri dev).
 #
-# The two stay separate ON PURPOSE: the service needs elevation for PawnIO/hardware writes, and you
+# The two stay separate ON PURPOSE: the service needs elevation for GPU hardware writes, and you
 # do not want the whole UI running as admin. They talk over the named pipe, same as production.
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts\dev.ps1

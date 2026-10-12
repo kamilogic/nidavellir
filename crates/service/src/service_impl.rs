@@ -11,7 +11,6 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use crate::ipc_server;
 use crate::AppState;
 use crate::SERVICE_NAME;
-use nidavellir_driver_pawnio::DriverManager;
 
 /// Set only under SCM: console mode has nobody to start the process again.
 static STOP_TX: OnceLock<std::sync::mpsc::Sender<Result<(), String>>> = OnceLock::new();
@@ -148,10 +147,7 @@ pub fn run_service() -> windows_service::Result<()> {
     crate::program_session::startup(sentinel_ready);
 
     let state = Arc::new(Mutex::new(AppState {
-        driver: DriverManager::new(),
         sensor_engine: nidavellir_core::sensors::SensorEngine::new(),
-        // Only the board is needed here; the full probe spawns PowerShell (~2 s) on every start.
-        motherboard: nidavellir_core::detector::detect_motherboard(),
         safe_store: safe_store.clone(),
         // Seed from the persisted forge result so a restart restores forged
         // profiles/points instead of showing an unforged GPU.

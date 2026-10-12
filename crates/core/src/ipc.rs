@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::capability::CapabilityReport;
 use crate::condemnation::CondemnationEvent;
 use crate::detector::HardwareInfo;
 use crate::gpu_sweep::VfPoint;
@@ -23,8 +22,6 @@ pub enum IpcRequest {
     ExitProgram,
     DetectHardware,
     ReadSensors,
-    GetCapabilityReport,
-    GetDriverStatus,
     GetSafeLoopStatus,
     /// Explicitly acknowledge the pending Forge restart/runtime incident. This releases only the
     /// acknowledgement latch; durable blacklist and incident history remain.
@@ -785,20 +782,12 @@ pub struct SafeLoopStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DriverStatusPayload {
-    pub status: String,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[allow(clippy::large_enum_variant)] // IPC wire variants stay inline for backward-compatible serde shape.
 pub enum ResponseData {
     Pong,
     Hardware(HardwareInfo),
     Sensors(SensorReadings),
-    Capability(CapabilityReport),
-    DriverStatus(DriverStatusPayload),
     SafeLoop(SafeLoopStatus),
     GpuApply(GpuApplyStatus),
     PowerSweep(PowerSweepProgress),
