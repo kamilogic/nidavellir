@@ -51,9 +51,6 @@ pub const F2_CLOCK_UPPER_MARGIN_MHZ: u32 = 15;
 pub fn f2_clock_ceiling_mhz(target: u32) -> u32 {
     target.saturating_add(F2_CLOCK_UPPER_MARGIN_MHZ)
 }
-pub fn f2_clock_in_target_band(clock: u32, target: u32) -> bool {
-    (target..=f2_clock_ceiling_mhz(target)).contains(&clock)
-}
 /// A pair holds its target one physical bin below the nominal clock too. When hot, the GPU's own
 /// boost management drops one bin at the locked anchor voltage, earlier at lower voltages:
 /// - 1920@937 at ~78 °C (run 1790537155912);
@@ -602,7 +599,7 @@ impl F2ObsOutcome {
     }
 
     /// A real instability/failure at this voltage (the undervolt did NOT hold) — distinct from a
-    /// planner/safety-gate refusal that performed no write. Used to compute `first_bad` / `is_known_bad`.
+    /// planner/safety-gate refusal that performed no write. Used to compute `first_bad`.
     pub fn is_bad(self) -> bool {
         matches!(
             self,
@@ -996,23 +993,6 @@ fn is_required_qualification_pattern(pattern: F2QualificationPattern) -> bool {
     required_pattern_index(pattern).is_some()
 }
 
-/// Lowest-voltage stable point proven by the current, homogeneous discovery contract. Negative
-/// observations remain version-independent and invalidate the same/deeper voltage as before.
-pub fn last_discovery_good_for_target(
-    obs: &[F2Observation],
-    target_mhz: u32,
-) -> Option<&F2Observation> {
-    let first_bad_mv = first_bad_for_target(obs, target_mhz).map(|o| o.anchor_mv);
-    obs.iter()
-        .filter(|o| {
-            o.target_mhz == target_mhz
-                && o.outcome.is_validated()
-                && is_current_discovery_evidence(o)
-        })
-        .filter(|o| first_bad_mv.is_none_or(|bad| o.anchor_mv > bad))
-        .min_by_key(|o| o.anchor_mv)
-}
-
 fn same_run_and_gpu(a: &F2Observation, b: &F2Observation) -> bool {
     a.run_id == b.run_id && a.gpu_key == b.gpu_key
 }
@@ -1078,18 +1058,6 @@ pub fn bracket_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<Volt
     } else {
         None
     }
-}
-
-/// True if `(target, anchor_mv)` is already known bad: there is a prior real-failure observation at
-/// that voltage OR ANY HIGHER voltage for the target. Conservative — a failure at voltage `V` (too low
-/// to hold the clock) implies `V` and everything LOWER is at least as risky.
-pub fn is_known_bad(obs: &[F2Observation], target_mhz: u32, anchor_mv: u32) -> bool {
-    obs.iter().any(|o| {
-        o.target_mhz == target_mhz
-            && o.evidence_kind != F2EvidenceKind::ApplyQualification
-            && is_voltage_boundary_failure(obs, o)
-            && o.anchor_mv >= anchor_mv
-    })
 }
 
 /// The validated descent baseline for chained same-target descent: the DEEPEST (lowest-voltage,
@@ -1213,39 +1181,13 @@ fn discovery_frontier_candidates(
 }
 
 /// Build one physical discovery frontier entry for a target. This deliberately preserves the
-/// deepest current Discovery pass even when its qualification is still inconclusive; callers that
-/// publish profiles must use [`qualified_frontier_entry_for_target`] instead.
+/// deepest current Discovery pass even when its qualification is still inconclusive, so it is not
+/// a publication gate.
 pub fn frontier_entry_for_target(
     obs: &[F2Observation],
     target_mhz: u32,
 ) -> Option<F2FrontierEntry> {
     let best = discovery_frontier_candidates(obs, target_mhz).min_by_key(|o| o.anchor_mv)?;
-    Some(frontier_entry_from_best(obs, target_mhz, best))
-}
-
-/// Build the deepest frontier entry that is publishable under the current qualification contract.
-/// An inconclusive deeper Discovery point remains physical boundary knowledge, but it cannot replace
-/// the nearest shallower pair that completed every currently required qualification pattern.
-pub fn qualified_frontier_entry_for_target(
-    obs: &[F2Observation],
-    target_mhz: u32,
-) -> Option<F2FrontierEntry> {
-    let best = discovery_frontier_candidates(obs, target_mhz)
-        .filter(|candidate| {
-            REQUIRED_QUALIFICATION_PATTERNS.into_iter().all(|pattern| {
-                obs.iter().any(|qualification| {
-                    qualification.target_mhz == target_mhz
-                        && qualification.anchor_mv == candidate.anchor_mv
-                        && is_current_qualification_pass(qualification)
-                        && qualification
-                            .qualification_coverage
-                            .as_ref()
-                            .and_then(|c| c.pattern)
-                            == Some(pattern)
-                })
-            })
-        })
-        .min_by_key(|o| o.anchor_mv)?;
     Some(frontier_entry_from_best(obs, target_mhz, best))
 }
 
@@ -1269,91 +1211,6 @@ pub fn learned_frontier_for_gpu(obs: &[F2Observation], gpu_key: &str) -> Vec<F2F
         .cloned()
         .collect();
     learned_frontier(&scoped)
-}
-
-/// Build the profile-publication projection for one exact physical GPU. The physical discovery
-/// frontier remains available through [`learned_frontier_for_gpu`].
-pub fn qualified_frontier_for_gpu(obs: &[F2Observation], gpu_key: &str) -> Vec<F2FrontierEntry> {
-    let scoped: Vec<F2Observation> = obs
-        .iter()
-        .filter(|o| o.gpu_key.as_deref() == Some(gpu_key))
-        .cloned()
-        .collect();
-    let mut targets: Vec<u32> = scoped.iter().map(|o| o.target_mhz).collect();
-    targets.sort_unstable();
-    targets.dedup();
-    targets
-        .into_iter()
-        .filter_map(|target| qualified_frontier_entry_for_target(&scoped, target))
-        .collect()
-}
-
-/// Project a measured, qualified frontier whose voltage never decreases as target clock rises.
-/// For each target, selects the lowest-voltage current Discovery candidate that has current
-/// qualification at that exact pair and is not below the previously selected anchor. Equal-voltage
-/// plateaus are valid. If no measured candidate satisfies the monotonic floor, the target is omitted;
-/// this projection never fabricates or relabels a voltage point.
-pub fn monotonic_qualified_frontier_for_gpu(
-    obs: &[F2Observation],
-    gpu_key: &str,
-) -> Vec<F2FrontierEntry> {
-    let scoped: Vec<F2Observation> = obs
-        .iter()
-        .filter(|o| o.gpu_key.as_deref() == Some(gpu_key))
-        .cloned()
-        .collect();
-    let mut targets: Vec<u32> = scoped.iter().map(|o| o.target_mhz).collect();
-    targets.sort_unstable();
-    targets.dedup();
-
-    let mut minimum_anchor_mv = None;
-    let mut frontier = Vec::new();
-    for target_mhz in targets {
-        let best = discovery_frontier_candidates(&scoped, target_mhz)
-            .filter(|candidate| {
-                minimum_anchor_mv.is_none_or(|minimum| candidate.anchor_mv >= minimum)
-            })
-            .filter(|candidate| {
-                REQUIRED_QUALIFICATION_PATTERNS.into_iter().all(|pattern| {
-                    scoped.iter().any(|qualification| {
-                        qualification.target_mhz == target_mhz
-                            && qualification.anchor_mv == candidate.anchor_mv
-                            && is_current_qualification_pass(qualification)
-                            && qualification
-                                .qualification_coverage
-                                .as_ref()
-                                .and_then(|coverage| coverage.pattern)
-                                == Some(pattern)
-                    })
-                })
-            })
-            .min_by_key(|candidate| candidate.anchor_mv);
-        if let Some(best) = best {
-            minimum_anchor_mv = Some(best.anchor_mv);
-            frontier.push(frontier_entry_from_best(&scoped, target_mhz, best));
-        }
-    }
-    frontier
-}
-
-/// Return the first physical voltage-order inversion in a frontier. As target clock rises, the
-/// minimum qualified voltage may stay flat or rise, but it must never fall. Equal-voltage plateaus
-/// remain valid measured evidence; a higher clock at a lower voltage means at least one target is
-/// stale/contradictory and profile synthesis must fail closed until discovery reconciles it.
-pub fn frontier_voltage_order_violation(
-    frontier: &[F2FrontierEntry],
-) -> Option<(u32, u32, u32, u32)> {
-    frontier.iter().find_map(|lower| {
-        frontier.iter().find_map(|higher| {
-            (higher.target_mhz > lower.target_mhz && higher.best_anchor_mv < lower.best_anchor_mv)
-                .then_some((
-                    lower.target_mhz,
-                    lower.best_anchor_mv,
-                    higher.target_mhz,
-                    higher.best_anchor_mv,
-                ))
-        })
-    })
 }
 
 /// Bridge ONE learned frontier entry to the canonical telemetry point the existing GPU profile
@@ -1441,10 +1298,6 @@ pub fn current_discovery_observation_at_anchor<'a>(
         })
 }
 
-/// Sustained-clock tolerance (MHz) mirroring the service classifier's `F2_CLOCK_DROP_TOL_MHZ`:
-/// one hot boost bin at the anchor voltage (see [`F2_HELD_BIN_BELOW_MHZ`]).
-pub const F2_APPLY_CLOCK_HOLD_TOL_MHZ: u32 = F2_HELD_BIN_BELOW_MHZ;
-
 /// True when an Apply-qualification observation's power/clock telemetry is trustworthy. A
 /// thermal-slowdown flag only invalidates it when the slowdown actually backed the card OFF the
 /// qualified point — i.e. the sustained (p5) clock sagged below target beyond tolerance. When the
@@ -1456,67 +1309,6 @@ fn apply_qual_reading_trustworthy(o: &F2Observation, _target_mhz: u32) -> bool {
     // v33 qualification already verifies heavy phases individually. Aggregate p5 includes idle
     // and cannot diagnose thermal clock loss independently of those phase measurements.
     is_current_apply_qualification_evidence(o)
-}
-
-/// Highest sustained p99 measured by the complete, reset-clean current required set at one exact Apply
-/// anchor in one run. Partial sets, failed/inconclusive passes, old qualification contracts, and
-/// thermal slowdowns that sagged the sustained clock are excluded; a thermal-slowdown flag that
-/// still HELD the target clock is trusted (see `apply_qual_reading_trustworthy`). The maximum across
-/// all approved patterns is returned so profile presentation cannot understate power already observed
-/// during its deployability soak (accepting a held-throttled reading can only raise it).
-fn apply_qualification_p99_at_anchor(
-    obs: &[F2Observation],
-    run_id: Option<&str>,
-    target_mhz: u32,
-    anchor_mv: u32,
-    gpu_key: &str,
-) -> Option<f32> {
-    let mut runs = std::collections::BTreeMap::<
-        &str,
-        ([bool; REQUIRED_QUALIFICATION_PATTERNS.len()], f32),
-    >::new();
-    for observation in obs.iter().filter(|o| {
-        run_id.is_none_or(|expected| o.run_id == expected)
-            && o.target_mhz == target_mhz
-            && o.anchor_mv == anchor_mv
-            && o.gpu_key.as_deref() == Some(gpu_key)
-            && is_current_apply_qualification_pass(o)
-            && o.reset_to_stock_ok
-            && o.boot_flag_cleared
-            && apply_qual_reading_trustworthy(o, target_mhz)
-            && o.power_p99_w
-                .is_some_and(|power| power.is_finite() && power > 0.0)
-    }) {
-        let entry = runs
-            .entry(observation.run_id.as_str())
-            .or_insert(([false; REQUIRED_QUALIFICATION_PATTERNS.len()], 0.0));
-        let Some(index) = observation
-            .qualification_coverage
-            .as_ref()
-            .and_then(|coverage| coverage.pattern)
-            .and_then(required_pattern_index)
-        else {
-            continue;
-        };
-        entry.0[index] = true;
-        let power = observation.power_p99_w.unwrap_or(0.0);
-        entry.1 = entry.1.max(power);
-    }
-    runs.into_values()
-        .filter(|(seen, _)| seen.iter().all(|present| *present))
-        .map(|(_, power)| power)
-        .max_by(f32::total_cmp)
-}
-
-/// Highest sustained p99 from the complete approved current set produced by one exact Forge run.
-pub fn current_apply_qualification_p99_at_anchor(
-    obs: &[F2Observation],
-    run_id: &str,
-    target_mhz: u32,
-    anchor_mv: u32,
-    gpu_key: &str,
-) -> Option<f32> {
-    apply_qualification_p99_at_anchor(obs, Some(run_id), target_mhz, anchor_mv, gpu_key)
 }
 
 /// Highest sustained p99 from a complete exact-Apply gate: Vulkan, DX11 v3, DX12 and continuous
@@ -1719,50 +1511,6 @@ pub fn worst_current_apply_qualification_power_at_anchor(
         })
         .filter(|power| power.is_finite() && *power > 0.0)
         .max_by(f32::total_cmp)
-}
-
-/// Highest sustained p99 across every complete current-contract run for one exact Apply pair.
-/// This restores the conservative published wattage when a qualified Forge snapshot is reloaded.
-pub fn highest_apply_qualification_p99_at_anchor(
-    obs: &[F2Observation],
-    target_mhz: u32,
-    anchor_mv: u32,
-    gpu_key: &str,
-) -> Option<f32> {
-    apply_qualification_p99_at_anchor(obs, None, target_mhz, anchor_mv, gpu_key)
-}
-
-/// Failure-phase telemetry: counts of qualification dwells that failed inside a named phase,
-/// keyed by `(target_mhz, anchor_mv, pattern, failure_phase)`. This is the data source for
-/// evidence-driven pattern weighting and adaptive apply margins — over time it shows WHICH
-/// stress phase actually predicts instability on this hardware. Pure; counts persisted
-/// evidence only.
-pub fn qualification_failure_histogram(
-    obs: &[F2Observation],
-) -> std::collections::BTreeMap<(u32, u32, String, String), u32> {
-    let mut histogram = std::collections::BTreeMap::new();
-    for observation in obs {
-        let Some(coverage) = observation.qualification_coverage.as_ref() else {
-            continue;
-        };
-        // `failure_phase` is recorded only when a phase actually failed.
-        let Some(phase) = coverage.failure_phase.clone() else {
-            continue;
-        };
-        let pattern = coverage
-            .pattern
-            .map(|pattern| format!("{pattern:?}"))
-            .unwrap_or_else(|| "legacy".to_string());
-        *histogram
-            .entry((
-                observation.target_mhz,
-                observation.anchor_mv,
-                pattern,
-                phase,
-            ))
-            .or_insert(0u32) += 1;
-    }
-    histogram
 }
 
 /// Bridge a whole learned frontier to the `(PowerSweepPoint, confidence)` pairing the existing
@@ -2238,21 +1986,9 @@ mod tests {
         assert!(first_bad_for_target(&[candidate.clone()],1800).is_none());
         candidate.outcome=F2ObsOutcome::SilentError;
         candidate.inconclusive_reason=Some("control_failure_outside_requested_pair".into());
-        assert!(!is_known_bad(&[candidate.clone()],1800,875));
+        assert!(first_bad_for_target(&[candidate.clone()],1800).is_none());
         candidate.inconclusive_reason=None;
-        assert!(is_known_bad(&[candidate],1800,875));
-    }
-
-    #[test]
-    fn is_known_bad_is_conservative_downward() {
-        let v = vec![obs(1800, 956, F2ObsOutcome::Unstable)];
-        // The exact failed voltage and anything LOWER is known bad.
-        assert!(is_known_bad(&v, 1800, 956));
-        assert!(is_known_bad(&v, 1800, 950));
-        // A HIGHER voltage is not implied bad by a lower-voltage failure.
-        assert!(!is_known_bad(&v, 1800, 962));
-        // Different target is unaffected.
-        assert!(!is_known_bad(&v, 1815, 956));
+        assert_eq!(first_bad_for_target(&[candidate],1800).map(|bad| bad.anchor_mv), Some(875));
     }
 
     #[test]
@@ -2272,7 +2008,6 @@ mod tests {
             harder_qualification.clone(),
         ];
         assert!(first_bad_for_target(&reconciled, 1815).is_none());
-        assert!(!is_known_bad(&reconciled, 1815, 900));
 
         let silent_error = obs(1815, 968, F2ObsOutcome::SilentError);
         let physical_failure = [silent_error, harder_discovery, harder_qualification];
@@ -2291,7 +2026,6 @@ mod tests {
         let lower_qualification = qualification_pass(lower_discovery.clone());
         let reconciled = [clock_drop.clone(), lower_discovery, lower_qualification];
         assert!(first_bad_for_target(&reconciled, 1815).is_none());
-        assert!(!is_known_bad(&reconciled, 1815, 950));
 
         let equal_discovery = obs(1815, 968, F2ObsOutcome::Validated);
         let equal_qualification = qualification_pass(equal_discovery.clone());
@@ -2449,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_frontier_keeps_shallower_pass_when_deeper_point_is_inconclusive() {
+    fn discovery_frontier_preserves_a_deeper_inconclusive_observation() {
         let target = 1860;
         let qualified_discovery = obs(target, 937, F2ObsOutcome::Validated);
         let qualified = qualification_pass(qualified_discovery.clone());
@@ -2474,114 +2208,6 @@ mod tests {
                 .best_anchor_mv,
             931,
             "the physical discovery frontier preserves the deeper unproven observation"
-        );
-        let publishable = qualified_frontier_entry_for_target(&observations, target).unwrap();
-        assert_eq!(publishable.best_anchor_mv, 937);
-        assert_eq!(publishable.validation_count, 1);
-    }
-
-    #[test]
-    fn qualified_frontier_for_gpu_excludes_targets_without_current_qualification() {
-        let qualified_discovery = obs(1860, 937, F2ObsOutcome::Validated);
-        let qualified = qualification_pass(qualified_discovery.clone());
-        let unqualified = obs(1785, 937, F2ObsOutcome::Validated);
-        let frontier = qualified_frontier_for_gpu(
-            &[qualified_discovery, qualified, unqualified],
-            "RTX 3060 Ti",
-        );
-        assert_eq!(
-            frontier
-                .iter()
-                .map(|entry| (entry.target_mhz, entry.best_anchor_mv))
-                .collect::<Vec<_>>(),
-            vec![(1860, 937)]
-        );
-    }
-
-    #[test]
-    fn monotonic_qualified_frontier_uses_measured_shallower_alternative() {
-        let low = obs(1695, 887, F2ObsOutcome::Validated);
-        let high_deep = obs(1710, 881, F2ObsOutcome::Validated);
-        let high_monotonic = obs(1710, 887, F2ObsOutcome::Validated);
-        let observations = [
-            low.clone(),
-            qualification_pass(low),
-            high_deep.clone(),
-            qualification_pass(high_deep),
-            high_monotonic.clone(),
-            qualification_pass(high_monotonic),
-        ];
-
-        let frontier = monotonic_qualified_frontier_for_gpu(&observations, "RTX 3060 Ti");
-        assert_eq!(
-            frontier
-                .iter()
-                .map(|entry| (entry.target_mhz, entry.best_anchor_mv))
-                .collect::<Vec<_>>(),
-            vec![(1695, 887), (1710, 887)]
-        );
-    }
-
-    #[test]
-    fn monotonic_qualified_frontier_allows_measured_plateau() {
-        let low = obs(1695, 887, F2ObsOutcome::Validated);
-        let high = obs(1710, 887, F2ObsOutcome::Validated);
-        let observations = [
-            low.clone(),
-            qualification_pass(low),
-            high.clone(),
-            qualification_pass(high),
-        ];
-
-        let frontier = monotonic_qualified_frontier_for_gpu(&observations, "RTX 3060 Ti");
-        assert_eq!(
-            frontier
-                .iter()
-                .map(|entry| (entry.target_mhz, entry.best_anchor_mv))
-                .collect::<Vec<_>>(),
-            vec![(1695, 887), (1710, 887)]
-        );
-    }
-
-    #[test]
-    fn monotonic_qualified_frontier_omits_target_without_measured_alternative() {
-        let low = obs(1695, 887, F2ObsOutcome::Validated);
-        let inverted_only = obs(1710, 881, F2ObsOutcome::Validated);
-        let later = obs(1725, 893, F2ObsOutcome::Validated);
-        let observations = [
-            low.clone(),
-            qualification_pass(low),
-            inverted_only.clone(),
-            qualification_pass(inverted_only),
-            later.clone(),
-            qualification_pass(later),
-        ];
-
-        let frontier = monotonic_qualified_frontier_for_gpu(&observations, "RTX 3060 Ti");
-        assert_eq!(
-            frontier
-                .iter()
-                .map(|entry| (entry.target_mhz, entry.best_anchor_mv))
-                .collect::<Vec<_>>(),
-            vec![(1695, 887), (1725, 893)],
-            "a missing compatible measurement is omitted, never synthesized"
-        );
-    }
-
-    #[test]
-    fn frontier_voltage_order_allows_plateau_but_rejects_inversion() {
-        let entry = |target_mhz, best_anchor_mv| {
-            let discovery = obs(target_mhz, best_anchor_mv, F2ObsOutcome::Validated);
-            let qualification = qualification_pass(discovery.clone());
-            qualified_frontier_entry_for_target(&[discovery, qualification], target_mhz).unwrap()
-        };
-        let plateau = [entry(1815, 975), entry(1860, 975), entry(1875, 981)];
-        assert_eq!(frontier_voltage_order_violation(&plateau), None);
-
-        let inverted = [entry(1815, 975), entry(1875, 975), entry(1935, 906)];
-        assert_eq!(
-            frontier_voltage_order_violation(&inverted),
-            Some((1815, 975, 1935, 906))
         );
     }
 
@@ -2644,12 +2270,7 @@ mod tests {
             .unwrap()
             .verdict = F2QualificationVerdict::Fail;
         let observations = [discovery, apply_pass, apply_failure];
-        assert_eq!(
-            last_discovery_good_for_target(&observations, 1800)
-                .unwrap()
-                .anchor_mv,
-            881
-        );
+        assert_eq!(frontier_entry_for_target(&observations, 1800).unwrap().best_anchor_mv, 881);
         assert!(first_bad_for_target(&observations, 1800).is_none());
     }
 
@@ -2817,7 +2438,6 @@ mod tests {
         let mut old = obs(1800, 962, F2ObsOutcome::Validated);
         old.discovery_contract_version = Some(3);
         assert!(!is_current_discovery_evidence(&old));
-        assert!(last_discovery_good_for_target(&[old.clone()], 1800).is_none());
         assert!(learned_frontier(&[old]).is_empty());
 
         let mut unconfirmed = obs(1800, 962, F2ObsOutcome::Validated);
@@ -2829,7 +2449,7 @@ mod tests {
         legacy.evidence_kind = F2EvidenceKind::Legacy;
         legacy.discovery_contract_version = None;
         assert!(!is_current_discovery_evidence(&legacy));
-        assert!(last_discovery_good_for_target(&[legacy], 1800).is_none());
+        assert!(learned_frontier(&[legacy]).is_empty());
     }
 
     #[test]
@@ -2915,7 +2535,7 @@ mod tests {
         let mut throttled = texture.clone();
         throttled.power_p99_w = Some(180.0);
         throttled.thermal_throttled = true;
-        throttled.sustained_clock_mhz = Some(1830 - F2_APPLY_CLOCK_HOLD_TOL_MHZ - 1);
+        throttled.sustained_clock_mhz = Some(1830 - F2_HELD_BIN_BELOW_MHZ - 1);
         let mut other_run_high_fps = high_fps.clone();
         other_run_high_fps.run_id = "other-run".into();
         other_run_high_fps.power_p99_w = Some(189.0);
@@ -2958,16 +2578,6 @@ mod tests {
             other_run_endurance,
         ];
         assert_eq!(
-            current_apply_qualification_p99_at_anchor(
-                &observations,
-                "apply-v7",
-                1830,
-                862,
-                "RTX 3060 Ti"
-            ),
-            Some(172.587)
-        );
-        assert_eq!(
             current_apply_qualification_p95_clock_at_anchor(
                 &observations,
                 "apply-v7",
@@ -2976,11 +2586,6 @@ mod tests {
                 "RTX 3060 Ti"
             ),
             Some(1890)
-        );
-        assert_eq!(
-            highest_apply_qualification_p99_at_anchor(&observations, 1830, 862, "RTX 3060 Ti"),
-            Some(190.0),
-            "restored snapshots use the highest complete approved run"
         );
         assert_eq!(
             current_complete_apply_gate_p99_at_anchor(
@@ -2999,7 +2604,7 @@ mod tests {
             "restored snapshots preserve the worst complete-gate run"
         );
         assert_eq!(
-            current_apply_qualification_p99_at_anchor(
+            current_complete_apply_gate_p99_at_anchor(
                 &[high_fps],
                 "apply-v7",
                 1830,
@@ -3035,17 +2640,6 @@ mod tests {
             held(F2QualificationPattern::Memory, 199.3),
         ];
         assert_eq!(
-            current_apply_qualification_p99_at_anchor(
-                &held_set,
-                "held-thermal",
-                1935,
-                956,
-                "RTX 4070"
-            ),
-            Some(199.7),
-            "held-clock thermal readings publish (highest p99), never understating power"
-        );
-        assert_eq!(
             current_apply_qualification_p95_clock_at_anchor(
                 &held_set,
                 "held-thermal",
@@ -3060,21 +2654,8 @@ mod tests {
         // Sag the sustained clock below tolerance on one pattern → that pattern is untrustworthy,
         // the triad is incomplete, and both gates fail closed.
         let mut sagged_set = held_set.clone();
-        sagged_set[1].sustained_clock_mhz = Some(1935 - F2_APPLY_CLOCK_HOLD_TOL_MHZ - 1);
-        assert!(current_apply_qualification_p99_at_anchor(&sagged_set, "held-thermal", 1935, 956, "RTX 4070").is_some(),
-            "aggregate idle downclock cannot override proven heavy phases");
+        sagged_set[1].sustained_clock_mhz = Some(1935 - F2_HELD_BIN_BELOW_MHZ - 1);
         sagged_set[1].qualification_coverage.as_mut().unwrap().verdict = F2QualificationVerdict::Inconclusive;
-        assert_eq!(
-            current_apply_qualification_p99_at_anchor(
-                &sagged_set,
-                "held-thermal",
-                1935,
-                956,
-                "RTX 4070"
-            ),
-            None,
-            "a thermal slowdown that sagged the clock still fails closed"
-        );
         assert_eq!(
             current_apply_qualification_p95_clock_at_anchor(
                 &sagged_set,
@@ -3331,54 +2912,6 @@ mod tests {
         assert_eq!(entry.best_anchor_mv, 918);
         // Only the tainted bin available -> no boundary at all.
         assert!(frontier_entry_for_target(&[crash, near], 1920).is_none());
-    }
-
-    #[test]
-    fn failure_histogram_counts_failed_phases_per_point_and_pattern() {
-        let mut fail_a = apply_qualification_pass(
-            obs(1935, 956, F2ObsOutcome::Unstable),
-            F2QualificationPattern::HighFps,
-        );
-        fail_a
-            .qualification_coverage
-            .as_mut()
-            .unwrap()
-            .failure_phase = Some("frame-cadence".into());
-        let mut fail_b = fail_a.clone();
-        fail_b
-            .qualification_coverage
-            .as_mut()
-            .unwrap()
-            .failure_phase = Some("frame-cadence".into());
-        let mut fail_other = apply_qualification_pass(
-            obs(1935, 950, F2ObsOutcome::Unstable),
-            F2QualificationPattern::Memory,
-        );
-        fail_other
-            .qualification_coverage
-            .as_mut()
-            .unwrap()
-            .failure_phase = Some("vram-pressure".into());
-        // A clean pass (no failure_phase) contributes nothing.
-        let clean = apply_qualification_pass(
-            obs(1935, 962, F2ObsOutcome::Validated),
-            F2QualificationPattern::Texture,
-        );
-
-        let histogram = qualification_failure_histogram(&[fail_a, fail_b, fail_other, clean]);
-        assert_eq!(
-            histogram
-                .get(&(1935, 956, "HighFps".into(), "frame-cadence".into()))
-                .copied(),
-            Some(2)
-        );
-        assert_eq!(
-            histogram
-                .get(&(1935, 950, "Memory".into(), "vram-pressure".into()))
-                .copied(),
-            Some(1)
-        );
-        assert_eq!(histogram.len(), 2);
     }
 
     #[test]

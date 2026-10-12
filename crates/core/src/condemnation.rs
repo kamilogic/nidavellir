@@ -32,7 +32,6 @@ pub const CONDEMNATION_LEDGER_FILE: &str = "condemnation_ledger.jsonl";
 
 pub const KIND_FIELD_TDR: &str = "field-tdr";
 pub const KIND_CANDIDATE_CRASH: &str = "candidate-crash";
-pub const KIND_DEVICE_LOST: &str = "device-lost";
 pub const KIND_APPLY_GATE_SILENT: &str = "apply-gate-silent-error";
 pub const KIND_REHABILITATED: &str = "rehabilitated";
 
@@ -163,23 +162,6 @@ pub struct CondemnedPairs {
     pub quarantine: Vec<(u32, u32)>,
     /// Highest condemning contract version per quarantined exact pair (for the re-proof rule).
     quarantine_contracts: Vec<(u32, u32, Option<u32>)>,
-}
-
-/// The EXPERIMENTAL clean-run (organic) view: only condemnations produced by `run_id` itself.
-/// Writes always go to the global ledger — a clean run reads its own failures back (they block
-/// and steer repairs within the run) but never historical ones, so algorithm versions can be
-/// compared on organically clean searches. Production reads use [`condemned_pairs`].
-pub fn condemned_pairs_for_run(
-    events: &[CondemnationEvent],
-    gpu_key: &str,
-    run_id: &str,
-) -> CondemnedPairs {
-    let scoped: Vec<CondemnationEvent> = events
-        .iter()
-        .filter(|e| e.run_id.as_deref() == Some(run_id))
-        .cloned()
-        .collect();
-    condemned_pairs(&scoped, gpu_key)
 }
 
 /// Events that apply to `gpu_key` (entries without a key match conservatively), with later
@@ -658,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn run_scoped_view_sees_only_its_own_run() {
+    fn production_view_sees_every_run() {
         let mut historical = event(CondemnationSeverity::Rigid, 1920, 918, Some(17));
         historical.run_id = Some("f2-forge-old".into());
         let mut seeded = event(CondemnationSeverity::Quarantine, 1890, 900, Some(17));
@@ -666,10 +648,6 @@ mod tests {
         let mut own = event(CondemnationSeverity::Quarantine, 1875, 887, Some(17));
         own.run_id = Some("f2-forge-new".into());
         let events = [historical, seeded, own];
-        let scoped = condemned_pairs_for_run(&events, "gpu-a", "f2-forge-new");
-        assert!(scoped.rigid.is_empty());
-        assert_eq!(scoped.quarantine, vec![(1875, 887)]);
-        // The production view still sees everything.
         let global = condemned_pairs(&events, "gpu-a");
         assert_eq!(global.rigid, vec![(1920, 918)]);
         assert_eq!(global.quarantine.len(), 2);

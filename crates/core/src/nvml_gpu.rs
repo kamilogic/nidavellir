@@ -175,19 +175,6 @@ pub fn lock_core_clock_max_mhz(max_mhz: u32) -> Result<(), String> {
         .map_err(|e| format!("set_gpu_locked_clocks: {e}"))
 }
 
-/// PIN the core (graphics) clock to exactly `mhz` (min = max). Combined with a
-/// voltage lock this forces a fixed V/F operating point — the real undervolt
-/// test: hold the clock, drop the voltage, find the lowest that's stable.
-pub fn pin_core_clock_mhz(mhz: u32) -> Result<(), String> {
-    use nvml_wrapper::enums::device::GpuLockedClocksSetting;
-    release_read_session();
-    let nvml = nvml_wrapper::Nvml::init().map_err(|e| format!("NVML init: {e}"))?;
-    let mut device = nvml.device_by_index(0).map_err(|e| format!("NVML device: {e}"))?;
-    device
-        .set_gpu_locked_clocks(GpuLockedClocksSetting::Numeric { min_clock_mhz: mhz, max_clock_mhz: mhz })
-        .map_err(|e| format!("set_gpu_locked_clocks(pin): {e}"))
-}
-
 /// Release the core clock cap (back to the stock boost ceiling).
 pub fn reset_core_clock_lock() -> Result<(), String> {
     release_read_session();
