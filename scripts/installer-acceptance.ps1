@@ -222,6 +222,17 @@ try {
         if (Test-Path -LiteralPath $serviceExe) { throw 'Service binary remains after uninstall' }
         if (Test-Path -LiteralPath (Join-Path $installDir 'nidavellir-ui.exe')) { throw 'UI binary remains after uninstall' }
         Check-History
+        # The installer remembers its folder for every later install and update unless "delete app
+        # data" is chosen, so a real installation would inherit the acceptance folder (2026-10-11).
+        # The in-place uninstaller also cannot delete itself.
+        $locationKey = 'HKLM:\SOFTWARE\nidavellir\Nidavellir'
+        if ((Get-ItemProperty -LiteralPath $locationKey -ErrorAction SilentlyContinue).'(default)' -eq $installDir) {
+            Remove-Item -LiteralPath $locationKey -Recurse
+            $vendorKey = Split-Path -Parent $locationKey
+            if (-not (Get-ChildItem -LiteralPath $vendorKey) -and -not (Get-Item -LiteralPath $vendorKey).Property) { Remove-Item -LiteralPath $vendorKey }
+        }
+        Remove-Item -LiteralPath (Join-Path $installDir 'uninstall.exe') -ErrorAction SilentlyContinue
+        if ((Test-Path -LiteralPath $installDir) -and -not (Get-ChildItem -LiteralPath $installDir -Force)) { Remove-Item -LiteralPath $installDir }
     }
     $report.status = 'lifecycle_subset_passed'
 } catch {

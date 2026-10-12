@@ -111,6 +111,9 @@ if ($service) {
 if ($LASTEXITCODE -ne 0) { throw "Recovery actions could not be set for ${serviceName} (sc.exe exit $LASTEXITCODE)" }
 & sc.exe failureflag $serviceName 1 | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Recovery flag could not be set for ${serviceName} (sc.exe exit $LASTEXITCODE)" }
+# Shown in services.msc; cosmetic, so a failure is logged instead of aborting the installation.
+& sc.exe description $serviceName 'Applies Nidavellir GPU profiles, runs Forge tests and watches for driver crashes. It returns the GPU to stock when Nidavellir exits.' | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-InstallLog "Service description could not be set (sc.exe exit $LASTEXITCODE)" }
 # The program starts the Core when it opens; the Core stops itself when the program exits.
 # Interactive users get the default service rights plus start (RP), nothing more.
 & sc.exe sdset $serviceName 'D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)' | Out-Null

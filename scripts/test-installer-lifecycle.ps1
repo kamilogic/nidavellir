@@ -83,7 +83,7 @@ function Assert-Failure([string]$Action, [string]$Message) {
 try {
     New-Fixture
     & $helper -Action Install -InstallDir $installDir | Out-Null
-    Assert-Calls 'Create,sc:failure,sc:failureflag,sc:sdset,StartService'
+    Assert-Calls 'Create,sc:failure,sc:failureflag,sc:description,sc:sdset,StartService'
     if (-not $global:NidavellirInstallerFixture.Cleaned) { throw 'Install must clear binaries an earlier update moved aside' }
     # Resolve like the helper does: CI's TEMP is an 8.3 path (RUNNER~1) that GetFullPath expands.
     $expectedPath = '"' + (Join-Path ([IO.Path]::GetFullPath($installDir)) 'nidavellir-service.exe') + '"'
@@ -93,9 +93,9 @@ try {
     & $helper -Action Prepare -InstallDir $installDir | Out-Null
     Assert-Calls 'StopService'
     & $helper -Action Install -InstallDir $installDir | Out-Null
-    Assert-Calls 'StopService,Change,sc:failure,sc:failureflag,sc:sdset,StartService'
+    Assert-Calls 'StopService,Change,sc:failure,sc:failureflag,sc:description,sc:sdset,StartService'
     & $helper -Action Uninstall -InstallDir $installDir | Out-Null
-    Assert-Calls 'StopService,Change,sc:failure,sc:failureflag,sc:sdset,StartService,StopService,Delete'
+    Assert-Calls 'StopService,Change,sc:failure,sc:failureflag,sc:description,sc:sdset,StartService,StopService,Delete'
 
     New-Fixture
     & $helper -Action Uninstall -InstallDir $installDir | Out-Null
@@ -120,6 +120,15 @@ try {
         Assert-Failure 'Install' 'could not be set'
         if ($global:NidavellirInstallerFixture.Calls[-1] -ne $operation) { throw 'Service started without recovery actions' }
     }
+
+    # The service description is cosmetic: its failure is logged and the installation continues.
+    # ProgramData points nowhere meanwhile, so the log line is not written to the real log.
+    New-Fixture
+    $global:NidavellirInstallerFixture.Fail = 'sc:description'
+    $realProgramData = $env:ProgramData
+    $env:ProgramData = Join-Path $env:TEMP "nidavellir-installer-test-absent-$PID"
+    try { & $helper -Action Install -InstallDir $installDir | Out-Null } finally { $env:ProgramData = $realProgramData }
+    Assert-Calls 'Create,sc:failure,sc:failureflag,sc:description,sc:sdset,StartService'
 
     New-Fixture $true
     $global:NidavellirInstallerFixture.Pending = $true
