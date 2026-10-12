@@ -1,9 +1,8 @@
 import { test, expect } from "@playwright/test";
 
 // This replaces Tauri at the browser boundary. It cannot open the real service pipe.
-async function openForge(page, scenario = "ready", theme = "command") {
-  await page.addInitScript(({ scenario, theme }) => {
-    localStorage.setItem("nidavellir-ui-theme", theme);
+async function openForge(page, scenario = "ready") {
+  await page.addInitScript(({ scenario }) => {
     if (!scenario.startsWith("onboarding")) localStorage.setItem("nidavellir-gpu-onboarded", "true");
     // 0.5.0 ran before; the app now reports 0.5.2 (only once, so a reload keeps what WhatsNew wrote).
     if (scenario === "updated" && !localStorage.getItem("nidavellir-last-version")) localStorage.setItem("nidavellir-last-version", "0.5.0");
@@ -132,7 +131,7 @@ async function openForge(page, scenario = "ready", theme = "command") {
         return ok({ type: "Unused", running: false });
       },
     };
-  }, { scenario, theme });
+  }, { scenario });
   page.on("dialog", (dialog) => dialog.accept());
   await page.goto("/");
 }
@@ -290,11 +289,10 @@ for (const scenario of ["onboarding-unsupported", "onboarding-malformed"]) {
   });
 }
 
-for (const theme of ["command", "instrument", "workshop"]) {
-test(`J09: ${theme} Soft Reset preserves the block and offers diagnostics`, async ({ page }, testInfo) => {
+test("J09: Soft Reset preserves the block and offers diagnostics", async ({ page }, testInfo) => {
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await openForge(page, "safety-limit", theme);
+  await openForge(page, "safety-limit");
   const review = page.getByRole("button", { name: "Review safety block", exact: true });
   await expect(review).toBeEnabled();
   await review.click();
@@ -316,7 +314,6 @@ test(`J09: ${theme} Soft Reset preserves the block and offers diagnostics`, asyn
   await expect(page.getByRole("heading", { name: "Rejected hardware points" })).toBeVisible();
   expect(errors).toEqual([]);
 });
-}
 
 test("J09: reviewing a safety block never enables saved profile Apply", async ({ page }) => {
   await openForge(page, "qualified");
@@ -327,9 +324,8 @@ test("J09: reviewing a safety block never enables saved profile Apply", async ({
   expect(await page.evaluate(() => window.__forgeTest.calls.some((m) => /^(Start|Resume|Apply)/.test(m)))).toBe(false);
 });
 
-for (const theme of ["command", "instrument", "workshop"]) {
-test(`J12: ${theme} shows single-run development authorization and its consumed state`, async ({ page }, testInfo) => {
-  await openForge(page, "ready", theme);
+test("J12: shows single-run development authorization and its consumed state", async ({ page }, testInfo) => {
+  await openForge(page);
   await page.evaluate(() => {
     window.__forgeTest.power.development_validation_note = "One development validation is authorized. Existing unsafe points remain excluded.";
   });
@@ -348,7 +344,6 @@ test(`J12: ${theme} shows single-run development authorization and its consumed 
   await page.screenshot({path:testInfo.outputPath("development-validation.png"),fullPage:true});
   expect(await page.evaluate(() => window.__forgeTest.calls.filter(m => /^(Authorize|Start|Resume|Apply)/.test(m)))).toEqual(["StartPowerSweep"]);
 });
-}
 
 test("J08: stopping and service loss never imply a qualified success", async ({ page }) => {
   await openForge(page);
@@ -433,48 +428,46 @@ test("Qualification: power limits and driver failures remain distinct from a ski
   await expect(lastDecision).toContainText("spent search budget is retained");
 });
 
-for (const theme of ["command", "instrument", "workshop"]) {
-  test(`Qualification: ${theme} shows bounded coverage and retains it on Resume`, async ({ page }, testInfo) => {
-    await openForge(page, "ready", theme);
-    await page.evaluate(() => {
-      Object.assign(window.__forgeTest.power, {
-        run_id: "bounded-test", running: false, phase: "paused", resume_available: true,
-        last_outcome: "BandClosedIntegrityError",
-        discovery_search: {
-          attempts_used: 7, attempts_limit: 24, elapsed_ms: 7_200_000, time_budget_ms: 28_800_000,
-          bands: [
-            { id: "performance", status: "closed", last_qualified_clock_mhz: 1890, last_qualified_voltage_mv: 900, stop_reason: "integrity_error_region_closed" },
-            { id: "balanced", status: "pending" },
-            { id: "efficiency", status: "pending" },
-          ],
-        },
-      });
+test("Qualification: shows bounded coverage and retains it on Resume", async ({ page }, testInfo) => {
+  await openForge(page);
+  await page.evaluate(() => {
+    Object.assign(window.__forgeTest.power, {
+      run_id: "bounded-test", running: false, phase: "paused", resume_available: true,
+      last_outcome: "BandClosedIntegrityError",
+      discovery_search: {
+        attempts_used: 7, attempts_limit: 24, elapsed_ms: 7_200_000, time_budget_ms: 28_800_000,
+        bands: [
+          { id: "performance", status: "closed", last_qualified_clock_mhz: 1890, last_qualified_voltage_mv: 900, stop_reason: "integrity_error_region_closed" },
+          { id: "balanced", status: "pending" },
+          { id: "efficiency", status: "pending" },
+        ],
+      },
     });
-    // Search coverage lives under Run details; the open state survives Resume and completion.
-    await page.getByText("Run details", { exact: true }).click();
-    const coverage = page.getByRole("region", { name: "Candidate search coverage" });
-    await expect(coverage).toContainText("7 / 24 candidate attempts");
-    await expect(coverage).toContainText("1 / 3 regions with a qualified candidate");
-    await expect(coverage).toContainText("Run budget: 8h 0m · used 2h 0m");
-    await expect(coverage).toContainText("Performance · Closed");
-    await expect(coverage).toContainText("Qualified: 1890 MHz @ 900 mV");
-    await expect(coverage).toContainText("An integrity error ended exploration of this region.");
-    await expect(coverage).toContainText("does not classify untested points as unstable");
-    await expect(page.getByRole("region", { name: "Forge paused" }).locator(".task-card.last")).toContainText("Region closed after an error");
-    await page.screenshot({ path: testInfo.outputPath("candidate-budget.png"), fullPage: true });
-    await page.getByRole("region", { name: "Forge paused" }).getByRole("button", { name: "Resume Forge", exact: true }).click();
-    await expect(page.getByRole("region", { name: "Forging your GPU" })).toBeVisible();
-    await expect(coverage).toContainText("7 / 24 candidate attempts");
-    await expect(coverage).toContainText("Performance · Closed");
-    expect(await page.evaluate(() => window.__forgeTest.calls.filter((m) => /^(Start|Resume|Apply)/.test(m)))).toEqual(["ResumePowerSweep"]);
-    await page.evaluate(() => {
-      Object.assign(window.__forgeTest.power, { running: false, phase: "finished", last_outcome: "SearchBudgetExhausted" });
-      window.__forgeTest.power.discovery_search.stop_reason = "attempt_budget_exhausted";
-    });
-    await expect(coverage).toContainText("Search ended: Candidate attempt budget reached.");
-    await expect(coverage).not.toContainText("attempt_budget_exhausted");
   });
-}
+  // Search coverage lives under Run details; the open state survives Resume and completion.
+  await page.getByText("Run details", { exact: true }).click();
+  const coverage = page.getByRole("region", { name: "Candidate search coverage" });
+  await expect(coverage).toContainText("7 / 24 candidate attempts");
+  await expect(coverage).toContainText("1 / 3 regions with a qualified candidate");
+  await expect(coverage).toContainText("Run budget: 8h 0m · used 2h 0m");
+  await expect(coverage).toContainText("Performance · Closed");
+  await expect(coverage).toContainText("Qualified: 1890 MHz @ 900 mV");
+  await expect(coverage).toContainText("An integrity error ended exploration of this region.");
+  await expect(coverage).toContainText("does not classify untested points as unstable");
+  await expect(page.getByRole("region", { name: "Forge paused" }).locator(".task-card.last")).toContainText("Region closed after an error");
+  await page.screenshot({ path: testInfo.outputPath("candidate-budget.png"), fullPage: true });
+  await page.getByRole("region", { name: "Forge paused" }).getByRole("button", { name: "Resume Forge", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Forging your GPU" })).toBeVisible();
+  await expect(coverage).toContainText("7 / 24 candidate attempts");
+  await expect(coverage).toContainText("Performance · Closed");
+  expect(await page.evaluate(() => window.__forgeTest.calls.filter((m) => /^(Start|Resume|Apply)/.test(m)))).toEqual(["ResumePowerSweep"]);
+  await page.evaluate(() => {
+    Object.assign(window.__forgeTest.power, { running: false, phase: "finished", last_outcome: "SearchBudgetExhausted" });
+    window.__forgeTest.power.discovery_search.stop_reason = "attempt_budget_exhausted";
+  });
+  await expect(coverage).toContainText("Search ended: Candidate attempt budget reached.");
+  await expect(coverage).not.toContainText("attempt_budget_exhausted");
+});
 
 test("Qualification: economics wait for top and missing evidence does not claim a boundary", async ({ page }) => {
   await openForge(page, "ready");
@@ -645,13 +638,13 @@ test("Sentinel: the GPU check is off by default and is switched in Settings", as
   expect(await page.evaluate(() => window.__forgeTest.calls.some((m) => /^(Start|Resume|Apply)/.test(m)))).toBe(false);
 });
 
-for (const theme of ["command", "instrument", "workshop"]) test(`Sentinel: a recorded problem asks for the GPU check and one click turns it on (${theme})`, async ({ page }, testInfo) => {
-  await openForge(page, "ready", theme);
+test("Sentinel: a recorded problem asks for the GPU check and one click turns it on", async ({ page }, testInfo) => {
+  await openForge(page);
   const advice = "Sentinel recorded a problem. Turn on the GPU check to analyse the applied profile.";
   await page.evaluate((text) => { window.__forgeTest.power.sentinel_advice = text; }, advice);
   await expect(page.getByText(advice)).toBeVisible();
   await page.getByText(advice).scrollIntoViewIfNeeded();
-  await page.screenshot({ path: testInfo.outputPath(`sentinel-advice-${theme}.png`) });
+  await page.screenshot({ path: testInfo.outputPath("sentinel-advice.png") });
   await page.getByRole("button", { name: "Turn on the GPU check" }).click();
   await expect(page.getByText(advice)).toHaveCount(0);
   expect(await page.evaluate(() => window.__forgeTest.sentinelRequests)).toEqual([true]);

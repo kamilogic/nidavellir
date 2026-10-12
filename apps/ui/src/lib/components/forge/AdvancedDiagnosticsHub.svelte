@@ -18,7 +18,6 @@
   import LogTerminal from "./LogTerminal.svelte";
 
   let {
-    theme = "command",
     embedded = false,
     powerSweep = null,
     logLines = [],
@@ -214,7 +213,7 @@
   }
 </script>
 
-<section class={`advanced-hub ${theme}`} class:embedded aria-labelledby="advanced-diagnostics-title">
+<section class="advanced-hub" class:embedded aria-labelledby="advanced-diagnostics-title">
   <header class="hub-header">
     <div>
       <span class="eyebrow">Technical workspace</span>
@@ -814,18 +813,7 @@
     text-rendering: optimizeLegibility;
   }
 
-  .advanced-hub.instrument {
-    font-family: "Bahnschrift", "Arial Narrow", sans-serif;
-    border-inline: 1px solid var(--forge-line);
-  }
-
-  .advanced-hub.workshop {
-    width: min(1320px, calc(100% - 4.5rem));
-    box-shadow: none;
-  }
-
-  .advanced-hub.embedded,
-  .advanced-hub.workshop.embedded {
+  .advanced-hub.embedded {
     width: 100%;
     min-height: 0;
     margin: 0;
@@ -834,21 +822,8 @@
     box-shadow: none;
   }
 
-  .advanced-hub.instrument.embedded {
-    border-inline: 0;
-  }
-
-  .advanced-hub.command.embedded .hub-header {
+  .advanced-hub.embedded .hub-header {
     border-left: 2px solid var(--forge-gold);
-  }
-
-  .advanced-hub.instrument.embedded .hub-header {
-    border: 1px solid var(--forge-line-strong);
-    background: color-mix(in srgb, var(--forge-panel) 48%, transparent);
-  }
-
-  .advanced-hub.workshop.embedded .hub-header {
-    padding-inline: 0;
   }
 
   .hub-header,
@@ -1074,23 +1049,13 @@
     border-radius: 50%;
   }
 
-  .state-readout.bump,
   .trace-note.recording {
     color: var(--forge-gold);
   }
 
-  .state-readout.bump i,
   .trace-note.recording i {
     background: currentColor;
     box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 14%, transparent);
-  }
-
-  .state-readout.stock {
-    color: var(--diag-danger);
-  }
-
-  .state-readout.stock i {
-    background: currentColor;
   }
 
   .sentinel-readout,
@@ -1221,14 +1186,6 @@
     letter-spacing: 0.06em;
     text-transform: uppercase;
     box-shadow: inset 0 0 0 1px rgba(197, 138, 81, 0.3);
-  }
-
-  .severity.rigid,
-  .severity.critical,
-  .severity.hard {
-    color: #ef9a8c;
-    background: rgba(215, 120, 104, 0.12);
-    box-shadow: inset 0 0 0 1px rgba(215, 120, 104, 0.34);
   }
 
   .rehabilitated-label {
@@ -1959,13 +1916,11 @@
   }
 
   @media (max-width: 780px) {
-    .advanced-hub,
-    .advanced-hub.workshop {
+    .advanced-hub {
       width: calc(100% - 1.5rem);
     }
 
-    .advanced-hub.embedded,
-    .advanced-hub.workshop.embedded {
+    .advanced-hub.embedded {
       width: 100%;
     }
 

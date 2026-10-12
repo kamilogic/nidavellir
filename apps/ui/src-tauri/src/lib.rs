@@ -8,11 +8,6 @@ async fn service_request(method: String, params: Option<Value>) -> Result<Value,
     ipc_client::call_service_with_params(&method, params).await
 }
 
-#[tauri::command]
-async fn service_ping() -> Result<Value, String> {
-    ipc_client::call_service_with_params("Ping", None).await
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if !program::claim_single_instance() {
@@ -23,7 +18,6 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             service_request,
-            service_ping,
             program::get_window_settings,
             program::set_window_settings,
             program::exit_program,

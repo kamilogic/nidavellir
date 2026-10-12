@@ -1,11 +1,8 @@
 <script>
   import Onboarding from "./lib/views/Onboarding.svelte";
-  import Dashboard from "./lib/views/Dashboard.svelte";
-  import SafeLoop from "./lib/views/SafeLoop.svelte";
   import Forge from "./lib/views/Forge.svelte";
   import TrayBridge from "./lib/components/forge/TrayBridge.svelte";
   import WhatsNew from "./lib/components/forge/WhatsNew.svelte";
-  import { t, locale, locales } from "./lib/i18n.js";
   import "./lib/theme.css";
 
   function initialOnboarded() {
@@ -17,81 +14,23 @@
     }
   }
 
-  function initialTheme() {
-    try {
-      const saved = localStorage.getItem("nidavellir-ui-theme");
-      return ["command", "instrument", "workshop"].includes(saved) ? saved : "command";
-    } catch {
-      return "command";
-    }
-  }
-
   let onboarded = $state(initialOnboarded());
-  let activeTab = $state("forge");
-  let uiTheme = $state(initialTheme());
 
   function finishOnboarding(_goal) {
     onboarded = true;
-    activeTab = "forge";
     try {
       localStorage.setItem("nidavellir-gpu-onboarded", "true");
     } catch {}
   }
-
-  function setTheme(event) {
-    applyTheme(event.currentTarget.value);
-  }
-
-  function applyTheme(nextTheme) {
-    uiTheme = nextTheme;
-    try {
-      localStorage.setItem("nidavellir-ui-theme", uiTheme);
-    } catch {}
-  }
 </script>
 
-<main data-ui-theme={uiTheme} class:forge-shell={onboarded && activeTab === "forge"} class:welcome-shell={!onboarded}>
+<main>
   <TrayBridge />
   <WhatsNew />
-  {#if onboarded && activeTab !== "forge"}
-    <header class="top">
-      <div>
-        <h1>Nidavellir</h1>
-        <p class="tagline">{$t("app.tagline")}</p>
-      </div>
-      <div class="top-right">
-        {#if onboarded}
-          <nav>
-            <button class:active={activeTab === "forge"} onclick={() => (activeTab = "forge")}>{$t("nav.forge")}</button>
-            <button class:active={activeTab === "dashboard"} onclick={() => (activeTab = "dashboard")}>{$t("nav.sensors")}</button>
-            <button class:active={activeTab === "safety"} onclick={() => (activeTab = "safety")}>{$t("nav.safety")}</button>
-          </nav>
-        {/if}
-        {#if locales.length > 1}
-          <select class="lang" bind:value={$locale} aria-label="Language">
-            {#each locales as l}<option value={l.id}>{l.label}</option>{/each}
-          </select>
-        {/if}
-        <label class="theme-picker">
-          <span>Theme</span>
-          <select value={uiTheme} onchange={setTheme} aria-label="Interface theme">
-            <option value="command">Command Deck</option>
-            <option value="instrument">Instrument Panel</option>
-            <option value="workshop">Quiet Workshop</option>
-          </select>
-        </label>
-      </div>
-    </header>
-  {/if}
-
   {#if !onboarded}
     <Onboarding onComplete={finishOnboarding} />
-  {:else if activeTab === "forge"}
-    <Forge theme={uiTheme} onThemeChange={applyTheme} />
-  {:else if activeTab === "dashboard"}
-    <Dashboard />
   {:else}
-    <SafeLoop />
+    <Forge />
   {/if}
 </main>
 
@@ -188,124 +127,8 @@
   }
 
   main {
-    width: min(calc(100vw - 3rem), 1200px);
-    margin: 0 auto;
-    padding: 1.4rem 0 2.25rem;
-  }
-
-  .top {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 1rem;
-    margin-bottom: 1.1rem;
-    border-bottom: 1px solid var(--nord-border);
-    padding-bottom: 0.9rem;
-  }
-
-  h1 {
-    margin: 0;
-    font-size: 1.7rem;
-    font-weight: 800;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: var(--nord-silver);
-    text-shadow: 0 1px 0 rgba(0, 0, 0, 0.65);
-  }
-
-  .tagline {
-    margin: 0.5rem 0 0;
-    color: var(--nord-frost-dim);
-    font-size: 0.92rem;
-    font-style: italic;
-    letter-spacing: 0.01em;
-  }
-
-  .top-right {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-  }
-  .lang {
-    background: var(--forge-panel-raised);
-    color: var(--nord-mist);
-    border: none;
-    border-radius: 999px;
-    padding: 0.45rem 0.6rem;
-    font-size: 0.8rem;
-    font-weight: 600;
-    cursor: pointer;
-  }
-
-  main.forge-shell,
-  main.welcome-shell {
     width: 100%;
-    max-width: none;
     margin: 0;
     padding: 0;
-  }
-  .theme-picker {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.42rem;
-    min-height: 2.5rem;
-    color: var(--nord-dim);
-    font-size: 0.68rem;
-    font-weight: 800;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-  .theme-picker select {
-    min-height: 2.5rem;
-    border: 0;
-    border-radius: 999px;
-    padding: 0.45rem 0.7rem;
-    background: var(--forge-panel-raised);
-    color: var(--nord-mist);
-    font: inherit;
-    letter-spacing: 0.02em;
-    text-transform: none;
-    cursor: pointer;
-  }
-  nav {
-    display: flex;
-    gap: 0.4rem;
-  }
-
-  nav button {
-    background: var(--forge-panel-raised);
-    color: var(--nord-mist);
-    border: none;
-    border-radius: 999px;
-    padding: 0.5rem 1.05rem;
-    cursor: pointer;
-    font-weight: 600;
-    font-size: 0.8rem;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-  }
-
-  nav button:hover {
-    color: var(--nord-silver);
-  }
-
-  nav button.active {
-    color: var(--forge-ink);
-    background: var(--forge-gold);
-    font-weight: 700;
-  }
-  @media (max-width: 760px) {
-    main {
-      width: min(calc(100vw - 1.5rem), 1200px);
-      padding-top: 1rem;
-    }
-    .top {
-      flex-direction: column;
-    }
-    .top-right {
-      justify-content: flex-start;
-    }
   }
 </style>

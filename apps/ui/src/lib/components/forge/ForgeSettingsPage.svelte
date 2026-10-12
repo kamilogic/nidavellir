@@ -2,12 +2,12 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { AppWindow, Check, Languages, Palette, RefreshCw, Settings, ShieldCheck } from "@lucide/svelte";
+  import { AppWindow, Check, Languages, RefreshCw, Settings, ShieldCheck } from "@lucide/svelte";
   import { locale } from "../../i18n.js";
   import { serviceCall } from "../../service.js";
   import { checkForUpdate, requestUpdate, updateHold, updateState } from "../../updates.js";
 
-  let { theme = "command", onThemeChange, powerSweep = null, serviceReady = false } = $props();
+  let { powerSweep = null, serviceReady = false } = $props();
 
   let sentinelOverride = $state(null);
   let sentinelSaving = $state(false);
@@ -49,11 +49,6 @@
     error: `Could not check for updates: ${$updateState.error}`,
   }[$updateState.status]);
 
-  const themes = [
-    { id: "command", name: "Command Deck", description: "Wide control surface" },
-    { id: "instrument", name: "Instrument Panel", description: "Industrial side rail" },
-    { id: "workshop", name: "Quiet Workshop", description: "Focused daily view" },
-  ];
 
   const windowOptions = [
     { key: "startWithWindows", name: "Start with Windows", description: "Opens in the tray when you sign in and applies your selected profile." },
@@ -79,12 +74,6 @@
     }
   }
 
-  function selectTheme(nextTheme) {
-    onThemeChange?.(nextTheme);
-    requestAnimationFrame(() => {
-      document.querySelector(`[data-theme-option="${nextTheme}"]`)?.focus();
-    });
-  }
 
   onMount(() => {
     let active = true;
@@ -111,7 +100,7 @@
   });
 </script>
 
-<section class={`forge-settings ${theme}`} aria-labelledby="forge-settings-title">
+<section class="forge-settings" aria-labelledby="forge-settings-title">
   <header class="settings-heading">
     <span class="settings-kicker">INTERFACE</span>
     <div class="settings-title">
@@ -124,31 +113,6 @@
   </header>
 
   <div class="settings-list">
-    <section class="settings-row" aria-labelledby="theme-setting-title">
-      <div class="setting-label">
-        <Palette size={23} strokeWidth={1.6} />
-        <div>
-          <h2 id="theme-setting-title">Interface theme</h2>
-          <p>Choose the layout that best fits how you use Nidavellir.</p>
-        </div>
-      </div>
-
-      <div class="theme-options" role="group" aria-label="Interface theme">
-        {#each themes as option, index}
-          <button
-            type="button"
-            class:active={theme === option.id}
-            aria-pressed={theme === option.id}
-            data-theme-option={option.id}
-            onclick={() => selectTheme(option.id)}
-          >
-            <span class="choice-index">0{index + 1}</span>
-            <span class="choice-copy"><strong>{option.name}</strong><small>{option.description}</small></span>
-            <span class="choice-check" aria-hidden="true"><Check size={17} strokeWidth={2} /></span>
-          </button>
-        {/each}
-      </div>
-    </section>
 
     <section class="settings-row" aria-labelledby="language-setting-title">
       <div class="setting-label">
@@ -290,23 +254,6 @@
     color: var(--settings-text);
   }
 
-  .forge-settings.instrument {
-    --settings-accent: #d3b478;
-    --settings-accent-soft: rgba(211, 180, 120, 0.09);
-    --settings-line: rgba(119, 125, 122, 0.42);
-    --settings-text: #d9dad8;
-    --settings-muted: #929795;
-    font-family: Bahnschrift, "Arial Narrow", "Segoe UI", sans-serif;
-  }
-
-  .forge-settings.workshop {
-    --settings-accent: #d29063;
-    --settings-accent-soft: rgba(210, 144, 99, 0.08);
-    --settings-line: rgba(100, 105, 104, 0.42);
-    --settings-text: #eeece8;
-    --settings-muted: #929795;
-  }
-
   .settings-heading {
     border-bottom: 1px solid var(--settings-line);
     padding: 12px 0 34px;
@@ -346,14 +293,6 @@
     letter-spacing: -0.025em;
     line-height: 1.05;
     text-wrap: balance;
-  }
-
-  .instrument h1 {
-    font-family: "Bahnschrift Condensed", "Arial Narrow", Bahnschrift, sans-serif;
-    font-size: clamp(36px, 5vw, 50px);
-    font-weight: 700;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
   }
 
   .settings-title p {
@@ -400,13 +339,6 @@
     line-height: 1.3;
   }
 
-  .instrument .setting-label h2 {
-    font-family: "Bahnschrift Condensed", "Arial Narrow", Bahnschrift, sans-serif;
-    font-size: 19px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-
   .setting-label p,
   .setting-note,
   .update-status p {
@@ -416,22 +348,16 @@
     line-height: 1.55;
   }
 
-  .theme-options,
   .language-options {
     display: grid;
     overflow: hidden;
     border: 1px solid var(--settings-line);
   }
 
-  .theme-options {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
   .language-options {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .theme-options button,
   .language-options button {
     display: grid;
     min-width: 0;
@@ -452,34 +378,25 @@
       transform 100ms ease;
   }
 
-  .theme-options button {
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    min-height: 108px;
-  }
-
   .language-options button {
     grid-template-columns: minmax(0, 1fr) auto;
   }
 
-  .theme-options button:first-child,
   .language-options button:first-child {
     border-left: 0;
   }
 
-  .theme-options button:hover:not(:disabled),
   .language-options button:hover:not(:disabled) {
     background: var(--settings-accent-soft);
     color: var(--settings-text);
   }
 
-  .theme-options button.active,
   .language-options button.active {
     background: var(--settings-accent-soft);
     color: var(--settings-text);
     box-shadow: inset 0 -2px 0 var(--settings-accent);
   }
 
-  .theme-options button:focus-visible,
   .language-options button:focus-visible {
     position: relative;
     z-index: 1;
@@ -487,25 +404,15 @@
     outline-offset: -3px;
   }
 
-  .theme-options button:active:not(:disabled),
   .language-options button:active:not(:disabled) {
     transform: scale(0.96);
   }
 
-  .theme-options button:disabled,
   .language-options button:disabled {
     cursor: not-allowed;
     opacity: 0.5;
   }
 
-  .choice-index {
-    color: var(--settings-accent);
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-  }
-
-  .choice-copy,
   .language-options button > span:first-child {
     display: flex;
     min-width: 0;
@@ -513,7 +420,6 @@
     gap: 5px;
   }
 
-  .choice-copy strong,
   .language-options strong {
     color: inherit;
     font-size: 14px;
@@ -521,7 +427,6 @@
     line-height: 1.25;
   }
 
-  .choice-copy small,
   .language-options small {
     color: var(--settings-muted);
     font-size: 11px;
@@ -719,18 +624,15 @@
       gap: 12px;
     }
 
-    .theme-options,
     .language-options {
       grid-template-columns: 1fr;
     }
 
-    .theme-options button,
     .language-options button {
       border-top: 1px solid var(--settings-line);
       border-left: 0;
     }
 
-    .theme-options button:first-child,
     .language-options button:first-child {
       border-top: 0;
     }
@@ -743,7 +645,6 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .theme-options button,
     .language-options button,
     .toggle-row input,
     .toggle-row input::after {

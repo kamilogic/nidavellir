@@ -11,8 +11,6 @@
   import { updateHold } from "../updates.js";
   import { windowVisible } from "../visibility.js";
 
-  let { theme = "command", onThemeChange } = $props();
-
   let error = $state(null);
   let serviceStatus = $state("connecting");
   let serviceError = $state(null);
@@ -738,9 +736,8 @@
 </script>
 
 <StartupScreen visible={booting} steps={startupSteps} />
-<section class={`forge theme-${theme}`} inert={booting}>
+<section class="forge" inert={booting}>
   <ForgeThemeScreen
-    {theme}
     {hardware}
     gpu={primarySensorGpu}
     {sparks}
@@ -761,7 +758,6 @@
     {exportFailed}
     onExportLog={exportLog}
     onViewSafetyHistory={() => { diagnosticsTab = "sentinel"; changeView("advanced"); }}
-    {onThemeChange}
     onForgeModeChange={selectForgeMode}
     onStartPower={startPower}
     onRecoverContinue={recoverAndStartPower}
@@ -778,7 +774,6 @@
   >
     <AdvancedDiagnosticsHub
       bind:activeTab={diagnosticsTab}
-      {theme}
       embedded
       {powerSweep}
       {logLines}
