@@ -153,11 +153,6 @@ pub fn run_service() -> windows_service::Result<()> {
         // Only the board is needed here; the full probe spawns PowerShell (~2 s) on every start.
         motherboard: nidavellir_core::detector::detect_motherboard(),
         safe_store: safe_store.clone(),
-        gpu_validation: crate::gpu_real::GpuValidationHandle::default(),
-        real_sweep: crate::gpu_sweep_real::RealSweepHandle::default(),
-        mem_sweep: crate::gpu_mem_sweep::MemSweepHandle::default(),
-        forge_all: crate::gpu_forge_all::ForgeAllHandle::default(),
-        benchmark: crate::gpu_benchmark::BenchmarkHandle::default(),
         // Seed from the persisted forge result so a restart restores forged
         // profiles/points instead of showing an unforged GPU.
         power_sweep: crate::gpu_power_sweep::restore_handle(),

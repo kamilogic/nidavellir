@@ -1,10 +1,9 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::capability::CapabilityReport;
 use crate::condemnation::CondemnationEvent;
 use crate::detector::HardwareInfo;
-use crate::gpu_sweep::{GpuSweepProgress, StabilityResult, SweepPhase, VfPoint};
+use crate::gpu_sweep::VfPoint;
 use crate::safe_loop::{BlacklistRegion, CrashClass, ForgeIncident, SafeLoopState, TuningPoint};
 use crate::sensors::SensorReadings;
 
@@ -33,41 +32,17 @@ pub enum IpcRequest {
     /// Development console only: authorize one fresh Standard validation while preserving all
     /// negative evidence. The service must opt in; authorization never starts a workload.
     AuthorizeDevelopmentValidation { reason: String },
-    GetGpuCurve,
-    StartGpuValidation,
-    GetGpuValidation,
-    StartRealSweep,
-    StartRealSweepFast,
-    StopRealSweep,
-    GetRealSweepProgress,
-    StartMemSweep,
-    StopMemSweep,
-    GetMemSweepProgress,
-    ApplyGodforge,
-    ApplyBrokkrs,
-    ApplyDeepCalm,
-    ApplyMemPeak,
     ResetGpuTuning,
     /// Returns to stock and clears all saved GPU learning, including negative history and archives.
     ResetGpuTuningFull,
     /// Returns to stock and clears positive learning/checkpoints, preserving known failures.
     ResetGpuTuningSoft,
     GetAppliedProfile,
-    VerifyAppliedProfile,
-    StartForgeAll,
-    StopForgeAll,
-    GetForgeAllProgress,
-    StartBenchmark,
-    StopBenchmark,
-    GetBenchmarkProgress,
     StartPowerSweep,
     /// Clean-run variant of `StartPowerSweep`: uses the Standard dwell policy while rebuilding
     /// positive discovery/profile evidence. Effective Safe Loop blacklist, Rigid/Quarantine ledger
     /// entries and the persistent TDR cone remain global and active before every candidate write.
     StartPowerSweepClean,
-    /// Deprecated wire alias retained for mixed-version clients; service executes Standard and
-    /// never restores the former provisional Fast behavior.
-    StartPowerSweepFast,
     /// High-confidence variant of `StartPowerSweep`: the same complete F2 frontier with longer
     /// dwells and independent repeated validations. Additive.
     StartPowerSweepLong,
@@ -618,41 +593,6 @@ pub struct PowerSweepProgress {
     pub next_task_estimated_duration_ms: Option<u64>,
 }
 
-/// One benchmark run's measured metrics (stock or tuned).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BenchSnapshot {
-    pub fps: f64,
-    pub bandwidth_gbps: f64,
-    pub avg_clock_mhz: u32,
-    pub avg_power_w: f32,
-    pub max_temp_c: f32,
-    /// Performance per watt (FPS ÷ average watts).
-    pub perf_per_watt: f64,
-    /// Fraction of samples (0–1) where the card was power-capped (SW_POWER_CAP).
-    pub power_capped_frac: f32,
-}
-
-/// Before/after benchmark progress + report (stock vs applied profile).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BenchmarkProgress {
-    pub running: bool,
-    pub phase: String,
-    pub log: Vec<String>,
-    pub stock: Option<BenchSnapshot>,
-    pub tuned: Option<BenchSnapshot>,
-    pub power_limit_w: f32,
-    pub note: Option<String>,
-}
-
-/// Live status of the full auto pipeline (VRAM gate → core → memory → soak).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ForgeAllProgress {
-    pub running: bool,
-    pub phase: String,
-    pub log: Vec<String>,
-    pub note: Option<String>,
-}
-
 /// The GPU profile currently applied/persisted, plus the last action's message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuApplyStatus {
@@ -810,75 +750,6 @@ pub struct ApplyVerificationStatus {
     pub diagnostic_message: Option<String>,
 }
 
-/// One step of the memory sweep: a clock offset with its measured effective
-/// bandwidth and integrity verdict.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemSweepPoint {
-    pub offset_mhz: i32,
-    pub mem_mhz: u32,
-    pub bandwidth_gbps: f32,
-    #[serde(default)]
-    pub min_gbps: f32,
-    pub stable: bool,
-}
-
-/// Memory sweep that finds the GDDR6 effective-bandwidth peak (not max clock).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemSweepProgress {
-    pub phase: SweepPhase,
-    pub running: bool,
-    pub current_offset_mhz: i32,
-    pub current_mem_mhz: u32,
-    pub current_gbps: f32,
-    pub baseline_gbps: f32,
-    pub points: Vec<MemSweepPoint>,
-    pub peak_offset_mhz: i32,
-    pub peak_gbps: f32,
-    #[serde(default)]
-    pub validation_note: Option<String>,
-}
-
-/// The live V/F curve read from the GPU via NVAPI (the same data Afterburner's
-/// curve editor shows). `plateau` is where a flat-curve undervolt has locked
-/// the top clock.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GpuCurveSnapshot {
-    pub name: String,
-    pub points: Vec<VfPoint>,
-    pub plateau: Option<VfPoint>,
-    /// True when read from real hardware (vs unavailable/simulated).
-    pub real: bool,
-    /// True when the modern per-point V/F curve API (Afterburner-style elastic
-    /// ceiling) is usable on this GPU + driver — drives UI messaging.
-    #[serde(default)]
-    pub vf_curve_supported: bool,
-}
-
-/// One completed stage of the validation battery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GpuStageResult {
-    pub name: String,
-    pub result: StabilityResult,
-    pub mismatches: u32,
-    pub elapsed_ms: u64,
-}
-
-/// Live status of the real GPU compute-validation battery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GpuValidationStatus {
-    pub running: bool,
-    /// Name of the stage currently running (when `running`).
-    pub current_stage: Option<String>,
-    pub stage_index: u32,
-    pub total_stages: u32,
-    /// Stages completed so far.
-    pub stages: Vec<GpuStageResult>,
-    /// Overall verdict once finished (worst of all stages).
-    pub result: Option<StabilityResult>,
-    pub adapter: Option<String>,
-    pub error: Option<String>,
-}
-
 /// Read-only snapshot of the Safe Loop for the UI's "Segurança" view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafeLoopStatus {
@@ -929,14 +800,7 @@ pub enum ResponseData {
     Capability(CapabilityReport),
     DriverStatus(DriverStatusPayload),
     SafeLoop(SafeLoopStatus),
-    GpuSweep(GpuSweepProgress),
-    GpuCurve(GpuCurveSnapshot),
-    GpuValidation(GpuValidationStatus),
-    MemSweep(MemSweepProgress),
     GpuApply(GpuApplyStatus),
-    ApplyVerification(ApplyVerificationStatus),
-    ForgeAll(ForgeAllProgress),
-    Benchmark(BenchmarkProgress),
     PowerSweep(PowerSweepProgress),
     ForgeLogExport(ForgeLogExport),
     /// Raw JSON of the sentinel's last action (None = no sentinel event ever recorded).
@@ -980,10 +844,6 @@ pub fn parse_request(line: &str) -> Result<IpcRequest, String> {
 
 pub fn serialize_response(response: &IpcResponse) -> Result<String, String> {
     serde_json::to_string(response).map_err(|e| format!("Failed to serialize response: {e}"))
-}
-
-pub fn response_to_value(response: &IpcResponse) -> Value {
-    serde_json::to_value(response).unwrap_or(Value::Null)
 }
 
 #[cfg(test)]

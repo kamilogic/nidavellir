@@ -297,113 +297,6 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                 Err(e) => IpcResponse::failure(e),
             }
         }
-        IpcRequest::GetGpuCurve => IpcResponse::success(ResponseData::GpuCurve(
-            crate::gpu_real::read_curve_snapshot(),
-        )),
-        IpcRequest::StartGpuValidation => {
-            if guard.gpu_validation.start() {
-                IpcResponse::success(ResponseData::GpuValidation(guard.gpu_validation.status()))
-            } else {
-                IpcResponse::failure("GPU validation already running")
-            }
-        }
-        IpcRequest::GetGpuValidation => {
-            IpcResponse::success(ResponseData::GpuValidation(guard.gpu_validation.status()))
-        }
-        IpcRequest::StartRealSweep => {
-            let store = guard.safe_store.clone();
-            if guard
-                .real_sweep
-                .start(store, crate::gpu_sweep_real::Quality::thorough())
-            {
-                IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
-            } else {
-                IpcResponse::failure("Real sweep already running")
-            }
-        }
-        IpcRequest::StartRealSweepFast => {
-            let store = guard.safe_store.clone();
-            if guard
-                .real_sweep
-                .start(store, crate::gpu_sweep_real::Quality::fast())
-            {
-                IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
-            } else {
-                IpcResponse::failure("Real sweep already running")
-            }
-        }
-        IpcRequest::StopRealSweep => {
-            guard.real_sweep.stop();
-            IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
-        }
-        IpcRequest::GetRealSweepProgress => {
-            IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
-        }
-        IpcRequest::StartMemSweep => {
-            let store = guard.safe_store.clone();
-            if guard.mem_sweep.start(store) {
-                IpcResponse::success(ResponseData::MemSweep(guard.mem_sweep.progress()))
-            } else {
-                IpcResponse::failure("Memory sweep already running")
-            }
-        }
-        IpcRequest::StopMemSweep => {
-            guard.mem_sweep.stop();
-            IpcResponse::success(ResponseData::MemSweep(guard.mem_sweep.progress()))
-        }
-        IpcRequest::GetMemSweepProgress => {
-            IpcResponse::success(ResponseData::MemSweep(guard.mem_sweep.progress()))
-        }
-        IpcRequest::ApplyGodforge | IpcRequest::ApplyBrokkrs | IpcRequest::ApplyDeepCalm => {
-            let profiles = guard.real_sweep.progress().profiles;
-            let chosen = profiles.as_ref().map(|p| match &request {
-                IpcRequest::ApplyBrokkrs => (&p.brokkrs_best.name, p.brokkrs_best.point),
-                IpcRequest::ApplyDeepCalm => (&p.deep_calm.name, p.deep_calm.point),
-                _ => (&p.godforge.name, p.godforge.point),
-            });
-            match chosen {
-                Some((name, point)) => {
-                    let mut ap = match crate::gpu_apply::load_applied_checked() {
-                        Ok(profile) => profile.unwrap_or_default(),
-                        Err(error) => return IpcResponse::failure(error),
-                    };
-                    ap.label = name.clone();
-                    ap.core = Some(point);
-                    gpu_apply_result_response(
-                        crate::gpu_apply::apply_and_persist(
-                            ap.label.clone(),
-                            ap.core,
-                            ap.mem_offset_mhz,
-                            &guard.safe_store,
-                        ),
-                        format!(
-                            "Applied {} ({} MHz @ {} mV)",
-                            name, point.freq_mhz, point.voltage_mv
-                        ),
-                    )
-                }
-                None => IpcResponse::failure("Run the core sweep first"),
-            }
-        }
-        IpcRequest::ApplyMemPeak => {
-            let peak = guard.mem_sweep.progress().peak_offset_mhz;
-            if peak <= 0 {
-                IpcResponse::failure("Run the memory sweep first")
-            } else {
-                let mut ap = match crate::gpu_apply::load_applied_checked() {
-                    Ok(profile) => profile.unwrap_or_default(),
-                    Err(error) => return IpcResponse::failure(error),
-                };
-                ap.mem_offset_mhz = Some(peak);
-                if ap.label.is_empty() {
-                    ap.label = "Custom".into();
-                }
-                gpu_apply_result_response(
-                    crate::gpu_apply::apply_with_memory_offset(ap, peak, &guard.safe_store),
-                    format!("Applied memory +{peak} MHz"),
-                )
-            }
-        }
         IpcRequest::ResetGpuTuning => {
             crate::development_validation::finish("stock reset requested", None);
             // Reset is the emergency recovery path after a TDR/interrupted forge. It must remain
@@ -511,43 +404,6 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetAppliedProfile => {
             IpcResponse::success(ResponseData::GpuApply(applied_status(String::new())))
         }
-        IpcRequest::VerifyAppliedProfile => {
-            // Read-only: classifies the live modern VF curve vs the applied profile.
-            // Never applies, reapplies, or mutates GPU state.
-            IpcResponse::success(ResponseData::ApplyVerification(
-                crate::gpu_verify::verify_applied_curve(),
-            ))
-        }
-        IpcRequest::StartForgeAll => {
-            let store = guard.safe_store.clone();
-            if guard.forge_all.start(store) {
-                IpcResponse::success(ResponseData::ForgeAll(guard.forge_all.progress()))
-            } else {
-                IpcResponse::failure("Forge-all already running")
-            }
-        }
-        IpcRequest::StopForgeAll => {
-            guard.forge_all.stop();
-            IpcResponse::success(ResponseData::ForgeAll(guard.forge_all.progress()))
-        }
-        IpcRequest::GetForgeAllProgress => {
-            IpcResponse::success(ResponseData::ForgeAll(guard.forge_all.progress()))
-        }
-        IpcRequest::StartBenchmark => {
-            let store = guard.safe_store.clone();
-            if guard.benchmark.start(store) {
-                IpcResponse::success(ResponseData::Benchmark(guard.benchmark.progress()))
-            } else {
-                IpcResponse::failure("Benchmark already running")
-            }
-        }
-        IpcRequest::StopBenchmark => {
-            guard.benchmark.stop();
-            IpcResponse::success(ResponseData::Benchmark(guard.benchmark.progress()))
-        }
-        IpcRequest::GetBenchmarkProgress => {
-            IpcResponse::success(ResponseData::Benchmark(guard.benchmark.progress()))
-        }
         IpcRequest::StartPowerSweep => {
             let store = guard.safe_store.clone();
             match guard.power_sweep.start(store) {
@@ -558,18 +414,6 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::StartPowerSweepClean => {
             let store = guard.safe_store.clone();
             match guard.power_sweep.start_clean_run(store) {
-                Ok(()) => IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress())),
-                Err(error) => IpcResponse::failure(error),
-            }
-        }
-        IpcRequest::StartPowerSweepFast => {
-            // Backward-compatible wire alias only. Fast no longer exists as a Forge behavior;
-            // an older UI therefore receives the same bounded, fully qualified Standard run.
-            let store = guard.safe_store.clone();
-            match guard
-                .power_sweep
-                .start_with_mode(store, crate::gpu_power_sweep::PowerSweepMode::Standard)
-            {
                 Ok(()) => IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress())),
                 Err(error) => IpcResponse::failure(error),
             }
@@ -721,12 +565,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
 }
 
 pub(crate) fn gpu_operation_running(state: &AppState) -> bool {
-    state.gpu_validation.is_running()
-        || state.real_sweep.is_running()
-        || state.mem_sweep.is_running()
-        || state.forge_all.is_running()
-        || state.benchmark.is_running()
-        || crate::gpu_power_sweep::FORGE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+    crate::gpu_power_sweep::FORGE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
         || state.manual_point.status().active
         || state.detector_lab.running()
 }
@@ -735,32 +574,12 @@ const RESET_QUIESCENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const RESET_QUIESCENCE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 pub(crate) fn request_mutating_worker_stop(state: &mut AppState, pause_forge: bool) {
-    state.gpu_validation.stop();
-    state.real_sweep.stop();
-    state.mem_sweep.stop();
-    state.forge_all.stop();
-    state.benchmark.stop();
     if pause_forge { state.power_sweep.stop(); } else { state.power_sweep.abort(); }
     state.detector_lab.stop();
 }
 
 fn mutating_worker_names(state: &AppState) -> Vec<&'static str> {
     let mut running = Vec::new();
-    if state.gpu_validation.is_running() {
-        running.push("GPU validation");
-    }
-    if state.real_sweep.is_running() {
-        running.push("real sweep");
-    }
-    if state.mem_sweep.is_running() {
-        running.push("memory sweep");
-    }
-    if state.forge_all.is_running() {
-        running.push("forge all");
-    }
-    if state.benchmark.is_running() {
-        running.push("benchmark");
-    }
     if crate::gpu_power_sweep::FORGE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
         running.push("power sweep");
     }
@@ -808,30 +627,12 @@ fn reset_failure_response(error: impl std::fmt::Display) -> IpcResponse {
     IpcResponse::failure(format!("Reset failed: {error}"))
 }
 
-fn gpu_apply_result_response(result: Result<(), String>, success_message: String) -> IpcResponse {
-    match result {
-        Ok(()) => IpcResponse::success(ResponseData::GpuApply(applied_status(success_message))),
-        Err(error) => IpcResponse::failure(format!("Apply failed: {error}")),
-    }
-}
-
 fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
     matches!(
         request,
         IpcRequest::AuthorizeDevelopmentValidation { .. }
-            | IpcRequest::StartGpuValidation
-            | IpcRequest::StartRealSweep
-            | IpcRequest::StartRealSweepFast
-            | IpcRequest::StartMemSweep
-            | IpcRequest::ApplyGodforge
-            | IpcRequest::ApplyBrokkrs
-            | IpcRequest::ApplyDeepCalm
-            | IpcRequest::ApplyMemPeak
-            | IpcRequest::StartForgeAll
-            | IpcRequest::StartBenchmark
             | IpcRequest::StartPowerSweep
             | IpcRequest::StartPowerSweepClean
-            | IpcRequest::StartPowerSweepFast
             | IpcRequest::StartPowerSweepLong
             | IpcRequest::ResumePowerSweep
             | IpcRequest::ApplyPowerGodforge
@@ -850,22 +651,16 @@ fn gpu_reboot_guard_applies(request: &IpcRequest) -> bool {
         )
 }
 
-// Only after worker quiescence and a completed learning reset: no stale in-memory profile
-// may remain applicable through a legacy IPC method after its disk evidence was forgotten.
+// Only after worker quiescence and a completed learning reset: no stale in-memory diagnostic
+// point may remain after its disk evidence was forgotten.
 fn forget_worker_results(state: &mut AppState) {
-    state.gpu_validation = Default::default();
-    state.real_sweep = Default::default();
-    state.mem_sweep = Default::default();
-    state.forge_all = Default::default();
-    state.benchmark = Default::default();
     state.manual_point = Default::default();
 }
 
 /// Route a forge-profile apply to the correct writer (Phase 2). When the active forge produced an F2
-/// anchored-undervolt result (`is_undervolt == true`), apply the F2 anchored undervolt; otherwise apply
-/// the legacy F1 flatten-down ceiling. F2 RAISES a lower-voltage bin to hold the clock (dropping power);
-/// F1 caps frequency down — applying the wrong one is unsafe, so the route keys on the structured flag,
-/// never on text. Backward-compatible: a legacy/restored payload defaults `is_undervolt = false` → F1.
+/// anchored-undervolt result (`is_undervolt == true`), apply the F2 anchored undervolt. A legacy F1
+/// result (a restored payload defaults `is_undervolt = false`) has no exact-Apply proof and is refused;
+/// the route keys on the structured flag, never on text.
 fn apply_forge_profile(
     store: &nidavellir_core::safe_loop::SafeLoopStore,
     prog: &nidavellir_core::ipc::PowerSweepProgress,
@@ -1099,20 +894,6 @@ mod tests {
     }
 
     #[test]
-    fn f1_apply_failure_is_returned_as_an_ipc_failure() {
-        let response = gpu_apply_result_response(
-            Err("checked safety preflight refused the pair".into()),
-            "must not be visible".into(),
-        );
-        assert!(!response.ok);
-        assert!(response.data.is_none());
-        assert_eq!(
-            response.error.as_deref(),
-            Some("Apply failed: checked safety preflight refused the pair")
-        );
-    }
-
-    #[test]
     fn reset_quiescence_refuses_persistent_worker_and_allows_quiet_state() {
         assert!(reset_quiescence_decision(&[], RESET_QUIESCENCE_TIMEOUT).is_ok());
         let error = reset_quiescence_decision(&["power sweep", "Detector Lab"], RESET_QUIESCENCE_TIMEOUT).unwrap_err();
@@ -1292,14 +1073,8 @@ mod tests {
     fn service_wide_gpu_lease_covers_starts_and_applies_but_not_recovery_reset() {
         for request in [
             IpcRequest::AuthorizeDevelopmentValidation { reason: "Reviewed development validation".into() },
-            IpcRequest::StartGpuValidation,
-            IpcRequest::StartRealSweep,
-            IpcRequest::StartMemSweep,
-            IpcRequest::StartForgeAll,
-            IpcRequest::StartBenchmark,
             IpcRequest::StartPowerSweep,
             IpcRequest::StartPowerSweepClean,
-            IpcRequest::StartPowerSweepFast,
             IpcRequest::StartPowerSweepLong,
             IpcRequest::ResumePowerSweep,
             IpcRequest::ApplyPowerGodforge,

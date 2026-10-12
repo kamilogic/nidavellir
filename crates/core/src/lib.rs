@@ -3,7 +3,6 @@ pub mod condemnation;
 pub mod detector;
 pub mod f2_observation;
 pub mod fingerprint;
-pub mod gpu_control;
 pub mod gpu_sweep;
 pub mod ipc;
 pub mod msr;
@@ -18,9 +17,6 @@ pub mod superio_profile;
 pub use capability::{build_capability_report, CapabilityBucket, CapabilityItem, CapabilityReport};
 pub use detector::{detect_hardware, HardwareInfo};
 pub use fingerprint::{compute_fingerprint, MachineFingerprint};
-pub use gpu_sweep::{
-    GpuProfileSet, GpuSweepConfig, GpuSweepEngine, GpuSweepProgress, SweepCommand, SweepPhase,
-};
 pub use ipc::{IpcRequest, IpcResponse};
 pub use safe_loop::{
     decide_recovery, BootFlag, RecoveryAction, SafeLoopRecord, SafeLoopState, SafeLoopStore,

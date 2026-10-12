@@ -124,7 +124,6 @@ pub(crate) fn allows_tuning_request(request: &IpcRequest) -> bool {
         IpcRequest::AuthorizeDevelopmentValidation { .. }
             | IpcRequest::StartPowerSweep
             | IpcRequest::StartPowerSweepClean
-            | IpcRequest::StartPowerSweepFast
     )
 }
 
@@ -481,9 +480,7 @@ mod tests {
         for request in [
             IpcRequest::ResumePowerSweep,
             IpcRequest::StartPowerSweepLong,
-            IpcRequest::StartMemSweep,
             IpcRequest::ApplyPowerBrokkrs,
-            IpcRequest::StartBenchmark,
             IpcRequest::ApplyManualDiagnosticPoint {
                 target_mhz: 1920,
                 voltage_mv: 943,

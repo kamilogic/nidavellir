@@ -465,146 +465,6 @@ pub(crate) const PREHANG_STALL_MS: u64 = 300;
 // F2 Apply uses exactly the next valid physical VF-table bin above the learned boundary. The
 // effective millivolt delta remains exposed in IPC because physical bin spacing is not uniform.
 
-/// Brokkr's V2 selection profiles. The threshold is the minimum stability
-/// confidence (Wilson lower bound over a point's accumulated trials) a candidate
-/// must clear to be eligible. Higher = more evidence required = safer.
-#[cfg(windows)]
-#[allow(dead_code)] // Conservative/Aggressive are selectable; only Balanced is wired for now
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SweepProfile {
-    Conservative,
-    Balanced,
-    Aggressive,
-}
-
-#[cfg(windows)]
-impl SweepProfile {
-    /// Minimum Wilson lower-bound stability confidence to accept a candidate.
-    #[allow(dead_code)] // feeds `select_brokkrs_v2` (retained + unit-tested for the knowledge path)
-    fn threshold(self) -> f64 {
-        match self {
-            SweepProfile::Conservative => 0.95,
-            SweepProfile::Balanced => 0.85,
-            SweepProfile::Aggressive => 0.70,
-        }
-    }
-}
-
-/// Instability severity, ordered (mirrors the L1/L2/L3 fail tiers). Stored per point
-/// and per frontier so the algorithm can weigh a cheap SilentError differently from
-/// an expensive HardReboot.
-#[derive(
-    serde::Serialize,
-    serde::Deserialize,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    Debug,
-)]
-enum FailSeverity {
-    #[default]
-    None,
-    SilentError,
-    Tdr,
-    Reboot,
-}
-
-/// Accumulated statistics for ONE offset, summed across ALL runs (continuous
-/// learning). The stable aggregates give a mean score; trials/failures feed the
-/// (future) Wilson confidence — a point with 50 clean trials must outrank one with 1.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
-struct PointStat {
-    trials: u32,
-    failures: u32,
-    worst_severity: FailSeverity,
-    stable_trials: u32,
-    clock_mhz_sum: u64,
-    power_w_sum: f64,
-    voltage_mv_sum: u64,
-}
-
-#[allow(dead_code)] // mean_voltage_mv() reserved for V3; score()/confidence() drive V2 selection
-impl PointStat {
-    /// Mean efficiency (MHz/W) over the stable trials, or 0 if never stable.
-    fn score(&self) -> f64 {
-        if self.stable_trials == 0 || self.power_w_sum <= 0.0 {
-            0.0
-        } else {
-            self.clock_mhz_sum as f64 / self.power_w_sum
-        }
-    }
-    /// Stability confidence: Wilson lower bound (z=1.96, 95%) of the stable rate
-    /// over accumulated trials. Few trials ⇒ low confidence even at a 100% rate
-    /// (1/1 ≈ 0.21, 50/50 ≈ 0.93), so a barely-tested point can't win on luck.
-    fn confidence(&self) -> f64 {
-        wilson_lower_bound(self.stable_trials, self.trials, 1.96)
-    }
-    fn mean_voltage_mv(&self) -> u32 {
-        if self.stable_trials == 0 {
-            0
-        } else {
-            (self.voltage_mv_sum / self.stable_trials as u64) as u32
-        }
-    }
-}
-
-/// Wilson score-interval lower bound for a binomial success rate — a sample-size-
-/// aware confidence floor: `successes`/`trials` stable observations, `z` the normal
-/// quantile (1.96 ≈ 95%). Returns 0 when there are no trials.
-#[allow(dead_code)] // live on Windows (drives selection); kept for non-Windows builds
-fn wilson_lower_bound(successes: u32, trials: u32, z: f64) -> f64 {
-    if trials == 0 {
-        return 0.0;
-    }
-    let n = trials as f64;
-    let phat = successes as f64 / n;
-    let z2 = z * z;
-    let center = phat + z2 / (2.0 * n);
-    let margin = z * ((phat * (1.0 - phat) / n) + z2 / (4.0 * n * n)).sqrt();
-    let denom = 1.0 + z2 / n;
-    ((center - margin) / denom).max(0.0)
-}
-
-/// Severity-differentiated stability frontier (user's design): keep the shallowest
-/// offset of each failure class separately, never collapsing them to one number.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
-struct BoundaryKnowledge {
-    /// Deepest offset (MHz) observed fully stable.
-    highest_clean: i32,
-    lowest_silent_error: Option<i32>,
-    lowest_tdr: Option<i32>,
-    lowest_reboot: Option<i32>,
-}
-
-/// Per-GPU continuous knowledge base: the stability curve this specific GPU is
-/// learning about itself, accumulated across runs. Keyed by GPU identity so a
-/// hardware change starts fresh.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
-struct GpuKnowledge {
-    gpu_key: String,
-    target_clock_mhz: u32,
-    boundary: BoundaryKnowledge,
-    /// offset (MHz) → accumulated stats.
-    points: std::collections::BTreeMap<i32, PointStat>,
-    schema_version: u32,
-}
-
-/// Stock-curve clock (MHz) at or below `v` mV — the card's natural clock there.
-#[cfg(windows)]
-#[allow(dead_code)]
-fn curve_freq_at_v(pts: &[(u32, u32)], v: u32) -> u32 {
-    pts.iter()
-        .filter(|p| p.0 <= v)
-        .max_by_key(|p| p.0)
-        .or_else(|| pts.iter().min_by_key(|p| p.0))
-        .map(|p| p.1)
-        .unwrap_or(0)
-}
-
 fn idle() -> PowerSweepProgress {
     PowerSweepProgress {
         phase: "idle".into(),
@@ -718,21 +578,6 @@ impl PowerSweepMode {
             PowerSweepMode::Long => "longa",
         }
     }
-    /// Mode tuning knobs `(max_probes, max_probes_per_target, validation_passes)`. These are
-    /// hardware-relative PROBE counts (not fixed MHz); the per-probe verifier/dwell/Safe-Loop guards
-    /// inside the shared core remain the safety net regardless of these values.
-    #[cfg(windows)]
-    fn tuning(self) -> (u32, u32, u32) {
-        match self {
-            PowerSweepMode::Standard => (BUTTON_MAX_PROBES, BUTTON_MAX_PROBES_PER_TARGET, 1),
-            PowerSweepMode::Long => (
-                LONG_MAX_PROBES,
-                LONG_MAX_PROBES_PER_TARGET,
-                LONG_VALIDATION_PASSES,
-            ),
-        }
-    }
-
     #[cfg(windows)]
     fn f2_policy(self) -> F2ForgeModePolicy {
         match self {
@@ -1664,9 +1509,8 @@ impl PowerSweepHandle {
         let manual_stop = Arc::clone(&self.manual_stop);
         let running = Arc::clone(&self.running);
         std::thread::spawn(move || {
-            // The live forge button now runs the F2 ANCHORED UNDERVOLT forge (the proven method for
-            // power-bound cards F1 flatten-down cannot differentiate). The F1 `run_power_sweep` is kept
-            // intact (Phase 3 decides its fate) but is no longer routed here.
+            // The live forge button runs the F2 ANCHORED UNDERVOLT forge (the proven method for
+            // power-bound cards F1 flatten-down cannot differentiate). The F1 sweep was removed in 0.6.0.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 #[cfg(windows)]
                 measure_multiclock_undervolt_forge(
@@ -2950,76 +2794,6 @@ fn set(progress: &Arc<Mutex<PowerSweepProgress>>, mut p: PowerSweepProgress) {
     }
 }
 
-#[cfg(windows)]
-fn recover_ctx() -> Option<nidavellir_gpu_stress::GpuCtx> {
-    use nidavellir_gpu_stress::GpuCtx;
-    for _ in 0..6 {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        if let Ok(c) = GpuCtx::new() {
-            return Some(c);
-        }
-    }
-    None
-}
-
-/// 3-tier failure classification (user's spec) — distinguishes "the GPU computed
-/// the wrong answer but the driver is fine" from "the workload context was lost but
-/// recoverable" from "the driver could not re-initialize the device (hard TDR)".
-/// Each tier recedes a different number of sweep steps.
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailTier {
-    /// L1: instability detected, driver healthy (silent error / wrong result).
-    L1Instability,
-    /// L2: workload/context lost, but the device was recreated successfully.
-    L2WorkloadReset,
-    /// L3: hard TDR — the driver could not re-initialize the device.
-    L3HardTdr,
-}
-
-#[cfg(windows)]
-impl FailTier {
-    fn label(self) -> &'static str {
-        match self {
-            FailTier::L1Instability => "L1 FAIL · instabilidade (driver ok)",
-            FailTier::L2WorkloadReset => "L2 FAIL · Workload-Reset (device recriado)",
-            FailTier::L3HardTdr => "L3 FAIL · HARD TDR (driver não reinicializou)",
-        }
-    }
-    /// How many sweep steps to recede (toward higher voltage / safety) for this tier.
-    fn backoff_steps(self) -> u32 {
-        match self {
-            FailTier::L1Instability => 1,
-            FailTier::L2WorkloadReset => 2,
-            FailTier::L3HardTdr => 4,
-        }
-    }
-}
-
-/// Classify a non-stable result into the 3-tier model, recovering the device on a
-/// context loss. On a Crash the offset/clock are first reset to stock, then the
-/// GpuCtx is recreated; if recreation fails it's a hard TDR (L3) and `*ctx` is left
-/// as-is (the caller must abort — there is no working device to run more loads on).
-#[cfg(windows)]
-fn classify_failure(res: StabilityResult, ctx: &mut nidavellir_gpu_stress::GpuCtx) -> FailTier {
-    match res {
-        StabilityResult::SilentError | StabilityResult::Unstable => FailTier::L1Instability,
-        StabilityResult::Stable => FailTier::L1Instability, // not expected; treat as mild
-        StabilityResult::Crash => {
-            let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(0);
-            let _ = nidavellir_gpu_nvapi::reset_vf_curve();
-            let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
-            match recover_ctx() {
-                Some(c) => {
-                    *ctx = c;
-                    FailTier::L2WorkloadReset
-                }
-                None => FailTier::L3HardTdr,
-            }
-        }
-    }
-}
-
 /// Precise per-dwell measurement under the max-power load. Returns the stability
 /// verdict and steady-state stats: (mean_clock, mean_power, max_power, std_power,
 /// power_capped_fraction). The first six seconds of power-characterization samples are discarded so only the
@@ -3285,24 +3059,6 @@ fn voltage_quality(sample_count: u32) -> DwellQuality {
         1..=9 => DwellQuality::Low,
         10..=49 => DwellQuality::Medium,
         _ => DwellQuality::High,
-    }
-}
-
-/// The worst (most conservative) of two qualities.
-#[allow(dead_code)] // dwell-quality combiner — retained + unit-tested
-fn worst_quality(a: DwellQuality, b: DwellQuality) -> DwellQuality {
-    fn rank(q: DwellQuality) -> u8 {
-        match q {
-            DwellQuality::Unavailable => 0,
-            DwellQuality::Low => 1,
-            DwellQuality::Medium => 2,
-            DwellQuality::High => 3,
-        }
-    }
-    if rank(a) <= rank(b) {
-        a
-    } else {
-        b
     }
 }
 
@@ -4817,199 +4573,6 @@ fn run_f2_stock_preheat(
     ))
 }
 
-/// Find the perf/watt knee: the point of the (power, clock) curve farthest above
-/// the line joining its endpoints — the elbow where more power stops buying much
-/// more clock. Falls back to the best raw perf/watt for tiny sets.
-/// Arduous re-validation of a chosen undervolt point: cap the clock at target +
-/// apply the point's offset (NO voltage lock) and run a LONG max-power soak. The
-/// quick dwell only approximates the cliff; a marginal undervolt can pass it yet
-/// fail in a game. If the soak fails, step to a LOWER offset (less undervolt =
-/// higher voltage = safer) and retry until stable — so the profile is solid.
-#[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
-fn arduous_validate(
-    ctx: &mut nidavellir_gpu_stress::GpuCtx,
-    store: &SafeLoopStore,
-    target: u32,
-    start: PowerSweepPoint,
-    points: &[PowerSweepPoint],
-    stop: &Arc<AtomicBool>,
-    label: &str,
-    progress: &Arc<Mutex<PowerSweepProgress>>,
-    prog: &mut PowerSweepProgress,
-) -> Option<PowerSweepPoint> {
-    let mut cand = start;
-    for _ in 0..6 {
-        if stop.load(Ordering::SeqCst) {
-            return Some(cand);
-        }
-        prog.log.push(format!(
-            "Validação árdua {label}: +{} MHz (~{} mV @ {target} MHz, ~35s, carga de jogo)…",
-            cand.offset_mhz, cand.voltage_mv
-        ));
-        set(progress, prog.clone());
-        // Soak under the SAME game-power render the sweep measured with (no rigid
-        // NVML clock pin — the cap + curve limit the clock naturally, exactly like
-        // the measurement). A marginal undervolt that passed the short dwell can
-        // still fail this long soak; if so, back off to a higher voltage.
-        let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(cand.offset_mhz);
-        let _ = store.arm_boot_flag(&BootFlag::new(
-            TuningPoint::from_axes([
-                ("gpu_offset_mhz", cand.offset_mhz as i64),
-                ("gpu_clock_mhz", target as i64),
-            ]),
-            "gpu_power_validate",
-        ));
-        let res = load_and_measure(35_000).result;
-        let _ = store.clear_boot_flag();
-        if matches!(res, StabilityResult::Stable) {
-            prog.log.push(format!(
-                "✓ {label} validado: +{} MHz (~{} mV)",
-                cand.offset_mhz, cand.voltage_mv
-            ));
-            set(progress, prog.clone());
-            return Some(cand);
-        }
-        let tier = classify_failure(res, ctx);
-        prog.log.push(format!(
-            "✗ {label}: {} em +{} MHz",
-            tier.label(),
-            cand.offset_mhz
-        ));
-        set(progress, prog.clone());
-        if tier == FailTier::L3HardTdr {
-            prog.log.push(format!(
-                "Abortando {label}: device não recuperou (hard TDR)."
-            ));
-            set(progress, prog.clone());
-            return None;
-        }
-        // Recede this tier's number of steps toward a LOWER offset (less undervolt
-        // → higher voltage → safer): L1 backs off 1, L2 backs off 2.
-        for _ in 0..tier.backoff_steps() {
-            match points
-                .iter()
-                .filter(|p| p.offset_mhz < cand.offset_mhz)
-                .max_by_key(|p| p.offset_mhz)
-                .copied()
-            {
-                Some(n) => cand = n,
-                None => {
-                    prog.log
-                        .push(format!("Sem ponto mais conservador para {label}."));
-                    return None;
-                }
-            }
-        }
-    }
-    Some(cand)
-}
-
-#[cfg(windows)]
-#[allow(dead_code)]
-fn knee(points: &[PowerSweepPoint]) -> Option<PowerSweepPoint> {
-    let pts: Vec<&PowerSweepPoint> = points
-        .iter()
-        .filter(|p| p.stable && p.power_w > 0.0)
-        .collect();
-    if pts.is_empty() {
-        return None;
-    }
-    if pts.len() < 3 {
-        return pts
-            .iter()
-            .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap())
-            .map(|p| **p);
-    }
-    let mut sorted = pts.clone();
-    sorted.sort_by(|a, b| a.power_w.partial_cmp(&b.power_w).unwrap());
-    let (x0, y0) = (sorted[0].power_w as f64, sorted[0].clock_mhz as f64);
-    let (x1, y1) = (
-        sorted[sorted.len() - 1].power_w as f64,
-        sorted[sorted.len() - 1].clock_mhz as f64,
-    );
-    let dx = x1 - x0;
-    let dy = y1 - y0;
-    let len = (dx * dx + dy * dy).sqrt().max(1e-6);
-    let mut best = *sorted[0];
-    let mut best_d = -1.0f64;
-    for p in &sorted {
-        // Perpendicular distance, signed so only points ABOVE the line (the
-        // concave elbow) count.
-        let d = ((p.clock_mhz as f64 - y0) * dx - (p.power_w as f64 - x0) * dy) / len;
-        if d > best_d {
-            best_d = d;
-            best = **p;
-        }
-    }
-    Some(best)
-}
-
-/// Brokkr's V2 selection: among the off-cap candidates, choose the highest
-/// accumulated efficiency (`score`, MHz/W) whose stability confidence (Wilson
-/// lower bound over accumulated trials) clears the active profile's threshold.
-/// When none qualifies — the usual case until a point is re-tested across runs —
-/// fall back to the V1 strategy (best off-cap perf/watt, else least-capped), so
-/// selection never returns "no solution". Joins each candidate to `know.points`
-/// by offset for its accumulated confidence; data collection is untouched.
-#[cfg(windows)]
-#[allow(dead_code)] // V2 confidence-gate selector — retained + unit-tested for the knowledge path
-fn select_brokkrs_v2(
-    all_points: &[PowerSweepPoint],
-    off_cap: &[PowerSweepPoint],
-    know: &GpuKnowledge,
-    profile: SweepProfile,
-) -> (Option<PowerSweepPoint>, Vec<String>) {
-    use std::cmp::Ordering as Ord;
-    let threshold = profile.threshold();
-    let mut log = Vec::new();
-
-    // Off-cap candidates whose accumulated confidence (Wilson-LB) clears the gate.
-    let mut gated: Vec<(PowerSweepPoint, f64, f64)> = off_cap
-        .iter()
-        .filter_map(|p| {
-            let ps = know.points.get(&p.offset_mhz)?;
-            Some((*p, ps.confidence(), ps.score()))
-        })
-        .filter(|(_, conf, _)| *conf >= threshold)
-        .collect();
-
-    if !gated.is_empty() {
-        // Among the trusted points, take the best accumulated efficiency (MHz/W).
-        gated.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ord::Equal));
-        let (best, conf, score) = gated[0];
-        log.push(format!(
-            "BROKKRS V2: candidate=+{} score={:.2} confidence={:.2} threshold={:.2} decision=accepted",
-            best.offset_mhz, score, conf, threshold
-        ));
-        return (Some(best), log);
-    }
-
-    // Confidence not yet mature → fall back to the V1 selection.
-    let best_conf = off_cap
-        .iter()
-        .filter_map(|p| know.points.get(&p.offset_mhz).map(|ps| ps.confidence()))
-        .fold(0.0_f64, f64::max);
-    log.push(format!(
-        "BROKKRS V2: no candidate met threshold best_confidence={:.2} threshold={:.2} fallback=V1",
-        best_conf, threshold
-    ));
-    let v1 = if off_cap.is_empty() {
-        all_points.iter().copied().min_by(|a, b| {
-            a.power_capped_frac
-                .partial_cmp(&b.power_capped_frac)
-                .unwrap_or(Ord::Equal)
-        })
-    } else {
-        off_cap.iter().copied().max_by(|a, b| {
-            a.perf_per_watt
-                .partial_cmp(&b.perf_per_watt)
-                .unwrap_or(Ord::Equal)
-        })
-    };
-    (v1, log)
-}
-
 /// The three forge profiles synthesized from a power frontier (F1 product model).
 /// Centralized product policy for profile synthesis (F1b) — thresholds live here, not
 /// scattered through the algorithm. Clock floors keep Brokkr's near Godforge and keep
@@ -5039,32 +4602,14 @@ impl ForgePolicy {
             confidence_threshold: 0.85,
         }
     }
-    fn conservative() -> Self {
-        Self {
-            brokkrs_min_clock_frac: 0.99,
-            deep_calm_min_clock_frac: 0.92,
-            confidence_threshold: 0.95,
-        }
-    }
-    fn aggressive() -> Self {
-        Self {
-            brokkrs_min_clock_frac: 0.97,
-            deep_calm_min_clock_frac: 0.85,
-            confidence_threshold: 0.70,
-        }
-    }
 }
 
 /// Observed GPU constraint regime — descriptive, and drives the candidate-clock range.
-/// `VoltageLimited` is reserved: it can't be told from a single stock sample (it emerges
-/// during the sweep when raising voltage stops raising clock), so `classify_regime`
-/// does not yet produce it.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // wired into the live sweep by F1b Phase 2
 enum Regime {
     PowerLimited,
-    VoltageLimited,
     ThermalLimited,
     Mixed,
     Unconstrained,
@@ -6905,32 +6450,6 @@ const FRONTIER_FLOOR_FRAC: f64 = 0.90;
 /// knee on a power-bound card, still small.
 #[cfg(windows)]
 const FRONTIER_PHASE_B_PROBES: u32 = 12;
-/// Live power-sweep BUTTON defaults (no CLI args). Bounded/quick multi-clock coverage: the global
-/// probe cap hard-bounds total dwell time, the per-target depth cap turns on the coverage-bounded
-/// scheduler (reach several clocks before deepening one) so the three profiles can differentiate.
-/// Both are hardware-relative PROBE counts (not fixed MHz); the per-probe verifier/dwell/Safe-Loop
-/// guards inside the shared core remain the safety net. Conservative — knee-seeking/warm-start stay off.
-#[cfg(windows)]
-const BUTTON_MAX_PROBES: u32 = 24;
-#[cfg(windows)]
-const BUTTON_MAX_PROBES_PER_TARGET: u32 = 3;
-/// LONG button mode: broader (more clocks) + deeper (one extra bin/target) discovery so the three
-/// profiles can differentiate, PLUS repeated per-pick ceiling soaks (`LONG_VALIDATION_PASSES`) so a
-/// deep point earns its confidence in ONE session instead of over later runs. `LONG_MAX_PROBES`
-/// stays a hard global cap; every probe/soak is the same fail-closed verifier/dwell/Safe-Loop motor.
-#[cfg(windows)]
-const LONG_MAX_PROBES: u32 = 40;
-#[cfg(windows)]
-const LONG_MAX_PROBES_PER_TARGET: u32 = 4;
-/// LONG mode: re-soak each pick at its DISCOVERED ceiling this many times before accepting it. Any
-/// non-Stable pass DROPS the pick (fail-closed) — extra passes can only reject, never widen exposure.
-#[cfg(windows)]
-const LONG_VALIDATION_PASSES: u32 = 3;
-/// Defensive hard cap on per-pick ceiling-soak passes (mode values stay well below this).
-#[cfg(windows)]
-const POWER_SWEEP_MAX_VALIDATION_PASSES: u32 = 5;
-
-
 // ── Phase 2B.2-b.3: graphics-core SANITY-DOMAIN guards ──────────────────────────────
 // NOT tuning targets — only safety guards to reject non-core / memory-domain / implausible
 // VF points so seeding can never derive a target like 7001 MHz or a safe_start like 1237 mV.
@@ -7662,25 +7181,22 @@ fn ordered_frontier_logs<'a>(scheduler: &'a [String], synthesis: &'a [String]) -
 
 /// Confirmed multi-clock frontier measurement result. The `frontier`/`profiles` are exactly the
 /// `FrontierBuildResult` the supervised run produces (so reporting/persistence is unchanged);
-/// `est_wall_s` is the pre-run worst-case dwell-time estimate, `detected_clock_mhz` is the derived
-/// stock reference clock (single-clock validation fallback), `aborted` mirrors the post-crash abort
-/// flag, and `logs` are the ordered scheduler + synthesis decision lines.
+/// `aborted` mirrors the post-crash abort flag, and `logs` are the ordered scheduler + synthesis
+/// decision lines.
 #[cfg(windows)]
 struct MultiClockForgeResult {
     frontier: Vec<PowerSweepPoint>,
     profiles: ForgeProfiles,
-    est_wall_s: u64,
-    detected_clock_mhz: u32,
     aborted: bool,
     logs: Vec<String>,
 }
 
 /// Run the CONFIRMED multi-clock frontier measurement and return its result, or `None` on any
 /// fail-closed abort (unseeded curve, invalid limits, out-of-range target, empty descent). This is
-/// the proven supervised core shared by `run_build_frontier` (console) and the live power-sweep
-/// button: `derive_core_seed` → regime (clamped to PowerLimited) → hardware-derived floor →
-/// `candidate_clocks` → limits → bin-based descent → `plan_frontier` → the real probe closure →
-/// `build_frontier`(_two_phase) → `synthesize_forge_profiles`. EVERY fail-closed guard is preserved.
+/// the supervised core of the console `run_build_frontier`: `derive_core_seed` → regime (clamped to
+/// PowerLimited) → hardware-derived floor → `candidate_clocks` → limits → bin-based descent → the
+/// real probe closure → `build_frontier`(_two_phase) → `synthesize_forge_profiles`. EVERY
+/// fail-closed guard is preserved.
 /// It ALWAYS restores stock and clears the boot flag on return (success, partial, abort). It NEVER
 /// applies or persists a profile; the caller decides what to do with the returned profiles.
 #[cfg(windows)]
@@ -7758,17 +7274,6 @@ fn measure_multiclock_forge(
         warn!("multiclock-forge: no real VF bin ≤ {safe_start_mv} mV — failing closed (no hardware floor)");
         return None;
     }
-    let plan = plan_frontier(
-        targets.clone(),
-        &descent,
-        DWELL_MS,
-        limits.max_probes_per_target,
-    );
-    let capped_dwells = limits
-        .max_probes
-        .map_or(plan.est_dwell_count, |mp| plan.est_dwell_count.min(mp));
-    let est_wall_s = capped_dwells as u64 * (DWELL_MS + PROBE_OVERHEAD_MS) / 1000;
-
     warn!("multiclock-forge: CONFIRMED — supervised hardware run begins (game-power dwells; can TDR/reboot).");
     let policy = ForgePolicy::balanced();
     let abort = AtomicBool::new(false);
@@ -7849,8 +7354,6 @@ fn measure_multiclock_forge(
     Some(MultiClockForgeResult {
         frontier: result.frontier,
         profiles: result.profiles,
-        est_wall_s,
-        detected_clock_mhz: seed.stock_sustained_mhz,
         aborted,
         logs,
     })
@@ -8219,408 +7722,6 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
 #[cfg(not(windows))]
 pub fn run_build_frontier(_store: &SafeLoopStore, _confirm: bool, _limits: FrontierLimits) {
     tracing::warn!("build-frontier is Windows-only");
-}
-
-/// Long-soak validation of one multi-clock pick AT ITS DISCOVERED VF-TABLE CEILING — the exact
-/// operating point the Apply path will write (`apply_core` → `choose_ceiling_mv`). It mirrors the
-/// real-probe ceiling write+verify (`real_probe_step`) but with the ARDUOUS soak duration so the
-/// long soak validates what Apply persists, not a stock offset. FAIL-CLOSED: any non-Stable verdict
-/// (unstable/silent error, device-lost/TDR crash, verify failure, snap/apply failure) DROPS the pick
-/// (`None`) — no offset-style back-off. The clock is assumed already locked by the caller. EVERY
-/// path resets to stock and clears the boot flag before returning.
-///
-/// Requires `pick.vf_table_voltage_mv = Some(vbin)`; callers with `None` keep the legacy
-/// offset-based `arduous_validate` path. The bin is a discovered safe descent bin, so the crash
-/// floor is already respected; `apply_vf_ceiling_monotone` itself fails closed if the static base is
-/// unavailable (audit B1), and a snap below any live bin returns `None` here.
-#[cfg(windows)]
-fn validate_pick_at_ceiling(
-    store: &SafeLoopStore,
-    clk: u32,
-    pick: PowerSweepPoint,
-    stop: &Arc<AtomicBool>,
-    label: &str,
-    progress: &Arc<Mutex<PowerSweepProgress>>,
-    prog: &mut PowerSweepProgress,
-) -> Option<PowerSweepPoint> {
-    use nidavellir_gpu_nvapi as gpu;
-    let Some(vbin) = pick.vf_table_voltage_mv else {
-        // Caller must not route a None-ceiling pick here.
-        return Some(pick);
-    };
-    if stop.load(Ordering::SeqCst) {
-        return Some(pick);
-    }
-    // Snap the discovered bin to a real VF-table bin at/above it — same as apply/verify/real-probe.
-    let live = gpu::read_vf_curve_modern();
-    let Some((ceiling_idx, ceiling_mv)) = gpu::nearest_vf_bin_at_or_above(&live, vbin) else {
-        prog.log.push(format!(
-            "✗ {label}: sem bin VF real ≥ {vbin} mV — descartado (fail-closed)."
-        ));
-        set(progress, prog.clone());
-        return None;
-    };
-    let static_base = gpu::read_vf_base_curve_modern();
-    prog.log.push(format!(
-        "Validação árdua {label}: teto {ceiling_mv} mV @ {clk} MHz (~35s, carga de jogo)…"
-    ));
-    set(progress, prog.clone());
-
-    // ARM the Safe Loop for this pick's INTENT before any VF write (a crash anytime after → the
-    // ceiling is NOT reapplied on boot). Same axes shape as the real probe.
-    let intent = TuningPoint::from_axes([
-        ("gpu_freq_mhz", clk as i64),
-        ("gpu_vf_bin_mv", ceiling_mv as i64),
-    ]);
-    let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_power_validate_ceiling"));
-
-    // Apply the monotone-down, static-base-anchored VF ceiling (REUSED; never modified). Fails
-    // closed if the static base is unavailable — reset + clear + drop.
-    if let Err(e) = gpu::apply_vf_ceiling_monotone(ceiling_mv, clk) {
-        warn!("{label}: apply_vf_ceiling_monotone({ceiling_mv} mV, {clk} MHz) failed closed: {e}");
-        reset_to_stock();
-        let _ = store.clear_boot_flag();
-        prog.log.push(format!(
-            "✗ {label}: aplicação do teto falhou — descartado (fail-closed)."
-        ));
-        set(progress, prog.clone());
-        return None;
-    }
-    // Read-only verify the JUST-applied transient ceiling (shared path). Static base enables the
-    // NoDownCapNeeded benign-zero rescue; stock_top is not available here so the narrow
-    // stock-equivalent path is conservatively off (passing `None`).
-    let after = gpu::read_vf_curve_modern();
-    let eval = crate::gpu_verify::classify_live_ceiling(
-        &after,
-        ceiling_idx,
-        ceiling_mv,
-        clk,
-        FRONTIER_VERIFY_TOL_MHZ,
-        None,
-        Some(&static_base),
-    );
-    let verified = eval.state == nidavellir_core::ipc::CurveVerification::VerifiedCurve
-        || eval.stock_equivalent
-        || eval.no_down_cap_rescue;
-    if !verified {
-        warn!(
-            "{label}: ceiling verify failed (state={:?}) — dropping pick (fail-closed).",
-            eval.state
-        );
-        reset_to_stock();
-        let _ = store.clear_boot_flag();
-        prog.log.push(format!(
-            "✗ {label}: teto não verificou — descartado (fail-closed)."
-        ));
-        set(progress, prog.clone());
-        return None;
-    }
-
-    // Long game-power soak at the applied ceiling (the ARDUOUS duration).
-    let res = load_and_measure(35_000).result;
-    // ALWAYS reset to stock + clear the flag, on EVERY path, before deciding.
-    reset_to_stock();
-    let _ = store.clear_boot_flag();
-
-    if matches!(res, StabilityResult::Stable) {
-        prog.log.push(format!(
-            "✓ {label} validado no teto: {ceiling_mv} mV @ {clk} MHz."
-        ));
-        set(progress, prog.clone());
-        Some(pick)
-    } else {
-        // UNSTABLE / SilentError / device-lost (Crash/TDR) → DROP (conservative, no back-off).
-        prog.log.push(format!(
-            "✗ {label}: instável no teto {ceiling_mv} mV @ {clk} MHz — descartado (fail-closed)."
-        ));
-        set(progress, prog.clone());
-        None
-    }
-}
-
-/// Run the fail-closed ceiling soak (`validate_pick_at_ceiling`) `passes` times for ONE pick. The
-/// caller has already locked the pick's clock. Each pass independently arms → applies → verifies →
-/// soaks → resets at the discovered ceiling; ANY non-Stable pass DROPS the pick (`None`). Extra
-/// passes (LONG mode) only let a deep point ACCUMULATE in-session confirmations — they can never
-/// widen exposure or rescue a failed pass. `passes == 1` is the Standard behavior. A mid-run stop
-/// keeps the last good pick (no further soaks).
-#[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
-fn validate_pick_ceiling_passes(
-    store: &SafeLoopStore,
-    clk: u32,
-    pick: PowerSweepPoint,
-    stop: &Arc<AtomicBool>,
-    label: &str,
-    progress: &Arc<Mutex<PowerSweepProgress>>,
-    prog: &mut PowerSweepProgress,
-    passes: u32,
-) -> Option<PowerSweepPoint> {
-    let mut current = pick;
-    for pass in 1..=passes {
-        if stop.load(Ordering::SeqCst) {
-            return Some(current);
-        }
-        if passes > 1 {
-            prog.log.push(format!(
-                "Validação árdua {label}: passagem {pass}/{passes} (confiança em sessão)…"
-            ));
-            set(progress, prog.clone());
-        }
-        match validate_pick_at_ceiling(store, clk, current, stop, label, progress, prog) {
-            Some(p) => current = p,
-            None => return None, // fail-closed: any failed pass drops the pick
-        }
-    }
-    Some(current)
-}
-
-/// F1 MULTI-CLOCK flatten-down forge — kept INTACT but no longer routed to the live button (the button
-/// now runs the F2 anchored-undervolt forge, which can differentiate power-bound cards F1 cannot).
-/// Phase 3 decides this path's fate (retire vs repurpose for cards where F1 CAN differentiate). Retained
-/// so its proven logic + tests stay available; `#[allow(dead_code)]` because the only caller (the button
-/// spawn) now targets the F2 forge.
-#[cfg(windows)]
-#[allow(dead_code)]
-fn run_power_sweep(
-    progress: Arc<Mutex<PowerSweepProgress>>,
-    stop: Arc<AtomicBool>,
-    store: SafeLoopStore,
-    mode: PowerSweepMode,
-) {
-    use nidavellir_gpu_nvapi as gpu;
-    use nidavellir_gpu_stress::GpuCtx;
-
-    info!(
-        "Power sweep starting (voltage → max-stable-clock → power) — mode {}",
-        mode.label()
-    );
-    let mut prog = idle();
-    prog.running = true;
-    prog.phase = "power".into();
-    prog.power_limit_w = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml()
-        .into_iter()
-        .next()
-        .and_then(|r| r.power_limit_w)
-        .unwrap_or(0.0);
-    prog.log.push(format!(
-        "Power sweep ({}) — cap {:.0} W. Mapeando tensão → clock estável → potência…",
-        mode.label(),
-        prog.power_limit_w
-    ));
-    set(&progress, prog.clone());
-
-    let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
-    let _ = gpu::reset_all();
-
-    let mut ctx = match GpuCtx::new() {
-        Ok(c) => c,
-        Err(e) => {
-            prog.running = false;
-            prog.phase = "done".into();
-            prog.note = Some(format!("Falha ao iniciar GPU: {e}"));
-            set(&progress, prog);
-            return;
-        }
-    };
-
-    let cap = prog.power_limit_w;
-    // Identity for forge-state persistence (single source of truth across restarts).
-    let gpu_key = nidavellir_gpu_nvapi::read_curve()
-        .map(|c| c.name)
-        .unwrap_or_else(|_| "unknown-gpu".into());
-
-    // BUTTON multi-clock limits: bounded supervised measurement with NO CLI args and NO fixed MHz —
-    // everything stays hardware-relative (candidate clocks + real VF bins are derived from the live
-    // curve inside `measure_multiclock_forge`). The per-target depth cap turns on the coverage-bounded
-    // scheduler (reach several clocks before deepening one) so the three profiles can differentiate;
-    // the global probe cap bounds total dwell time. The probe/depth caps come from the selected MODE
-    // (Standard = the bounded default, Long = broader+deeper); `validation_passes` sets
-    // how many times each pick is re-soaked at its ceiling. Knee-seeking and warm-start stay OFF
-    // (default) in all modes to keep the live run conservative and predictable.
-    let (max_probes, max_probes_per_target, validation_passes) = mode.tuning();
-    let validation_passes = validation_passes.clamp(1, POWER_SWEEP_MAX_VALIDATION_PASSES);
-    let limits = FrontierLimits {
-        max_targets: None,
-        max_probes: Some(max_probes),
-        max_probes_per_target: Some(max_probes_per_target),
-        safe_start_cap_mv: None,
-        warm_start_brackets: false,
-        bind_seeking: false,
-        power_bound_knee_seeking: false,
-        phase_b_probes: None,
-    };
-
-    // Surface the worst-case duration estimate BEFORE the long measurement (UI shows it). The estimate
-    // is derived from the same hardware-relative plan the measurement runs.
-    prog.note = Some("Forja multi-clock — estimando duração…".into());
-    set(&progress, prog.clone());
-
-    // Run the PROVEN multi-clock measurement core (same supervised path as build-frontier): derive
-    // the seed, candidate clocks, real VF-bin descent; probe under game-power dwells with the per-probe
-    // verifier + Safe Loop + reset guards; synthesize the three differentiated profiles. It ALWAYS
-    // restores stock and clears the boot flag, and applies/persists NOTHING. A fail-closed abort
-    // (unseeded curve, invalid limits, out-of-range target, empty descent) returns `None`.
-    let Some(result) = measure_multiclock_forge(&store, &stop, &limits) else {
-        // FAIL CLOSED: never persist a failed/empty run. The helper already reset to stock.
-        let _ = gpu::reset_all();
-        let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
-        prog.running = false;
-        prog.phase = "done".into();
-        prog.note = Some(
-            "Forja multi-clock abortada com segurança (curva/limites inválidos) — GPU restaurada ao stock, nada aplicado."
-                .into(),
-        );
-        set(&progress, prog);
-        info!("Power sweep aborted fail-closed (multi-clock measurement)");
-        return;
-    };
-
-    let detected = result.detected_clock_mhz;
-    prog.stock_clock_mhz = detected;
-    let val_note = if validation_passes > 1 {
-        format!(", validação {validation_passes}× por perfil")
-    } else {
-        String::new()
-    };
-    prog.note = Some(format!(
-        "Forja multi-clock ({}) — ~{} s estimados (cap {cap:.0} W, clock base ~{detected} MHz{val_note}).",
-        mode.label(),
-        result.est_wall_s
-    ));
-    prog.log.push(format!(
-        "Frontier multi-clock: {} ponto(s), ~{} s estimados, clock base ~{detected} MHz (cap {cap:.0} W).",
-        result.frontier.len(), result.est_wall_s
-    ));
-    prog.log.extend(result.logs);
-
-    // Map the three multi-clock profiles (godforge / Brokkr's Best / Deep Calm) and frontier points.
-    // `deep_calm` is now populated by the multi-clock synthesis (additive — the existing apply handler
-    // already reads it).
-    prog.power_bound_collapse = result.profiles.power_bound_collapse;
-    prog.godforge = result.profiles.godforge;
-    prog.brokkrs = result.profiles.brokkrs;
-    prog.deep_calm = result.profiles.deep_calm;
-    prog.points = result.frontier;
-
-    // APPLY-AXIS BACKFILL: multi-clock picks come from `probe_to_point`, which records the discovered
-    // undervolt ceiling in `vf_table_voltage_mv` but leaves `voltage_mv = 0` (default). The Apply path
-    // (`apply_core` → `choose_ceiling_mv`) keys on `voltage_mv`, and `choose_ceiling_mv(curve, 0)` snaps
-    // to the LOWEST bin = deepest undervolt — the WRONG ceiling. Backfill `voltage_mv` from the
-    // discovered bin so Apply writes the DISCOVERED ceiling and `prog.points`/persisted state agree.
-    // `vf_table_voltage_mv` is left untouched.
-    let backfill_voltage = |p: &mut PowerSweepPoint| {
-        if p.voltage_mv == 0 {
-            p.voltage_mv = p.vf_table_voltage_mv.unwrap_or(p.voltage_mv);
-        }
-    };
-    if let Some(p) = prog.godforge.as_mut() {
-        backfill_voltage(p);
-    }
-    if let Some(p) = prog.brokkrs.as_mut() {
-        backfill_voltage(p);
-    }
-    if let Some(p) = prog.deep_calm.as_mut() {
-        backfill_voltage(p);
-    }
-    set(&progress, prog.clone());
-
-    // --- Arduous validation of each pick (long soak) ----------------------
-    // Each pick is validated AT ITS OWN clock: lock the pick's target clock, then soak under
-    // game-power for the arduous duration. A multi-clock pick carries the DISCOVERED VF-table ceiling
-    // (`vf_table_voltage_mv = Some(vbin)`) — the exact operating point Apply will write — so it is
-    // soaked AT THAT CEILING (`validate_pick_at_ceiling`, fail-closed: drop on any failure). A pick
-    // with no ceiling (`None`, single-clock / legacy) keeps the offset-based `arduous_validate` path,
-    // whose back-off candidate set is filtered to that pick's `target_clock_mhz`.
-    let pts = prog.points.clone();
-    prog.phase = "validate".into();
-    set(&progress, prog.clone());
-    let picks: [(&str, Option<PowerSweepPoint>); 3] = [
-        ("Godforge", prog.godforge),
-        ("Brokkr's", prog.brokkrs),
-        ("Deep Calm", prog.deep_calm),
-    ];
-    for (label, pick) in picks {
-        let Some(p) = pick else { continue };
-        let clk = p.target_clock_mhz.unwrap_or(detected);
-        let _ = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(clk);
-        let validated = if p.vf_table_voltage_mv.is_some() {
-            // Multi-clock pick: long soak AT THE DISCOVERED CEILING (mirrors the real probe write).
-            // LONG mode repeats the soak (`validation_passes`) so a deep point earns in-session
-            // confidence; Standard runs a single pass. Any failed pass drops the pick (fail-closed).
-            validate_pick_ceiling_passes(
-                &store,
-                clk,
-                p,
-                &stop,
-                label,
-                &progress,
-                &mut prog,
-                validation_passes,
-            )
-        } else {
-            // Legacy / single-clock fallback: offset-based long soak + back-off within this clock.
-            let same_clock: Vec<PowerSweepPoint> = match p.target_clock_mhz {
-                Some(t) => pts
-                    .iter()
-                    .copied()
-                    .filter(|q| q.target_clock_mhz == Some(t))
-                    .collect(),
-                None => pts.clone(),
-            };
-            arduous_validate(
-                &mut ctx,
-                &store,
-                clk,
-                p,
-                &same_clock,
-                &stop,
-                label,
-                &progress,
-                &mut prog,
-            )
-        };
-        match label {
-            "Godforge" => prog.godforge = validated,
-            "Brokkr's" => prog.brokkrs = validated,
-            _ => prog.deep_calm = validated,
-        }
-    }
-    prog.recommended = prog.brokkrs;
-
-    // ALWAYS restore stock after validation (success, partial, or abort). No profile is applied.
-    let _ = nidavellir_gpu_nvapi::unlock_core_voltage();
-    let _ = gpu::reset_all();
-    let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
-    let _ = store.clear_boot_flag();
-
-    if prog.godforge.is_some() {
-        let fmt = |o: Option<PowerSweepPoint>| match o {
-            Some(p) => format!(
-                "{} MHz @ {} mV ({:.0} W)",
-                p.clock_mhz,
-                p.vf_table_voltage_mv.unwrap_or(p.voltage_mv),
-                p.power_w
-            ),
-            None => "—".into(),
-        };
-        prog.note = Some(format!(
-            "Multi-clock · cap {cap:.0} W · Godforge {} · Brokkr's {} · Deep Calm {} — confirme em jogo.",
-            fmt(prog.godforge), fmt(prog.brokkrs), fmt(prog.deep_calm)
-        ));
-    } else {
-        prog.note = Some("Nenhum perfil estável encontrado.".into());
-    }
-    prog.running = false;
-    prog.phase = "done".into();
-    // Persist the completed result so the service can reconstruct forged
-    // profiles/points after a restart. Only when there is a usable profile, so a
-    // failed/empty sweep never overwrites a previously good snapshot.
-    if prog.godforge.is_some() {
-        save_forge_state(&gpu_key, &prog);
-    }
-    set(&progress, prog);
-    info!("Power sweep finished");
 }
 
 /// Every distinct thermally normalized live frequency whose physical index is present in the sane
@@ -11358,19 +10459,6 @@ mod tests {
     }
 
     #[test]
-    fn wilson_lower_bound_matches_spec_values() {
-        // No trials → no confidence (the gate can never pass on an unseen point).
-        assert_eq!(wilson_lower_bound(0, 0, 1.96), 0.0);
-        // The V2 premise: a single clean trial is weak; many clean trials are strong.
-        let one = wilson_lower_bound(1, 1, 1.96);
-        let fifty = wilson_lower_bound(50, 50, 1.96);
-        assert!((one - 0.21).abs() < 0.01, "1/1 ≈ 0.21, got {one}");
-        assert!((fifty - 0.93).abs() < 0.01, "50/50 ≈ 0.93, got {fifty}");
-        // A failure must drag confidence below a perfect record of the same size.
-        assert!(wilson_lower_bound(9, 10, 1.96) < wilson_lower_bound(10, 10, 1.96));
-    }
-
-    #[test]
     fn recover_after_reset_preserves_interrupted_checkpoint_for_operator_review() {
         let handle = PowerSweepHandle::default();
         {
@@ -11601,34 +10689,6 @@ mod tests {
         assert!(crate::gpu_undervolt::field_pair_blacklisted(
             &record, 1845, 862
         ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn power_sweep_mode_tuning_preserves_standard_and_expands_long() {
-        // Legacy F1 tuning remains covered because the old engine is intentionally retained, but the
-        // live F2 route uses `f2_policy()` below and does not consume these breadth/depth budgets.
-        // INVARIANT: Standard stays byte-identical to the pre-modes (proven, HW-validated) button —
-        // same probe/depth caps and a single ceiling soak. The plain `StartPowerSweep` maps here.
-        assert_eq!(PowerSweepMode::default(), PowerSweepMode::Standard);
-        assert_eq!(
-            PowerSweepMode::Standard.tuning(),
-            (BUTTON_MAX_PROBES, BUTTON_MAX_PROBES_PER_TARGET, 1)
-        );
-        // Long: broader + deeper discovery and >1 confidence passes, within the defensive hard cap.
-        let (lp, lpt, lpass) = PowerSweepMode::Long.tuning();
-        assert!(
-            lp > BUTTON_MAX_PROBES,
-            "long must widen the global probe budget"
-        );
-        assert!(
-            lpt >= BUTTON_MAX_PROBES_PER_TARGET,
-            "long must not shrink per-target descent"
-        );
-        assert!(
-            (2..=POWER_SWEEP_MAX_VALIDATION_PASSES).contains(&lpass),
-            "long passes must exceed 1 yet stay within the defensive cap"
-        );
     }
 
     #[cfg(windows)]
@@ -12398,64 +11458,6 @@ mod tests {
         ));
     }
 
-
-    #[cfg(windows)]
-    fn pt(offset_mhz: i32, perf_per_watt: f64, capped: f32) -> PowerSweepPoint {
-        PowerSweepPoint {
-            voltage_mv: 900,
-            clock_mhz: 1830,
-            offset_mhz,
-            power_w: 180.0,
-            max_power_w: 185.0,
-            power_std_w: 1.0,
-            power_capped_frac: capped,
-            stable: true,
-            perf_per_watt,
-            measured_voltage_mv: Some(900),
-            vf_table_voltage_mv: None,
-            ..Default::default()
-        }
-    }
-
-    /// Build a knowledge base where each entry has an exact (trials, stable, score).
-    #[cfg(windows)]
-    fn knowledge_with(entries: &[(i32, u32, u32, f64)]) -> GpuKnowledge {
-        let mut k = GpuKnowledge::default();
-        for &(offset, trials, stable, score) in entries {
-            let e = k.points.entry(offset).or_default();
-            e.trials = trials;
-            e.stable_trials = stable;
-            e.failures = trials - stable;
-            // score() = clock_mhz_sum / power_w_sum → choose sums that yield `score`.
-            e.power_w_sum = 100.0 * stable as f64;
-            e.clock_mhz_sum = (score * e.power_w_sum) as u64;
-        }
-        k
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn gate_picks_best_score_among_confident_points() {
-        // +195 is the most efficient point that is ALSO well-tested; +210 is more
-        // efficient on paper but tested once → its low confidence must keep it out.
-        let off_cap = vec![pt(180, 10.24, 0.0), pt(195, 11.0, 0.0), pt(210, 12.0, 0.0)];
-        let know = knowledge_with(&[(180, 50, 50, 10.24), (195, 60, 60, 11.0), (210, 1, 1, 12.0)]);
-        let (pick, log) = select_brokkrs_v2(&off_cap, &off_cap, &know, SweepProfile::Balanced);
-        assert_eq!(pick.unwrap().offset_mhz, 195);
-        assert!(log.iter().any(|l| l.contains("decision=accepted")));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn gate_falls_back_to_v1_when_confidence_is_immature() {
-        // Every point has a single trial (today's real state) → nothing clears .85
-        // → V1 fallback chooses the best off-cap perf/watt and logs that it did.
-        let off_cap = vec![pt(150, 9.0, 0.0), pt(180, 10.24, 0.0)];
-        let know = knowledge_with(&[(150, 1, 1, 9.0), (180, 1, 1, 10.24)]);
-        let (pick, log) = select_brokkrs_v2(&off_cap, &off_cap, &know, SweepProfile::Balanced);
-        assert_eq!(pick.unwrap().offset_mhz, 180);
-        assert!(log.iter().any(|l| l.contains("fallback=V1")));
-    }
 
     #[cfg(windows)]
     fn fp(clock_mhz: u32, power_w: f32) -> PowerSweepPoint {
@@ -15903,11 +14905,6 @@ mod tests {
         assert_eq!(voltage_quality(5), DwellQuality::Low);
         assert_eq!(voltage_quality(20), DwellQuality::Medium);
         assert_eq!(voltage_quality(60), DwellQuality::High);
-        // Overall takes the worst metric (voltage is the weak link here).
-        assert_eq!(
-            worst_quality(DwellQuality::High, DwellQuality::Medium),
-            DwellQuality::Medium
-        );
     }
 
     #[cfg(windows)]

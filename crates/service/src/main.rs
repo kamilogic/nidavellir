@@ -4,13 +4,8 @@ mod detector_lab;
 mod development_validation;
 mod game_trace;
 mod gpu_apply;
-mod gpu_benchmark;
 mod gpu_f2_sweep;
-mod gpu_forge_all;
-mod gpu_mem_sweep;
 mod gpu_power_sweep;
-mod gpu_real;
-mod gpu_sweep_real;
 mod gpu_undervolt;
 mod gpu_verify;
 mod health;
@@ -29,12 +24,7 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use windows_service::define_windows_service;
 
-use gpu_benchmark::BenchmarkHandle;
-use gpu_forge_all::ForgeAllHandle;
-use gpu_mem_sweep::MemSweepHandle;
 use gpu_power_sweep::PowerSweepHandle;
-use gpu_real::GpuValidationHandle;
-use gpu_sweep_real::RealSweepHandle;
 use nidavellir_core::safe_loop::SafeLoopStore;
 use nidavellir_driver_pawnio::DriverManager;
 
@@ -46,11 +36,6 @@ pub struct AppState {
     pub sensor_engine: nidavellir_core::sensors::SensorEngine,
     pub motherboard: nidavellir_core::detector::MotherboardInfo,
     pub safe_store: SafeLoopStore,
-    pub gpu_validation: GpuValidationHandle,
-    pub real_sweep: RealSweepHandle,
-    pub mem_sweep: MemSweepHandle,
-    pub forge_all: ForgeAllHandle,
-    pub benchmark: BenchmarkHandle,
     pub power_sweep: PowerSweepHandle,
     pub game_trace: game_trace::GameTraceHandle,
     pub manual_point: manual_point::ManualPointHandle,
@@ -516,11 +501,6 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
         // Only the board is needed here; the full probe spawns PowerShell (~2 s) on every start.
         motherboard: nidavellir_core::detector::detect_motherboard(),
         safe_store,
-        gpu_validation: GpuValidationHandle::default(),
-        real_sweep: RealSweepHandle::default(),
-        mem_sweep: MemSweepHandle::default(),
-        forge_all: ForgeAllHandle::default(),
-        benchmark: BenchmarkHandle::default(),
         // Seed from the persisted forge result so a restart restores forged
         // profiles/points instead of showing an unforged GPU.
         power_sweep: gpu_power_sweep::restore_handle(),

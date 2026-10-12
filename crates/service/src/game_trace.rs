@@ -346,7 +346,7 @@ pub fn run(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// UI-controlled background telemetry logger, living in the running service process (already
-/// elevated). Mirrors the [`crate::gpu_benchmark::BenchmarkHandle`] start/stop/status shape.
+/// elevated), with a start/stop/status handle.
 #[derive(Clone)]
 pub struct GameTraceHandle {
     status: Arc<Mutex<GameTraceStatus>>,
