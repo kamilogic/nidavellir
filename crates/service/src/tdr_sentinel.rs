@@ -1242,8 +1242,8 @@ fn watcher_event_is_new(last_handled: Option<&str>, start_floor: &str, newest: &
 /// function returns only after the watcher thread durably persists that seed/floor and acknowledges
 /// it is active; callers must treat every error as a hard block on reapply and hardware work.
 pub fn spawn(store: SafeLoopStore, initial_baseline: Option<String>) -> Result<(), String> {
-    CANARY_ENABLED.store(crate::gpu_power_sweep::load_forge_option("sentinel_canary"), std::sync::atomic::Ordering::SeqCst);
-    PROBLEM_SEEN.store(crate::gpu_power_sweep::load_forge_option("sentinel_problem"), std::sync::atomic::Ordering::SeqCst);
+    CANARY_ENABLED.store(crate::gpu_power_sweep::load_forge_option("sentinel_canary", false), std::sync::atomic::Ordering::SeqCst);
+    PROBLEM_SEEN.store(crate::gpu_power_sweep::load_forge_option("sentinel_problem", false), std::sync::atomic::Ordering::SeqCst);
     // Shared bump budget across BOTH layers: one automatic bump per service session, total.
     let bumps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let watcher_started = nidavellir_core::f2_observation::now_rfc3339();

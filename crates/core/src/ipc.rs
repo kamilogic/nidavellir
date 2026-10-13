@@ -556,14 +556,19 @@ pub struct PowerSweepProgress {
     /// Structured human-readable reason why `ResumePowerSweep` is currently unavailable.
     #[serde(default)]
     pub resume_block_reason: Option<String>,
-    /// Opt-in (2026-10-01): after a staircase-edge TDR and the next service start, acknowledge the
-    /// run's own CandidateCrash and Resume automatically, through the same guards as the user's
-    /// Resume. Persisted with the run and carried into the next one.
+    /// After a staircase-edge TDR and the next service start, acknowledge the run's own
+    /// CandidateCrash and Resume automatically, through the same guards as the user's Resume.
+    /// Opt-in from 2026-10-01; on by default since 2026-10-12 unless the user turned it off.
     #[serde(default)]
     pub auto_resume: bool,
     /// Epoch ms when a pending automatic Resume fires; `None` when none is scheduled.
     #[serde(default)]
     pub auto_resume_at_ms: Option<u64>,
+    /// The run was started by a build where auto-resume is on by default (2026-10-12), so only such
+    /// a run may continue by itself. A run saved by an older build, when the option was opt-in,
+    /// decodes as `false` and waits for the user's Resume.
+    #[serde(default)]
+    pub auto_resume_consent: bool,
     /// The Sentinel's GPU check while gaming (2026-10-05): a short self-check every 20 s under load
     /// that can catch silent errors at the applied profile, at the cost of brief stutters. Off by
     /// default; filled by `GetPowerSweepProgress` and `SetSentinelCanary`.

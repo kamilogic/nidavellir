@@ -209,16 +209,19 @@ fn f2_current_crash_budget_error(
     }
 }
 
-/// An opted-in run interrupted at a staircase-edge TDR may resume itself: its search is still open
-/// (unexpected TDRs close it) and the only pending incident, if any, is this run's own
-/// CandidateCrash. Every Resume guard (reboot latch, boot flag, Safe Mode, crash ceiling, build
-/// and driver identity) still runs inside `resume`.
+/// A run interrupted at a staircase-edge TDR may resume itself when auto-resume is on and the run
+/// was started by a build where it is on by default (`auto_resume_consent`: a run saved by an
+/// older, opt-in build waits for the user). Its search must still be open (unexpected TDRs close
+/// it) and the only pending incident, if any, is this run's own CandidateCrash. Every Resume guard
+/// (reboot latch, boot flag, Safe Mode, crash ceiling, build and driver identity) still runs
+/// inside `resume`.
 #[cfg(windows)]
 pub(crate) fn auto_resume_eligible(
     progress: &PowerSweepProgress,
     pending: Option<&nidavellir_core::safe_loop::ForgeIncident>,
 ) -> bool {
     progress.auto_resume
+        && progress.auto_resume_consent
         && !progress.running
         && progress.phase == "interrupted"
         && progress.discovery_search.as_ref().is_some_and(|search| search.stop_reason.is_none())
@@ -1073,14 +1076,21 @@ fn forge_options_path() -> std::path::PathBuf {
     nidavellir_core::safe_loop::default_data_dir().join("forge_options.json")
 }
 
-/// A user preference, not learning: Full Reset keeps it.
+/// Auto-resume after this run's own edge TDR is on unless the user turned it off: a Forge takes
+/// hours and needs no one at the PC (decision 2026-10-12 (b)). The Sentinel options stay opt-in.
+pub(crate) const AUTO_RESUME_DEFAULT: bool = true;
+
+/// A user preference, not learning: Full Reset keeps it. A missing key reads as `default`.
 #[cfg(windows)]
-pub(crate) fn load_forge_option(key: &str) -> bool {
-    std::fs::read_to_string(forge_options_path())
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+pub(crate) fn load_forge_option(key: &str, default: bool) -> bool {
+    forge_option_from(std::fs::read_to_string(forge_options_path()).ok().as_deref(), key, default)
+}
+
+/// One option from the `forge_options.json` text. Unreadable text or a missing key gives `default`.
+fn forge_option_from(text: Option<&str>, key: &str, default: bool) -> bool {
+    text.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
         .and_then(|value| value.get(key)?.as_bool())
-        .unwrap_or(false)
+        .unwrap_or(default)
 }
 
 /// Writes one key and keeps the others: auto-resume and the Sentinel options share the file.
@@ -2686,7 +2696,7 @@ pub(crate) fn current_gpu_key() -> String {
 #[cfg(windows)]
 pub fn restore_handle() -> PowerSweepHandle {
     let handle = PowerSweepHandle::default();
-    handle.auto_resume.store(load_forge_option("auto_resume"), Ordering::SeqCst);
+    handle.auto_resume.store(load_forge_option("auto_resume", AUTO_RESUME_DEFAULT), Ordering::SeqCst);
     let gpu_key = current_gpu_key();
     if let Some(mut prog) = load_forge_state(&gpu_key) {
         let store = SafeLoopStore::system();
@@ -8355,6 +8365,9 @@ fn measure_multiclock_undervolt_forge(
     prog.is_undervolt = true; // Apply IPC routes these points through the anchored F2 writer.
     prog.mode = Some(mode.id().to_string());
     prog.run_id = Some(run_id.clone());
+    // Only a run started by this build may continue by itself; a resumed run keeps what it had, so
+    // a run from an older, opt-in build never resumes unattended (2026-10-12 safety audit).
+    prog.auto_resume_consent = if resume_requested { previous.auto_resume_consent } else { true };
     if resumed_run_sequence.is_empty() {
         resumed_run_sequence.push(run_id.clone());
     }
@@ -11790,6 +11803,7 @@ mod tests {
         use nidavellir_core::safe_loop::{ForgeIncident, ForgeIncidentKind};
         let mut progress = PowerSweepProgress {
             auto_resume: true,
+            auto_resume_consent: true,
             phase: "interrupted".into(),
             run_id: Some("run-a".into()),
             discovery_search: Some(Default::default()),
@@ -11813,6 +11827,42 @@ mod tests {
         progress.phase = "interrupted".into();
         progress.auto_resume = false;
         assert!(!auto_resume_eligible(&progress, Some(&crash("run-a"))));
+    }
+
+    /// 2026-10-12 safety audit: with auto-resume on by default, a run interrupted under an older,
+    /// opt-in build (its saved state has no consent stamp) must wait for the user's Resume.
+    #[cfg(windows)]
+    #[test]
+    fn a_run_saved_by_an_opt_in_build_never_resumes_by_itself() {
+        use nidavellir_core::safe_loop::{ForgeIncident, ForgeIncidentKind};
+        let started_here = PowerSweepProgress {
+            auto_resume: true,
+            auto_resume_consent: true,
+            phase: "interrupted".into(),
+            run_id: Some("run-old".into()),
+            discovery_search: Some(Default::default()),
+            ..Default::default()
+        };
+        let mut saved = serde_json::to_value(&started_here).unwrap();
+        saved.as_object_mut().unwrap().remove("auto_resume_consent");
+        let restored: PowerSweepProgress = serde_json::from_value(saved).unwrap();
+        assert!(!restored.auto_resume_consent, "older saved state decodes without consent");
+        let crash = ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash, Some("run-old".into()), Some("gpu".into()), Some(1815), Some(887), "tdr",
+        );
+        assert!(!auto_resume_eligible(&restored, Some(&crash)), "the pending incident waits for the user");
+        assert!(!auto_resume_eligible(&restored, None), "an orphan interrupted run waits for the user");
+        assert!(auto_resume_eligible(&started_here, Some(&crash)));
+    }
+
+    #[test]
+    fn auto_resume_defaults_on_while_an_explicit_choice_and_the_sentinel_options_hold() {
+        assert!(forge_option_from(None, "auto_resume", AUTO_RESUME_DEFAULT), "fresh install");
+        assert!(forge_option_from(Some(r#"{"sentinel_canary":true}"#), "auto_resume", AUTO_RESUME_DEFAULT));
+        assert!(!forge_option_from(Some(r#"{"auto_resume":false}"#), "auto_resume", AUTO_RESUME_DEFAULT), "the user turned it off");
+        assert!(forge_option_from(Some("not json"), "auto_resume", AUTO_RESUME_DEFAULT));
+        assert!(!forge_option_from(None, "sentinel_canary", false), "the GPU check stays opt-in");
+        assert!(forge_option_from(Some(r#"{"sentinel_canary":true}"#), "sentinel_canary", false));
     }
 
     #[cfg(windows)]
