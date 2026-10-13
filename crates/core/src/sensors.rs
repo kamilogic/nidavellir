@@ -34,6 +34,9 @@ pub struct GpuSensors {
     pub power_w: Option<f32>,
     pub temperature_source: Option<String>,
     pub power_source: Option<String>,
+    /// Enforced board power limit from NVML (W), for the Live GPU power reading.
+    #[serde(default)]
+    pub power_limit_w: Option<f32>,
 }
 
 pub struct SensorEngine {
@@ -100,6 +103,7 @@ fn read_gpu_sensors() -> Vec<GpuSensors> {
                 power_w: nv.power_w,
                 temperature_source: nv.temperature_c.map(|_| SensorSource::Nvml.as_str().to_string()),
                 power_source: nv.power_w.map(|_| SensorSource::Nvml.as_str().to_string()),
+                power_limit_w: nv.power_limit_w,
             },
         );
     }
@@ -171,6 +175,7 @@ fn read_gpu_sensors_wmi() -> Vec<GpuSensors> {
             power_w: None,
             temperature_source: None,
             power_source: None,
+            power_limit_w: None,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
