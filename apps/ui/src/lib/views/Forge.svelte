@@ -1,10 +1,10 @@
 <script>
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { open } from "@tauri-apps/plugin-shell";
   import { serviceCall } from "../service.js";
   import { nvidiaGpu, recoverForge, requireServiceData } from "../forge-workflow.js";
-  import AdvancedDiagnosticsHub from "../components/forge/AdvancedDiagnosticsHub.svelte";
+  import LiveLog from "../components/forge/LiveLog.svelte";
+  import SentinelPage from "../components/forge/SentinelPage.svelte";
   import ForgeThemeScreen from "../components/forge/ForgeThemeScreen.svelte";
   import StartupScreen from "../components/forge/StartupScreen.svelte";
   import UpdateButton from "../components/forge/UpdateButton.svelte";
@@ -19,32 +19,20 @@
   let hardware = $state(null);
   let safeLoop = $state(null);
   let activeView = $state("forge");
-  let diagnosticsTab = $state("log");
   let applied = $state(null);
   let exporting = $state(false);
   let exportMsg = $state("");
   let exportFailed = $state(false);
   // v17 sentinel: last automatic action + recommendation (sentinel_status.json via IPC).
   let sentinel = $state(null);
-  // Game-trace: read-only NVML/NVAPI workload logger.
-  let gameTrace = $state(null);
-  let gameTraceBusy = $state(false);
-  let gameTraceActionError = $state("");
-  let gameTraceExportBusy = $state(false);
-  let gameTraceExportMsg = $state("");
-  let manualPoint = $state(null);
-  let manualPointBusy = $state(false);
-  let manualPointActionError = $state("");
-  let detectorLab = $state(null);
-  let detectorLabBusy = $state(false);
-  let detectorLabActionError = $state("");
   let fullResetBusy = $state(false);
   let actionBusy = $state(false);
   let fullResetFeedback = $state(null);
   // Live GPU telemetry (ReadSensors) + rolling sparkline buffers for the monitoring panel.
   let sensors = $state(null);
   let sparks = $state({ core: [], mem: [], temp: [], power: [], fan: [], voltage: [], usage: [] });
-  const SPARK_CAP = 20;
+  // 30 readings, one every 2 s: the Live GPU monitor shows the last minute.
+  const SPARK_CAP = 30;
   let powerSweep = $state(null);
   let forgeMode = $state("standard");
   let resetCleanRunArmed = $state(false);
@@ -432,168 +420,8 @@
     }
   }
 
-  async function refreshGameTrace(clearRecoveredError = true) {
-    try {
-      const r = await serviceCall("GetGameTraceStatus");
-      if (r?.ok === false) throw new Error(r.error || "Unable to read Game Trace status");
-      if (r?.data?.type === "GameTrace") {
-        gameTrace = r.data;
-        if (clearRecoveredError && !gameTraceBusy) gameTraceActionError = "";
-      }
-    } catch {
-      /* game-trace status is best-effort UI info */
-    }
-  }
-
-  async function toggleGameTrace() {
-    if (gameTraceBusy) return;
-    gameTraceBusy = true;
-    gameTraceActionError = "";
-    try {
-      const method = gameTrace?.running ? "StopGameTrace" : "StartGameTrace";
-      const r = await serviceCall(method);
-      if (r?.ok === false) throw new Error(r.error || "Unable to update Game Trace");
-      if (r?.data?.type !== "GameTrace") throw new Error("Invalid Game Trace response");
-      gameTrace = r.data;
-      gameTraceExportMsg = "";
-    } catch (e) {
-      gameTraceActionError = String(e);
-    } finally {
-      await refreshGameTrace(false);
-      gameTraceBusy = false;
-    }
-  }
-
-  async function openGameTraceLog() {
-    if (!gameTrace?.out_path || gameTraceExportBusy) return;
-    gameTraceExportBusy = true;
-    gameTraceExportMsg = "";
-    try {
-      await open(gameTrace.out_path);
-      gameTraceExportMsg = "The exported JSONL was opened with your default application.";
-    } catch (e) {
-      gameTraceExportMsg = `Unable to open the exported log: ${String(e)}`;
-    } finally {
-      gameTraceExportBusy = false;
-    }
-  }
-
-  async function refreshManualPoint(clearRecoveredError = true) {
-    try {
-      const r = await serviceCall("GetManualDiagnosticPointStatus");
-      if (r?.ok === false) throw new Error(r.error || "Unable to read manual point status");
-      if (r?.data?.type === "ManualDiagnosticPoint") {
-        manualPoint = r.data;
-        if (clearRecoveredError && !manualPointBusy) manualPointActionError = "";
-      }
-    } catch {
-      /* diagnostic status is best-effort UI information */
-    }
-  }
-
-  async function applyManualPoint(config) {
-    if (manualPointBusy || manualPoint?.active) return;
-    const confirmed = globalThis.confirm?.(
-      `Apply the temporary diagnostic point ${config.target_mhz} MHz @ ${config.voltage_mv} mV? Clock may step down, but the resolved voltage will be locked. It may cause a driver reset during real workloads. The point will not become a profile; use Return to stock when the test is finished.`,
-    ) ?? true;
-    if (!confirmed) return;
-    manualPointBusy = true;
-    manualPointActionError = "";
-    try {
-      const r = await serviceCall("ApplyManualDiagnosticPoint", config);
-      if (r?.ok === false) throw new Error(r.error || "Unable to apply the manual point");
-      if (r?.data?.type !== "ManualDiagnosticPoint") throw new Error("Invalid manual point response");
-      manualPoint = r.data;
-    } catch (e) {
-      manualPointActionError = String(e);
-    } finally {
-      await refreshManualPoint(false);
-      manualPointBusy = false;
-    }
-  }
-
-  async function resetManualPoint() {
-    if (manualPointBusy) return;
-    manualPointBusy = true;
-    manualPointActionError = "";
-    try {
-      const r = await serviceCall("ResetManualDiagnosticPoint");
-      if (r?.ok === false) throw new Error(r.error || "Unable to return the GPU to stock");
-      if (r?.data?.type === "ManualDiagnosticPoint") manualPoint = r.data;
-    } catch (e) {
-      manualPointActionError = String(e);
-    } finally {
-      await refreshManualPoint(false);
-      manualPointBusy = false;
-    }
-  }
-
-  async function refreshDetectorLab(clearRecoveredError = true) {
-    try {
-      const r = await serviceCall("GetDetectorLabStatus");
-      if (r?.ok === false) throw new Error(r.error || "Unable to read Detector Lab status");
-      if (r?.data?.type === "DetectorLab") {
-        detectorLab = r.data;
-        if (clearRecoveredError && !detectorLabBusy) detectorLabActionError = "";
-      }
-    } catch {
-      /* experimental diagnostic status is best-effort UI information */
-    }
-  }
-
-  async function startDetectorLab(config) {
-    if (detectorLabBusy || detectorLab?.running || !manualPoint?.active) return;
-    const recipeLabel = config.recipe === "dense_v14" ? "v14 dense candidate" : "v25 control";
-    const confirmed = globalThis.confirm?.(
-      `Run ${recipeLabel} for ${config.duration_s} seconds at ${manualPoint.target_mhz} MHz @ ${manualPoint.resolved_voltage_mv} mV? A marginal point may cause a TDR. Detector Lab will not qualify a profile or write blacklist.`,
-    ) ?? true;
-    if (!confirmed) return;
-    detectorLabBusy = true;
-    detectorLabActionError = "";
-    try {
-      const r = await serviceCall("StartDetectorLab", config);
-      if (r?.ok === false) throw new Error(r.error || "Unable to start Detector Lab");
-      if (r?.data?.type !== "DetectorLab") throw new Error("Invalid Detector Lab response");
-      detectorLab = r.data;
-    } catch (e) {
-      detectorLabActionError = String(e);
-    } finally {
-      await Promise.all([refreshDetectorLab(false), refreshManualPoint(false)]);
-      detectorLabBusy = false;
-    }
-  }
-
-  async function stopDetectorLab() {
-    if (detectorLabBusy || !detectorLab?.running) return;
-    detectorLabBusy = true;
-    detectorLabActionError = "";
-    try {
-      const r = await serviceCall("StopDetectorLab");
-      if (r?.ok === false) throw new Error(r.error || "Unable to stop Detector Lab");
-      if (r?.data?.type === "DetectorLab") detectorLab = r.data;
-    } catch (e) {
-      detectorLabActionError = String(e);
-    } finally {
-      await refreshDetectorLab(false);
-      detectorLabBusy = false;
-    }
-  }
-
-  async function openDetectorLabLog() {
-    if (!detectorLab?.out_path) return;
-    try {
-      await open(detectorLab.out_path);
-    } catch (e) {
-      detectorLabActionError = `Unable to open the Detector Lab journal: ${String(e)}`;
-    }
-  }
-
-  function closeAdvancedDiagnostics() {
-    changeView("forge");
-  }
-
   function changeView(view) {
-    activeView = view === "advanced" || view === "settings" ? view : "forge";
+    activeView = ["report", "log", "sentinel", "settings"].includes(view) ? view : "forge";
     requestAnimationFrame(() => {
       window.scrollTo({ top: 0, behavior: "auto" });
       document.querySelector("[data-forge-heading]")?.focus({ preventScroll: true });
@@ -629,23 +457,6 @@
   }
 
   const primarySensorGpu = $derived(sensors?.gpu?.[0] ?? null);
-  const logLines = $derived(powerSweep?.log ?? []);
-  const sentinelState = $derived.by(() => {
-    if (!sentinel) return "No events";
-    if (sentinel.action === "bump") return "Automatic adjustment";
-    if (String(sentinel.action ?? "").startsWith("stock")) return "Returned to stock";
-    return "Event recorded";
-  });
-  // Sentinel status records differ by event; a TDR record carries no tuning pair.
-  const sentinelSummary = $derived.by(() => {
-    if (!sentinel) return "No automatic recovery action recorded.";
-    const pair = sentinel.target_mhz && sentinel.failed_mv ? `${sentinel.target_mhz} MHz @ ${sentinel.failed_mv} mV` : null;
-    if (sentinel.action === "bump" && pair) {
-      return `Kept ${sentinel.target_mhz} MHz and moved the unstable point from ${sentinel.failed_mv} to ${sentinel.new_mv} mV (strike ${sentinel.strike}/3).`;
-    }
-    if (sentinel.event === "tdr") return `The GPU driver crashed${pair ? ` at ${pair}` : ""}; the GPU returned to stock.`;
-    return pair ? `Returned the GPU to stock after a failure at ${pair}.` : "Returned the GPU to stock after a stability event.";
-  });
 
   $effect(() => {
     if (
@@ -715,22 +526,13 @@
     refresh();
     refreshSentinel();
     refreshSensors();
-    refreshGameTrace();
-    refreshManualPoint();
-    refreshDetectorLab();
     timer = setInterval(tick, 500);
     const sentinelTimer = setInterval(refreshSentinel, 10_000);
     const sensorTimer = setInterval(refreshSensors, 2000);
-    const gameTraceTimer = setInterval(refreshGameTrace, 1000);
-    const manualPointTimer = setInterval(refreshManualPoint, 2000);
-    const detectorLabTimer = setInterval(refreshDetectorLab, 1000);
     return () => {
       clearInterval(timer);
       clearInterval(sentinelTimer);
       clearInterval(sensorTimer);
-      clearInterval(gameTraceTimer);
-      clearInterval(manualPointTimer);
-      clearInterval(detectorLabTimer);
     };
   });
 </script>
@@ -757,7 +559,7 @@
     {exportMsg}
     {exportFailed}
     onExportLog={exportLog}
-    onViewSafetyHistory={() => { diagnosticsTab = "sentinel"; changeView("advanced"); }}
+    onViewSafetyHistory={() => changeView("sentinel")}
     onForgeModeChange={selectForgeMode}
     onStartPower={startPower}
     onRecoverContinue={recoverAndStartPower}
@@ -772,39 +574,11 @@
     {activeView}
     onViewChange={changeView}
   >
-    <AdvancedDiagnosticsHub
-      bind:activeTab={diagnosticsTab}
-      embedded
-      {powerSweep}
-      {logLines}
-      {exporting}
-      {exportMsg}
-      {exportFailed}
-      {sentinel}
-      {safeLoop}
-      {sentinelState}
-      {sentinelSummary}
-      {gameTrace}
-      {gameTraceBusy}
-      {gameTraceActionError}
-      {gameTraceExportBusy}
-      {gameTraceExportMsg}
-      {manualPoint}
-      {manualPointBusy}
-      {manualPointActionError}
-      {detectorLab}
-      {detectorLabBusy}
-      {detectorLabActionError}
-      onExportLog={exportLog}
-      onToggleGameTrace={toggleGameTrace}
-      onOpenGameTraceLog={openGameTraceLog}
-      onApplyManualPoint={applyManualPoint}
-      onResetManualPoint={resetManualPoint}
-      onStartDetectorLab={startDetectorLab}
-      onStopDetectorLab={stopDetectorLab}
-      onOpenDetectorLabLog={openDetectorLabLog}
-      onClose={closeAdvancedDiagnostics}
-    />
+    {#if activeView === "sentinel"}
+      <SentinelPage {sentinel} {safeLoop} {powerSweep} {applied} serviceReady={serviceStatus === "online"} />
+    {:else}
+      <LiveLog {powerSweep} {exporting} {exportMsg} {exportFailed} onExportLog={exportLog} />
+    {/if}
   </ForgeThemeScreen>
   <UpdateButton />
 

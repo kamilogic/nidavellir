@@ -2,12 +2,13 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { AppWindow, Check, Languages, RefreshCw, Settings, ShieldCheck } from "@lucide/svelte";
+  import { Activity, AppWindow, Check, Languages, RefreshCw, Settings, ShieldCheck } from "@lucide/svelte";
   import { locale } from "../../i18n.js";
+  import { liveGpuView } from "../../live-gpu-view.js";
   import { serviceCall } from "../../service.js";
   import { checkForUpdate, requestUpdate, updateHold, updateState } from "../../updates.js";
 
-  let { powerSweep = null, serviceReady = false } = $props();
+  let { powerSweep = null, serviceReady = false, resetDisabled = true, resetDisabledReason = "", onOpenReset } = $props();
 
   let sentinelOverride = $state(null);
   let sentinelSaving = $state(false);
@@ -112,7 +113,9 @@
     </div>
   </header>
 
-  <div class="settings-list">
+  <section class="settings-band" aria-label="Preferences">
+    <span class="band-title">Preferences</span>
+    <div class="settings-list">
 
     <section class="settings-row" aria-labelledby="language-setting-title">
       <div class="setting-label">
@@ -139,6 +142,29 @@
           </button>
         </div>
         <p class="setting-note">Português will be enabled when every visible screen has a complete translation.</p>
+      </div>
+    </section>
+
+    <section class="settings-row" aria-labelledby="live-gpu-setting-title">
+      <div class="setting-label">
+        <Activity size={23} strokeWidth={1.6} />
+        <div>
+          <h2 id="live-gpu-setting-title">Live GPU view</h2>
+          <p>How the Forge screen draws the live clock, voltage, power and temperature.</p>
+        </div>
+      </div>
+
+      <div class="setting-control">
+        <div class="language-options" role="group" aria-label="Live GPU view">
+          <button type="button" class:active={$liveGpuView === "monitor"} aria-pressed={$liveGpuView === "monitor"} onclick={() => liveGpuView.set("monitor")}>
+            <span><strong>Monitor</strong><small>Graphs of the last minute · recommended</small></span>
+            <span class="choice-check" aria-hidden="true"><Check size={17} strokeWidth={2} /></span>
+          </button>
+          <button type="button" class:active={$liveGpuView === "gauges"} aria-pressed={$liveGpuView === "gauges"} onclick={() => liveGpuView.set("gauges")}>
+            <span><strong>Gauges</strong><small>Dials for the current moment</small></span>
+            <span class="choice-check" aria-hidden="true"><Check size={17} strokeWidth={2} /></span>
+          </button>
+        </div>
       </div>
     </section>
 
@@ -234,7 +260,41 @@
         {/if}
       </div>
     </section>
-  </div>
+    </div>
+  </section>
+
+  <!-- Kept apart from everyday settings: both resets erase measurements. -->
+  <section class="start-over" id="start-over" aria-labelledby="start-over-title">
+    <div class="start-over-head">
+      <h2 id="start-over-title">Start over</h2>
+      <p>Both return the GPU to stock first. Neither starts a Forge.</p>
+    </div>
+    <div class="start-over-options">
+      <div class="reset-option soft">
+        <span class="reset-kind">Soft Reset</span>
+        <h3>Measure again</h3>
+        <dl>
+          <dt class="keeps">Keeps</dt><dd>Known failures and blocked points</dd>
+          <dt class="clears">Clears</dt><dd>Profiles, measurements and the saved run</dd>
+          <dt>When</dt><dd>After a driver update, new cooling or a repaste</dd>
+        </dl>
+        <button class="reset-button soft" type="button" onclick={(event) => onOpenReset?.(event, "soft")} disabled={resetDisabled}>Soft Reset…</button>
+      </div>
+      <div class="reset-option full">
+        <span class="reset-kind">Full Reset</span>
+        <h3>Forget this GPU</h3>
+        <dl>
+          <dt class="erases">Erases</dt><dd>Everything Nidavellir learned, including failure history</dd>
+          <dt>Then</dt><dd>The next Forge starts from zero and may test points that failed before</dd>
+          <dt>When</dt><dd>Only when you want this GPU tested as if it were new</dd>
+        </dl>
+        <button class="reset-button full" type="button" onclick={(event) => onOpenReset?.(event, "full")} disabled={resetDisabled}>Full Reset…</button>
+      </div>
+    </div>
+    {#if resetDisabled && resetDisabledReason}
+      <p class="setting-note">{resetDisabledReason}</p>
+    {/if}
+  </section>
 </section>
 
 <style>
@@ -245,7 +305,6 @@
 
   .forge-settings {
     --settings-accent: #d0a15f;
-    --settings-accent-soft: rgba(208, 161, 95, 0.1);
     --settings-line: rgba(172, 181, 187, 0.28);
     --settings-text: #e2e3e2;
     --settings-muted: #969da2;
@@ -255,8 +314,26 @@
   }
 
   .settings-heading {
-    border-bottom: 1px solid var(--settings-line);
-    padding: 12px 0 34px;
+    padding: 12px 0 30px;
+  }
+
+  /* Full-width bands, as on the Forge screen. */
+  .settings-band,
+  .start-over {
+    margin-inline: calc(-1 * var(--page-gutter, 36px));
+    border-top: 1px solid rgba(164, 171, 177, 0.3);
+    padding: 22px var(--page-gutter, 36px) 28px;
+    background: rgba(5, 8, 9, 0.5);
+  }
+
+  .band-title,
+  .start-over-head h2 {
+    display: block;
+    color: #e9ba79;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
   }
 
   .settings-kicker {
@@ -303,9 +380,7 @@
     line-height: 1.6;
   }
 
-  .settings-list {
-    border-bottom: 1px solid var(--settings-line);
-  }
+
 
   .settings-row {
     display: grid;
@@ -350,8 +425,6 @@
 
   .language-options {
     display: grid;
-    overflow: hidden;
-    border: 1px solid var(--settings-line);
   }
 
   .language-options {
@@ -361,13 +434,12 @@
   .language-options button {
     display: grid;
     min-width: 0;
-    min-height: 78px;
     align-items: center;
     gap: 12px;
     border: 0;
     border-left: 1px solid var(--settings-line);
-    padding: 14px 16px;
-    background: rgba(5, 8, 9, 0.12);
+    padding: 0 20px 14px;
+    background: transparent;
     color: var(--settings-muted);
     text-align: left;
     cursor: pointer;
@@ -384,15 +456,14 @@
 
   .language-options button:first-child {
     border-left: 0;
+    padding-left: 0;
   }
 
   .language-options button:hover:not(:disabled) {
-    background: var(--settings-accent-soft);
     color: var(--settings-text);
   }
 
   .language-options button.active {
-    background: var(--settings-accent-soft);
     color: var(--settings-text);
     box-shadow: inset 0 -2px 0 var(--settings-accent);
   }
@@ -453,9 +524,6 @@
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 8px 20px;
-    min-height: 78px;
-    border-block: 1px solid var(--settings-line);
-    padding: 13px 16px;
   }
 
   .update-status > div {
@@ -521,22 +589,19 @@
     opacity: 0.6;
   }
 
-  .toggle-list {
-    border: 1px solid var(--settings-line);
-  }
-
   .toggle-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 18px;
     border-top: 1px solid var(--settings-line);
-    padding: 14px 16px;
+    padding: 14px 0;
     cursor: pointer;
   }
 
   .toggle-row:first-child {
     border-top: 0;
+    padding-top: 0;
   }
 
   .toggle-row > span {
@@ -608,6 +673,102 @@
     line-height: 1.5;
   }
 
+  .start-over {
+    margin-top: 16px;
+  }
+
+  .start-over-head h2 { margin: 0; }
+
+  .start-over-head p {
+    margin: 6px 0 0;
+    color: #9aa1a5;
+    font-size: 13.5px;
+  }
+
+  .start-over-options {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-top: 18px;
+  }
+
+  .reset-option {
+    min-width: 0;
+    border-left: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 4px 28px 6px;
+  }
+
+  .reset-option:first-child {
+    border-left: 0;
+    padding-left: 0;
+  }
+
+  .reset-kind,
+  .reset-option dt {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+
+  .soft .reset-kind,
+  .reset-option dt.clears { color: #e3a83b; }
+  .full .reset-kind,
+  .reset-option dt.erases { color: #e2656a; }
+  .reset-option dt.keeps { color: #8fc04a; }
+
+  .reset-option h3 {
+    margin: 6px 0 0;
+    color: #eceeef;
+    font-size: 20px;
+    font-weight: 600;
+  }
+
+  .reset-option dl {
+    display: grid;
+    grid-template-columns: 70px minmax(0, 1fr);
+    gap: 8px 12px;
+    margin: 14px 0 18px;
+    font-size: 14px;
+  }
+
+  .reset-option dt {
+    padding-top: 2px;
+    color: #8f979c;
+    font-size: 11px;
+  }
+
+  .reset-option dd {
+    margin: 0;
+    color: #b8bbbe;
+    text-wrap: pretty;
+  }
+
+  .reset-button {
+    min-height: 36px;
+    border-radius: 6px;
+    padding: 0 16px;
+    background: transparent;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .reset-button.soft {
+    border: 1px solid rgba(227, 168, 59, 0.6);
+    color: #f0c46e;
+  }
+
+  .reset-button.full {
+    border: 1px solid rgba(226, 101, 106, 0.65);
+    color: #f08a8f;
+  }
+
+  .reset-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
   @media (max-width: 900px) {
     .settings-row {
       grid-template-columns: 1fr;
@@ -631,6 +792,7 @@
     .language-options button {
       border-top: 1px solid var(--settings-line);
       border-left: 0;
+      padding: 14px 0;
     }
 
     .language-options button:first-child {

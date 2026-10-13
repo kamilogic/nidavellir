@@ -1,16 +1,23 @@
 <script>
-  import { Activity, ArrowRight, Clock3, Play, Square, Timer } from "@lucide/svelte";
+  import { ArrowRight, Clock3, Play, Square, Timer } from "@lucide/svelte";
 
   let {
     powerSweep = null,
     powerRunning = false,
     safeLoop = null,
     forgeMode = "standard",
-    detailsOpen = $bindable(false),
+    // "band": the Forge screen section. "report": the Forge report page with every run detail.
+    layout = "band",
+    onOpenReport,
+    onOpenLog,
     onStopPower,
     onRecoverContinue,
     onResumePower,
   } = $props();
+
+  const GLYPH = { pass: "✓", step: "·", attention: "!", fail: "✕" };
+  // The newest Live log events, oldest first, so they read like the log itself.
+  const recentEvents = $derived((powerSweep?.log_entries ?? []).slice(-3));
 
   const FORGE_PHASES = [
     { id: "prepare", label: "Prepare" },
@@ -306,6 +313,23 @@
     return "Awaiting the first measured step";
   }
 
+  /** Which published profile a search level produced, matched by its qualified clock. */
+  function bandProfileNote(band) {
+    if (!qualifiedBand(band)) return band.stop_reason ? searchStopReason(band.stop_reason) : "No qualified candidate.";
+    const names = { godforge: "Godforge", brokkrs: "Brokkr’s Best", deep_calm: "Deep Calm" };
+    for (const key of Object.keys(names)) {
+      const point = powerSweep?.[key];
+      const clock = point?.target_clock_mhz ?? point?.clock_mhz;
+      const voltage = point?.vf_table_voltage_mv ?? point?.voltage_mv;
+      if (clock === band.last_qualified_clock_mhz && voltage != null && band.id !== "performance") return `${names[key]} runs at ${voltage} mV`;
+    }
+    return band.id === "performance" ? "Highest clock that held" : "Not used by a profile";
+  }
+
+  function qualifiedBand(band) {
+    return band.last_qualified_clock_mhz > 0 && band.last_qualified_voltage_mv > 0;
+  }
+
   function bandLabel(id) {
     return { performance: "Performance", compensated: "Game-margin top", balanced: "Balance", efficiency: "Efficiency" }[id] ?? id;
   }
@@ -569,16 +593,23 @@
   });
 </script>
 
-<section class="forge-progress" class:settled={!active} aria-labelledby="forge-progress-title">
+<section class="forge-progress" class:settled={!active} class:report={layout === "report"} aria-labelledby="forge-progress-title">
   <p class="sr-only" aria-live="polite" aria-atomic="true">{liveAnnouncement}</p>
 
   <header class="progress-header">
     <div class="progress-heading">
-      <span class="eyebrow">Forge progress</span>
-      <h3 id="forge-progress-title"><Activity size={19} strokeWidth={1.8} />{title}</h3>
-      <p>{active || !runSummary ? phaseInfo.detail : runSummary}</p>
+      {#if layout === "report"}
+        <span class="eyebrow">Forge report</span>
+        <h1 id="forge-progress-title" data-forge-heading tabindex="-1">{title}</h1>
+      {:else}
+        <h2 id="forge-progress-title">{active ? title : "Last Forge"}</h2>
+      {/if}
+      <p>{active || !runSummary ? phaseInfo.detail : `${title} · ${runSummary}`}</p>
     </div>
     <div class="progress-actions">
+      {#if layout === "band" && (discoverySearch || powerSweep?.note)}
+        <button class="report-link" type="button" onclick={onOpenReport}>Forge report ›</button>
+      {/if}
       <span class:live={powerRunning && !rebootRequired} class:warning={isInterrupted || rebootRequired} class="run-pill">{runState}</span>
       {#if powerRunning && !rebootRequired}
         <button class="progress-button stop" type="button" onclick={onStopPower} disabled={isStopping}>
@@ -600,7 +631,19 @@
     <p class="resume-note reboot-note" role={rebootRequired ? "alert" : "status"}>{interruptionNote}</p>
   {/if}
 
-  {#if active}
+  {#if !active && layout === "band" && searchBands.length}
+    <ul class="levels" aria-label="Search levels">
+      {#each searchBands as band}
+        <li class:qualified={qualifiedBand(band)}>
+          <span class="level-name"><span aria-hidden="true">{qualifiedBand(band) ? "✓" : "–"}</span>{bandLabel(band.id)}</span>
+          <strong>{qualifiedBand(band) ? `${band.last_qualified_clock_mhz} MHz @ ${band.last_qualified_voltage_mv} mV` : "Not qualified"}</strong>
+          <small>{bandProfileNote(band)}</small>
+        </li>
+      {/each}
+    </ul>
+  {/if}
+
+  {#if active && layout === "band"}
     <ol class="phase-rail" aria-label="Forge stages">
       {#each FORGE_PHASES as forgePhase, index}
         <li
@@ -648,7 +691,6 @@
     {#if !isInterrupted}
     <div class="task-flow">
       <article class="task-card current">
-        <span class="task-icon"><Timer size={20} strokeWidth={1.75} /></span>
         <div>
           <small>Now{powerRunning ? ` · ${duration(taskElapsedMs)}` : ""}</small>
           <strong>{currentTaskLabel}</strong>
@@ -656,7 +698,6 @@
         </div>
       </article>
       <article class={`task-card last ${lastDecision.tone}`}>
-        <span class="task-icon text-icon">LAST</span>
         <div>
           <small>Last decision</small>
           <strong>{lastDecision.label}</strong>
@@ -664,7 +705,6 @@
         </div>
       </article>
       <article class="task-card next">
-        <span class="task-icon text-icon">NEXT</span>
         <div>
           <small>{powerRunning && taskRemainingMs != null ? `Starts in about ${duration(taskRemainingMs)}` : "Next planned task"}</small>
           <strong>{nextTaskLabel}</strong>
@@ -672,6 +712,20 @@
         </div>
       </article>
     </div>
+    {/if}
+
+    {#if layout === "band" && recentEvents.length}
+      <div class="recent" aria-label="Latest Forge events">
+        <div class="recent-head">
+          <span class="eyebrow">Latest events</span>
+          <button class="report-link" type="button" onclick={onOpenLog}>Live log ›</button>
+        </div>
+        <ul>
+          {#each recentEvents as entry}
+            <li class={`tone-${entry.tone}`}><span class="glyph" aria-hidden="true">{GLYPH[entry.tone] ?? "·"}</span><span>{entry.text}</span></li>
+          {/each}
+        </ul>
+      </div>
     {/if}
 
     <div class="run-timing">
@@ -698,9 +752,8 @@
     </p>
   {/if}
 
-  {#if discoverySearch || powerSweep?.note}
-    <details class="run-details" bind:open={detailsOpen}>
-      <summary>Run details</summary>
+  {#if layout === "report" && (discoverySearch || powerSweep?.note)}
+    <div class="run-details">
       {#if powerSweep?.note}<p class="core-note">{powerSweep.note}</p>{/if}
       {#if powerRunning}<p class="core-note">Conservative remaining ceiling: {remainingCeiling}.</p>{/if}
       {#if discoverySearch}
@@ -731,21 +784,17 @@
           {/if}
         </section>
       {/if}
-    </details>
+    </div>
   {/if}
 </section>
 
 <style>
+  /* No box of its own: on the Forge screen it sits in a band, and the report is a page. */
   .forge-progress {
     --panel-radius: 11px;
     --inner-radius: 9px;
     display: grid;
     gap: 12px;
-    padding: 18px;
-    border: 0;
-    border-radius: var(--panel-radius);
-    background: var(--progress-surface, rgba(7, 10, 12, 0.58));
-    box-shadow: inset 0 0 0 1px var(--progress-outline, rgba(126, 136, 143, 0.34));
     color: #e3e3df;
     font-family: inherit;
   }
@@ -781,15 +830,125 @@
     text-transform: uppercase;
   }
 
-  h3 {
-    display: flex;
-    align-items: center;
-    gap: 8px;
+  h2 {
     margin: 0;
-    color: #e3e3df;
-    font-size: 1.125rem;
+    color: #e9ba79;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  h1 {
+    margin: 4px 0 0;
+    color: #f0f0ef;
+    font-size: clamp(1.55rem, 2.4vw, 2.15rem);
     font-weight: 580;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.025em;
+  }
+
+  h1:focus { outline: none; }
+
+  .report-link {
+    border: 0;
+    padding: 0 4px;
+    background: transparent;
+    color: #e0a96b;
+    font: inherit;
+    font-size: 13px;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .report-link:hover { color: #f0c48c; }
+
+  .recent {
+    display: grid;
+    gap: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding-top: 12px;
+  }
+
+  .recent-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+
+  .recent ul {
+    display: grid;
+    gap: 4px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .recent li {
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr);
+    gap: 6px;
+    color: #dfe2e4;
+    font-size: 13.5px;
+  }
+
+  .recent .glyph {
+    color: #6f787e;
+    font-weight: 700;
+    text-align: center;
+  }
+
+  .recent .tone-pass,
+  .recent .tone-pass .glyph { color: #9fcf5c; }
+  .recent .tone-attention,
+  .recent .tone-attention .glyph { color: #ebb85a; }
+  .recent .tone-fail,
+  .recent .tone-fail .glyph { color: #ee7a7e; }
+
+  .levels {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(0, 1fr));
+    grid-auto-flow: column;
+    margin: 4px 0 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .levels li {
+    display: grid;
+    gap: 5px;
+    min-width: 0;
+    border-left: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 2px 24px 4px;
+  }
+
+  .levels li:first-child {
+    border-left: 0;
+    padding-left: 0;
+  }
+
+  .level-name {
+    display: flex;
+    gap: 7px;
+    color: #a5aaad;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+
+  .levels li.qualified .level-name span { color: #8fc04a; }
+
+  .levels strong {
+    color: #e2e4e5;
+    font-size: 15px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .levels small {
+    color: #8f979c;
+    font-size: 12px;
+    text-wrap: pretty;
   }
 
   .progress-heading p {
@@ -936,10 +1095,7 @@
   }
 
   .progress-overview {
-    padding: 12px 14px;
-    border-radius: var(--inner-radius);
-    background: rgba(0, 0, 0, 0.2);
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.055);
+    padding: 2px 0;
   }
 
   .progress-copy { justify-content: space-between; gap: 12px; color: #a2a9ac; font-size: 0.75rem; }
@@ -977,14 +1133,32 @@
 
   @keyframes forge-progress-sheen { to { transform: translateX(140%); } }
 
-  .run-context { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  /* Columns split by hairlines, like the profile columns: no box per item. */
+  .run-context,
+  .task-flow,
+  .run-timing {
+    display: grid;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding-top: 12px;
+  }
 
-  .run-context article {
+  .run-context { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .task-flow,
+  .run-timing { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+  .run-context article,
+  .task-card,
+  .run-timing article {
     min-width: 0;
-    padding: 10px 12px;
-    border-radius: var(--inner-radius);
-    background: rgba(255, 255, 255, 0.025);
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.055);
+    border-left: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 2px 20px 4px;
+  }
+
+  .run-context article:first-child,
+  .task-card:first-child,
+  .run-timing article:first-child {
+    border-left: 0;
+    padding-left: 0;
   }
 
   .run-context span { display: block; color: #8e979b; font-size: 0.75rem; }
@@ -1000,51 +1174,19 @@
     white-space: nowrap;
   }
 
-  .search-budget { padding: 12px; border-radius: var(--inner-radius); background: rgba(0, 0, 0, 0.2); }
+  .search-budget { padding: 0; }
   .search-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.8rem; }
   .search-summary strong { color: var(--forge-gold); }
   .search-summary span { color: #a2a9ac; }
   .search-budget p { margin: 6px 0 0; color: #a2a9ac; font-size: 0.75rem; line-height: 1.5; }
   .search-budget .search-stop { color: var(--forge-gold); }
   .search-bands { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }
-  .search-bands li { min-width: 0; padding: 10px; border-radius: var(--inner-radius); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1); }
+  .search-bands li { min-width: 0; border-top: 1px solid rgba(255, 255, 255, 0.1); padding: 10px 0; }
   .search-bands strong { font-size: 0.8rem; font-weight: 670; }
   .search-bands strong span { color: #a2a9ac; font-weight: 500; }
-  .search-bands li.closed { box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.3); }
+  .search-bands li.closed { border-top-color: rgba(214, 168, 93, 0.45); }
 
-  .task-flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-
-  .task-card {
-    display: grid;
-    min-width: 0;
-    min-height: 112px;
-    grid-template-columns: 40px minmax(0, 1fr);
-    align-items: center;
-    gap: 11px;
-    padding: 12px;
-    border-radius: var(--inner-radius);
-    background: rgba(0, 0, 0, 0.2);
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.055);
-  }
-
-  .task-card.current { background: rgba(214, 168, 93, 0.07); box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.24); }
-  .task-card.last.success { box-shadow: inset 0 0 0 1px rgba(126, 184, 78, 0.3); }
-  .task-card.last.caution { box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.3); }
-  .task-card.last.danger { box-shadow: inset 0 0 0 1px rgba(191, 97, 106, 0.36); }
-
-  .task-icon {
-    display: grid;
-    width: 40px;
-    height: 40px;
-    place-items: center;
-    border-radius: 9px;
-    background: rgba(214, 168, 93, 0.11);
-    box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.24);
-    color: var(--forge-gold);
-  }
-
-  .text-icon { color: #9aa3a7; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.06em; }
-  .task-card div { min-width: 0; }
+  .task-card.current strong { color: var(--forge-gold); }
   .task-card small { color: #929b9f; font-size: 0.75rem; font-variant-numeric: tabular-nums; }
 
   .task-card strong {
@@ -1068,15 +1210,8 @@
     text-wrap: pretty;
   }
 
-  .run-timing { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-
   .run-timing article {
-    min-width: 0;
     gap: 9px;
-    padding: 10px 12px;
-    border-radius: 9px;
-    background: rgba(255, 255, 255, 0.025);
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
     color: #929b9f;
   }
 
@@ -1103,23 +1238,19 @@
 
   .forge-progress.settled { gap: 10px; }
 
+  /* The report page: every run detail, readable without opening anything. */
   .run-details {
-    border-radius: var(--inner-radius);
-    background: rgba(0, 0, 0, 0.16);
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+    display: grid;
+    gap: 12px;
+    margin-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.12);
+    padding-top: 16px;
   }
 
-  .run-details summary {
-    padding: 10px 12px;
-    color: #a2a9ac;
-    font-size: 0.78rem;
-    font-weight: 700;
-    cursor: pointer;
+  .forge-progress.report .core-note,
+  .forge-progress.report .search-budget p {
+    font-size: 0.85rem;
   }
-
-  .run-details[open] summary { color: var(--forge-text, #e8ecf1); }
-
-  .run-details > :not(summary) { margin: 0 12px 12px; }
 
   .core-note {
     color: #a2a9ac;
@@ -1141,15 +1272,16 @@
   @media (max-width: 1040px) {
     .progress-header { align-items: flex-start; flex-direction: column; }
     .progress-actions { justify-content: flex-start; }
-    .task-flow { grid-template-columns: 1fr; }
-    .task-card { min-height: 92px; }
-    .run-timing { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .task-flow { grid-template-columns: 1fr; gap: 10px; }
+    .task-card { border-left: 0; padding-left: 0; }
   }
 
   @media (max-width: 680px) {
     .forge-progress { padding: 14px; }
     .run-context,
-    .run-timing { grid-template-columns: 1fr; }
+    .run-timing { grid-template-columns: 1fr; gap: 10px; }
+    .run-context article,
+    .run-timing article { border-left: 0; padding-left: 0; }
     .progress-button { min-height: 44px; }
   }
 
