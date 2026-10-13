@@ -4351,6 +4351,39 @@ pub(crate) struct F2ClockDiscoveryProgress {
     pub anchor_mv: Option<u32>,
     pub outcome: Option<String>,
     pub line: String,
+    /// The Live log event: a short English text and its tone.
+    pub live: Option<(nidavellir_core::ipc::LogTone, String)>,
+}
+
+/// Plain names for the qualification tests in the Live log.
+fn live_pattern_name(pattern: F2QualificationPattern) -> &'static str {
+    match pattern {
+        F2QualificationPattern::A => "load A",
+        F2QualificationPattern::B => "load B",
+        F2QualificationPattern::HighFps => "high-FPS load",
+        F2QualificationPattern::Texture => "texture test",
+        F2QualificationPattern::Transitions => "load transitions",
+        F2QualificationPattern::Memory => "memory test",
+        F2QualificationPattern::Endurance => "endurance test",
+        F2QualificationPattern::TransitionShock => "load shocks",
+        F2QualificationPattern::Dx11Game => "DX11 game load",
+        F2QualificationPattern::Dx12Game => "DX12 game load",
+    }
+}
+
+/// The Live log reading of one confirmed step: its tone and a short phrase.
+fn live_outcome(outcome: &F2Outcome) -> (nidavellir_core::ipc::LogTone, &'static str) {
+    use nidavellir_core::ipc::LogTone;
+    match outcome {
+        F2Outcome::Validated => (LogTone::Pass, "passed"),
+        F2Outcome::SilentError => (LogTone::Fail, "integrity error"),
+        F2Outcome::Unstable => (LogTone::Fail, "unstable"),
+        F2Outcome::DeviceLost => (LogTone::Fail, "driver crash"),
+        F2Outcome::ClockDrop | F2Outcome::PowerBoundClockDrop => (LogTone::Attention, "clock dropped"),
+        F2Outcome::Inconclusive => (LogTone::Attention, "inconclusive"),
+        F2Outcome::ResetFailed => (LogTone::Fail, "return to stock not confirmed"),
+        F2Outcome::ArmFailed(_) | F2Outcome::ApplyFailed(_) | F2Outcome::VerifyFailed => (LogTone::Fail, "could not be applied"),
+    }
 }
 
 /// Result of filling one missing exact-Apply-bin PowerRender measurement after the qualified
@@ -4650,6 +4683,15 @@ fn gate_anchored_candidate_fsgl3(
                     candidate.anchor.voltage_mv,
                     dwell_ms / 1000
                 ),
+                live: Some((
+                    nidavellir_core::ipc::LogTone::Step,
+                    format!(
+                        "Testing {target_mhz} MHz at {} mV · {}, test {matrix_position} of {}",
+                        candidate.anchor.voltage_mv,
+                        live_pattern_name(pattern),
+                        patterns.len()
+                    ),
+                )),
             });
             let mut report = run_confirmed_f2_step(&mut validation_ops);
             annotate_qualification_report(
@@ -4705,6 +4747,17 @@ fn gate_anchored_candidate_fsgl3(
                     patterns.len(),
                     report.outcome
                 ),
+                live: Some({
+                    let (tone, phrase) = live_outcome(&report.outcome);
+                    let name = live_pattern_name(pattern);
+                    let pair = format!("{target_mhz} MHz at {} mV", candidate.anchor.voltage_mv);
+                    let text = if report.outcome == F2Outcome::Validated {
+                        format!("{pair} passed the {name} · test {matrix_position} of {}", patterns.len())
+                    } else {
+                        format!("{pair} · {name}: {phrase}")
+                    };
+                    (tone, text)
+                }),
             });
             if report.inconclusive_reason.as_deref().is_some_and(|r| r.starts_with("control_failure")) {
                 return F2QualificationOutcome::Aborted {
@@ -5165,6 +5218,10 @@ pub(crate) fn run_confirmed_f2_power_calibration(
         line: format!(
             "Calibração p99: {target_mhz} MHz @ {apply_mv} mV — PowerRender no bin exato de Apply…"
         ),
+        live: Some((
+            nidavellir_core::ipc::LogTone::Step,
+            format!("Measuring typical power at {target_mhz} MHz at {apply_mv} mV"),
+        )),
     });
     let initial_report = run_confirmed_f2_step(&mut ops);
     let anomalous_p99 = f2_power_p99_requires_recheck(previous_confirmed_power, &initial_report);
@@ -5246,6 +5303,18 @@ pub(crate) fn run_confirmed_f2_power_calibration(
                     "medição inconclusiva"
                 }
             ),
+            live: Some(match (attempt.power_p99_confirmed, attempt.power_p99_w) {
+                (true, Some(watts)) if attempt.outcome == F2Outcome::Validated => (
+                    nidavellir_core::ipc::LogTone::Pass,
+                    format!("Typical power at {target_mhz} MHz at {apply_mv} mV: {watts:.0} W"),
+                ),
+                _ => {
+                    let (tone, phrase) = live_outcome(&attempt.outcome);
+                    let tone = if tone == nidavellir_core::ipc::LogTone::Pass { nidavellir_core::ipc::LogTone::Attention } else { tone };
+                    let phrase = if attempt.outcome == F2Outcome::Validated { "power reading inconclusive" } else { phrase };
+                    (tone, format!("{target_mhz} MHz at {apply_mv} mV · power measurement {}/{}: {phrase}", attempt_index + 1, attempts.len()))
+                }
+            }),
         });
     }
 

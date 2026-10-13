@@ -415,6 +415,28 @@ pub struct ForgeDiscoveryBand {
     pub next_raise_clock: bool,
 }
 
+/// How a Live log event reads: a routine step, a passed check, something to watch, or a failure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogTone {
+    #[default]
+    Step,
+    Pass,
+    Attention,
+    Fail,
+}
+
+/// One Live log event. `phase` names the Forge stage ("Stock baseline", "Performance", …).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ForgeLogEntry {
+    pub at_ms: u64,
+    pub tone: LogTone,
+    pub phase: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// Power-target sweep and the measured profile trade-offs, with search coverage separate from
 /// point qualification.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -440,7 +462,12 @@ pub struct PowerSweepProgress {
     /// Runtime-only development authorization status; never restores permission from a checkpoint.
     #[serde(default, skip_deserializing)]
     pub development_validation_note: Option<String>,
+    /// Technical lines for the exported diagnostic report.
     pub log: Vec<String>,
+    /// The Live log (2026-10-12): short English events, each tagged at the source with its tone
+    /// and Forge phase, with the technical numbers kept apart in `detail`.
+    #[serde(default)]
+    pub log_entries: Vec<ForgeLogEntry>,
     pub points: Vec<PowerSweepPoint>,
     /// Enforced power cap (W).
     pub power_limit_w: f32,

@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::DateTime;
+use nidavellir_core::ipc::LogTone;
 use nidavellir_core::safe_loop::ForgeIncident;
 
 use crate::gpu_power_sweep::auto_resume_eligible;
@@ -112,8 +113,8 @@ fn countdown(state: &Mutex<AppState>) -> bool {
     let deadline = now_ms() + AUTO_RESUME_DELAY_MS;
     {
         let Ok(guard) = state.lock() else { return false };
-        guard.power_sweep.note_auto_resume(Some(deadline), format!(
-            "Retomada automática em {} s: TDR na borda do degrau; o incidente desta run será reconhecido e a mesma run continua. Desligue a opção para cancelar.",
+        guard.power_sweep.note_auto_resume(Some(deadline), LogTone::Attention, format!(
+            "Driver crash at a test edge · the same run continues in {} s. Turn off auto-continue to cancel.",
             AUTO_RESUME_DELAY_MS / 1000
         ));
     }
@@ -126,7 +127,7 @@ fn countdown(state: &Mutex<AppState>) -> bool {
         let progress = guard.power_sweep.progress();
         if !progress.auto_resume || progress.running {
             if progress.auto_resume_at_ms.is_some() {
-                guard.power_sweep.note_auto_resume(None, "Retomada automática cancelada.".into());
+                guard.power_sweep.note_auto_resume(None, LogTone::Step, "Automatic continuation cancelled.".into());
             }
             return false;
         }
@@ -141,28 +142,28 @@ fn act(state: &Mutex<AppState>, keys: [String; 2]) {
         attempted.extend(keys.iter().cloned());
     }
     let refuse = |reason: String| {
-        guard.power_sweep.note_auto_resume(None, format!(
-            "Retomada automática recusada: {reason}. A run aguarda ação manual."
+        guard.power_sweep.note_auto_resume(None, LogTone::Attention, format!(
+            "Automatic continuation refused: {reason}. The run waits for you."
         ));
     };
     let progress = guard.power_sweep.progress();
     let pending = match pending_incident(&guard) {
         Ok(pending) => pending,
-        Err(error) => return refuse(format!("Safe Loop ilegível ({error})")),
+        Err(error) => return refuse(format!("the Safe Loop state could not be read ({error})")),
     };
     if !auto_resume_eligible(&progress, pending.as_ref()) {
-        return refuse("o estado da run mudou durante a espera".into());
+        return refuse("the run changed during the wait".into());
     }
     if let Some(latch) = crate::tdr_sentinel::reboot_required_event() {
-        let line = match pending.as_ref().ok_or_else(|| "o incidente já foi reconhecido".to_string())
+        let line = match pending.as_ref().ok_or_else(|| "the incident was already acknowledged".to_string())
             .and_then(|incident| begin_driver_reset(incident, &latch))
         {
-            Ok(()) => "Reset só do driver da GPU: o serviço para com a GPU em stock, reinicia o adaptador NVIDIA e volta sozinho; a run continua sem reiniciar o Windows.".into(),
+            Ok(()) => "Restarting only the GPU driver: the service stops with the GPU at stock, restarts the NVIDIA adapter and comes back by itself; the run continues without a Windows restart.".into(),
             Err(reason) => format!(
-                "Este boot ainda guarda o TDR {latch} e o reset só do driver não está disponível ({reason}). Reinicie o Windows: com o serviço instalado a run continua sozinha depois do boot."
+                "This boot still holds driver crash {latch} and a driver-only restart is not available ({reason}). Restart Windows: with the installed service the run continues by itself after the restart."
             ),
         };
-        return guard.power_sweep.note_auto_resume(None, line);
+        return guard.power_sweep.note_auto_resume(None, LogTone::Attention, line);
     }
     // Saved before acting, so a Core the program restarts never tries this incident again.
     if let Err(error) = save_attempt(&attempts_path(), &keys) {
@@ -176,9 +177,9 @@ fn act(state: &Mutex<AppState>, keys: [String; 2]) {
         }
     }
     guard.power_sweep.refresh_resume_state(&guard.safe_store);
-    guard.power_sweep.note_auto_resume(None, format!(
-        "Retomando automaticamente{}.",
-        if pending.is_some() { "; o CandidateCrash desta run foi reconhecido pela opção de retomada automática" } else { "" }
+    guard.power_sweep.note_auto_resume(None, LogTone::Step, format!(
+        "Continuing the run automatically{}.",
+        if pending.is_some() { "; auto-continue acknowledged this run's driver crash" } else { "" }
     ));
     if let Err(error) = guard.power_sweep.resume(guard.safe_store.clone()) {
         refuse(error);

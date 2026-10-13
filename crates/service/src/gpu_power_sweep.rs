@@ -30,7 +30,7 @@ use nidavellir_core::f2_observation::{
 };
 use nidavellir_core::gpu_sweep::StabilityResult;
 use nidavellir_core::ipc::{
-    DwellQuality, ForgeResumeCompatibility, PowerSweepPoint, PowerSweepProgress,
+    DwellQuality, ForgeLogEntry, ForgeResumeCompatibility, LogTone, PowerSweepPoint, PowerSweepProgress,
 };
 use nidavellir_core::safe_loop::{BootFlag, SafeLoopRecord, SafeLoopStore, TuningPoint};
 #[cfg(windows)]
@@ -1277,6 +1277,13 @@ impl PowerSweepHandle {
         prog.log.push(format!(
             "FIELD: {target_mhz} MHz @ {anchor_mv} mV confirmado instável pelo operador; perfil bloqueado e ponto salvo na blacklist durável."
         ));
+        live_event(
+            &mut prog,
+            LogTone::Fail,
+            "In use",
+            format!("{target_mhz} MHz at {anchor_mv} mV marked unstable by you · that profile is blocked"),
+            None,
+        );
         save_forge_state(&gpu_key, &prog);
         Ok(prog.clone())
     }
@@ -1460,10 +1467,13 @@ impl PowerSweepHandle {
     /// Show or clear the automatic-Resume countdown with a log line. No hardware work; the line is
     /// persisted only while no Forge worker owns the progress.
     #[cfg(windows)]
-    pub(crate) fn note_auto_resume(&self, at_ms: Option<u64>, line: String) {
+    /// The auto-resume supervisor reports to the Live log: a countdown or a refusal needs the
+    /// user's attention, a resume in progress is a routine step.
+    pub(crate) fn note_auto_resume(&self, at_ms: Option<u64>, tone: LogTone, line: String) {
         self.auto_resume_at_ms.store(at_ms.unwrap_or(0), Ordering::SeqCst);
         if let Ok(mut progress) = self.progress.lock() {
             if !progress.running {
+                live_event(&mut progress, tone, "Recovery", line.clone(), None);
                 progress.log.push(line);
                 save_forge_state(&current_gpu_key(), &progress);
             }
@@ -1679,6 +1689,39 @@ const FORGE_STATE_LOG_TAIL: usize = 40;
 /// Every completed evidence point remains durable in `f2_observations.jsonl`.
 const FORGE_LIVE_LOG_TAIL: usize = 240;
 
+fn keep_tail<T>(items: &mut Vec<T>, tail: usize) {
+    if items.len() > tail {
+        items.drain(0..items.len() - tail);
+    }
+}
+
+/// The Live log: one short English event, tagged with its tone and Forge phase. The technical
+/// `log` line next to it stays for the exported report.
+pub(crate) fn live_event(
+    prog: &mut PowerSweepProgress,
+    tone: LogTone,
+    phase: &str,
+    text: impl Into<String>,
+    detail: Option<String>,
+) {
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+    prog.log_entries.push(ForgeLogEntry { at_ms, tone, phase: phase.into(), text: text.into(), detail });
+    keep_tail(&mut prog.log_entries, FORGE_LIVE_LOG_TAIL);
+}
+
+/// The Live log phase for a search level.
+fn band_phase(id: &str) -> &'static str {
+    match id {
+        "performance" => "Performance",
+        "compensated" => "Game margin",
+        "balanced" => "Balance",
+        "efficiency" => "Efficiency",
+        _ => "Search",
+    }
+}
+
 /// On-disk wrapper around a completed `PowerSweepProgress`, tagged with the GPU
 /// it was forged on and a schema version for forward-compatible rejection.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1707,6 +1750,7 @@ fn encode_forge_state(gpu_key: &str, prog: &PowerSweepProgress) -> Option<String
         let drop = snapshot.log.len() - FORGE_STATE_LOG_TAIL;
         snapshot.log.drain(0..drop);
     }
+    keep_tail(&mut snapshot.log_entries, FORGE_STATE_LOG_TAIL);
     let file = ForgeStateFile {
         schema_version: FORGE_STATE_SCHEMA,
         gpu_key: gpu_key.to_string(),
@@ -2799,6 +2843,7 @@ fn set(progress: &Arc<Mutex<PowerSweepProgress>>, mut p: PowerSweepProgress) {
         let drop = p.log.len() - FORGE_LIVE_LOG_TAIL;
         p.log.drain(0..drop);
     }
+    keep_tail(&mut p.log_entries, FORGE_LIVE_LOG_TAIL);
     if let Ok(mut g) = progress.lock() {
         *g = p;
     }
@@ -8195,6 +8240,7 @@ fn f2_candidate_progress(
     gpu_key: &str,
     started: &std::time::Instant,
     previous_elapsed_ms: u64,
+    phase: &str,
     event: crate::gpu_undervolt::F2ClockDiscoveryProgress,
 ) {
     if event.outcome.is_some() {
@@ -8212,6 +8258,9 @@ fn f2_candidate_progress(
         search.elapsed_ms = prog.elapsed_ms;
     }
     prog.log.push(event.line);
+    if let Some((tone, text)) = event.live {
+        live_event(prog, tone, phase, text, None);
+    }
     set(progress, prog.clone());
     // Admission was synchronously persisted before the first arm. This progress snapshot cannot
     // authorize a new candidate; the next admission performs its own checked durable write.
@@ -8403,6 +8452,21 @@ fn measure_multiclock_undervolt_forge(
             "Long: mesmo orçamento de tentativas, com tempo proporcional às matrizes prolongadas; nenhuma repetição automática de inconclusivos.".into()
         }
     });
+    let run_label = if clean_run {
+        "Clean Run"
+    } else {
+        match mode {
+            PowerSweepMode::Standard => "Standard",
+            PowerSweepMode::Long => "Long",
+        }
+    };
+    live_event(
+        &mut prog,
+        LogTone::Step,
+        "Setup",
+        format!("{run_label} Forge {}", if resume_requested { "resumed" } else { "started" }),
+        (cap > 0.0).then(|| format!("power limit {cap:.0} W")),
+    );
     set(progress, prog.clone());
 
     // Stable physical identity scopes observations and persisted profiles to this exact GPU.
@@ -8506,6 +8570,13 @@ fn measure_multiclock_undervolt_forge(
         F2_PREHEAT_TEMP_DELTA_C,
         F2_PREHEAT_CLOCK_DELTA_MHZ
     ));
+    live_event(
+        &mut prog,
+        LogTone::Step,
+        "Stock baseline",
+        "Measuring the GPU at stock until it settles",
+        Some(format!("up to {} windows of {} s", F2_PREHEAT_MAX_WINDOWS, F2_PREHEAT_WINDOW_MS / 1000)),
+    );
     set(progress, prog.clone());
     let preheat = match run_f2_stock_preheat(progress, stop.as_ref(), &mut prog) {
         Ok(preheat) => preheat,
@@ -8523,30 +8594,31 @@ fn measure_multiclock_undervolt_forge(
                 task_tracker.tick(&mut prog);
                 prog.resume_available = prog.resume_compatibility.is_some();
                 prog.resume_block_reason = (!prog.resume_available).then(|| {
-                    "o backend não conseguiu registrar identidade completa de build/GPU/driver"
-                        .into()
+                    "the build, GPU and driver identity could not be recorded".into()
                 });
                 prog.note = Some(
-                    "Forge pausado durante a normalização: GPU em stock e checkpoint preservado."
+                    "Forge paused during the stock measurement. The GPU is at stock and the checkpoint is saved."
                         .into(),
                 );
                 prog.log.push(
                     "STOP manual concluído durante preheat; checkpoint retomável gravado após reset stock."
                         .into(),
                 );
+                live_event(&mut prog, LogTone::Attention, "Stock baseline", "Stopped by you during the stock measurement · the run can resume", None);
                 task_tracker.finish(&mut prog);
                 save_forge_state(&gpu_key, &prog);
             } else {
                 prog.phase = "incomplete".into();
                 prog.resume_available = false;
-                prog.resume_block_reason = Some("preheat stock inconclusivo".into());
+                prog.resume_block_reason = Some("the stock measurement did not settle".into());
                 prog.note = Some(format!(
-                    "Forja F2 abortada antes de Cboost — preheat stock inconclusivo: {e}. {}",
+                    "The Forge stopped before testing: the stock measurement did not settle ({e}). {}",
                     reset
                         .err()
-                        .map(|reset_error| format!("Reset final também falhou: {reset_error}"))
-                        .unwrap_or_else(|| "GPU restaurada ao stock; nada aplicado.".into())
+                        .map(|reset_error| format!("The final return to stock also failed: {reset_error}"))
+                        .unwrap_or_else(|| "The GPU is back at stock; nothing was applied.".into())
                 ));
+                live_event(&mut prog, LogTone::Fail, "Stock baseline", "The stock measurement did not settle · nothing was applied", Some(format!("{e}")));
             }
             set(progress, prog);
             warn!("f2-forge: stock preheat failed closed: {e}");
@@ -8560,8 +8632,9 @@ fn measure_multiclock_undervolt_forge(
         prog.resume_available = false;
         prog.resume_block_reason = Some(reason.clone());
         prog.note = Some(format!(
-            "Retomada parada no stock: {reason}. Reinicie o Windows; o checkpoint da run continua salvo e ela retoma do mesmo ponto."
+            "Resume stopped at stock: {reason}. Restart Windows; the run's checkpoint stays saved and it resumes from the same point."
         ));
+        live_event(&mut prog, LogTone::Fail, "Stock baseline", "Resume stopped: the stock clock is lower than when the run began · restart Windows", Some(reason.clone()));
         set(progress, prog);
         warn!("f2-forge: resume stock drift: {reason}");
         return;
@@ -8574,6 +8647,16 @@ fn measure_multiclock_undervolt_forge(
         "Stock normalizado em {} janelas: p5 sustentado {} MHz a {:.1} °C.",
         preheat.windows, preheat.sustained_clock_mhz, preheat.temperature_c
     ));
+    live_event(
+        &mut prog,
+        LogTone::Pass,
+        "Stock baseline",
+        format!("Stock baseline ready: {} MHz at {:.0} °C", preheat.sustained_clock_mhz, preheat.temperature_c),
+        Some(match preheat.power_p99_w {
+            Some(watts) => format!("{} windows · typical power {watts:.0} W", preheat.windows),
+            None => format!("{} windows", preheat.windows),
+        }),
+    );
     set(progress, prog.clone());
 
     let live = gpu::read_vf_curve_modern();
@@ -8599,9 +8682,10 @@ fn measure_multiclock_undervolt_forge(
         prog.running = false;
         prog.phase = "incomplete".into();
         prog.note = Some(
-            "Forja F2 abortada com segurança — sem pontos de curva V/F base sãos. GPU no stock, nada aplicado."
+            "The Forge stopped safely: the GPU's base V/F curve could not be read. The GPU is at stock; nothing was applied."
                 .into(),
         );
+        live_event(&mut prog, LogTone::Fail, "Setup", "The GPU's voltage curve could not be read · nothing was applied", None);
         set(progress, prog);
         return;
     };
@@ -8623,6 +8707,7 @@ fn measure_multiclock_undervolt_forge(
         prog.log.push(format!(
             "Qualificação exact-Apply v{F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION} (matriz v27): capturando goldens stock por API e validando Vulkan + DX11 v3 + DX12 em stock…"
         ));
+        live_event(&mut prog, LogTone::Step, "Stock baseline", "Recording stock reference results for the error checks", None);
         set(progress, prog.clone());
         match capture_fsgl3_render_goldens().and_then(|goldens| {
             validate_v27_api_matrix_stock(goldens, V27_API_MATRIX_STOCK_CHECK_MS, None)?;
@@ -8632,6 +8717,7 @@ fn measure_multiclock_undervolt_forge(
                 prog.log.push(format!(
                     "Qualificação exact-Apply v{F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION} (matriz v27): controles stock Vulkan, DX11 v3 e DX12 aprovados neste boot."
                 ));
+                live_event(&mut prog, LogTone::Pass, "Stock baseline", "Stock reference results ready for Vulkan, DX11 and DX12", None);
                 set(progress, prog.clone());
                 Some(goldens)
             }
@@ -8640,8 +8726,9 @@ fn measure_multiclock_undervolt_forge(
                 prog.running = false;
                 prog.phase = "incomplete".into();
                 prog.note = Some(format!(
-                    "Forja F2 abortada antes da qualificação exact-Apply v{F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION} (matriz v27) — um controle stock da matriz de APIs falhou: {e}. Reinicie antes de outro teste; GPU no stock, nada aplicado."
+                    "The Forge stopped before testing: a stock check of the Vulkan, DX11 or DX12 test failed ({e}). Restart Windows before another run. The GPU is at stock; nothing was applied."
                 ));
+                live_event(&mut prog, LogTone::Fail, "Stock baseline", "A stock check of the error tests failed · restart Windows before another run", Some(format!("{e}")));
                 set(progress, prog);
                 warn!("f2-forge: v27 API-matrix stock control failed: {e}");
                 return;
@@ -8663,9 +8750,10 @@ fn measure_multiclock_undervolt_forge(
         prog.running = false;
         prog.phase = "incomplete".into();
         prog.note = Some(
-            "Forja F2 abortada com segurança — nenhum clock candidato derivável. GPU no stock, nada aplicado."
+            "The Forge stopped safely: no clock could be derived to test. The GPU is at stock; nothing was applied."
                 .into(),
         );
+        live_event(&mut prog, LogTone::Fail, "Setup", "No clock could be derived to test · nothing was applied", None);
         set(progress, prog);
         warn!("f2-forge: no candidate clocks derived — fail closed");
         return;
@@ -8689,12 +8777,13 @@ fn measure_multiclock_undervolt_forge(
             prog.phase = "needs_attention".into();
             prog.profiles_qualified = false;
             prog.note = Some(format!(
-                "Forge bloqueado antes do primeiro candidato: ledger de condenação ilegível ({error}). {}",
+                "The Forge was blocked before the first candidate: the failure history could not be read ({error}). {}",
                 reset
                     .err()
-                    .map(|reset_error| format!("Reset stock também falhou: {reset_error}"))
-                    .unwrap_or_else(|| "GPU confirmada em stock.".into())
+                    .map(|reset_error| format!("The return to stock also failed: {reset_error}"))
+                    .unwrap_or_else(|| "The GPU is confirmed at stock.".into())
             ));
+            live_event(&mut prog, LogTone::Fail, "Safety", "The failure history could not be read · nothing was armed", Some(format!("{error}")));
             set(progress, prog);
             return;
         }
@@ -8718,12 +8807,13 @@ fn measure_multiclock_undervolt_forge(
                 "FORGE: proteção TDR recusou iniciar candidatos — {reason}. Nenhum ponto foi armado."
             ));
             prog.note = Some(format!(
-                "Forge bloqueado pela política finita de TDR: {reason}. {}",
+                "The Forge was blocked by the driver-crash limit: {reason}. {}",
                 reset
                     .err()
-                    .map(|error| format!("Reset stock também falhou: {error}"))
-                    .unwrap_or_else(|| "GPU confirmada em stock.".into())
+                    .map(|error| format!("The return to stock also failed: {error}"))
+                    .unwrap_or_else(|| "The GPU is confirmed at stock.".into())
             ));
+            live_event(&mut prog, LogTone::Fail, "Safety", "The driver-crash protection refused to start new candidates · nothing was armed", Some(reason.clone()));
             set(progress, prog);
             return;
         }
@@ -8737,6 +8827,17 @@ fn measure_multiclock_undervolt_forge(
             tdr_policy.crashes.len(),
             tdr_safety_cone.len(),
         ));
+        live_event(
+            &mut prog,
+            LogTone::Attention,
+            "Safety",
+            format!(
+                "Driver-crash protection active: {} of {} crashes in this run",
+                f2_run_crash_count(&tdr_policy.crashes, Some(&run_id)),
+                F2_TDR_RUN_SANITY_CEILING
+            ),
+            Some(format!("{} crash area(s) kept clear", tdr_safety_cone.len())),
+        );
         for event in &tdr_policy.crashes {
             prog.log.push(format!(
                 "TDR fonte: {} MHz @ {} mV (run {}; contrato v{}).",
@@ -8788,6 +8889,13 @@ fn measure_multiclock_undervolt_forge(
             "Busca pelo topo da curva stock: {} MHz @ {} mV; p5 stock {} MHz é referência, não limite da busca. Candidato ainda sem qualificação.",
             initial.target_clock_mhz, initial.voltage_mv, preheat.sustained_clock_mhz
         ));
+        live_event(
+            &mut prog,
+            LogTone::Step,
+            "Search",
+            format!("Searching from the top of the stock curve: {} MHz at {} mV", initial.target_clock_mhz, initial.voltage_mv),
+            None,
+        );
     }
     prog.log.push(format!("Faixa de clock em teste: alvo nominal até alvo +{} MHz; NVML continua solicitando o alvo nominal. Picos não promovem outro perfil; tensão e potência mantêm os mesmos limites.", nidavellir_core::f2_observation::F2_CLOCK_UPPER_MARGIN_MHZ));
     let standard_ms = f2_apply_pair_upper_ms(PowerSweepMode::Standard.f2_policy());
@@ -8804,6 +8912,7 @@ fn measure_multiclock_undervolt_forge(
     if let Err(error) = search::resume_after_stock(&mut discovery) {
         forge_aborted = true;
         prog.log.push(format!("Busca recusada: {error}"));
+        live_event(&mut prog, LogTone::Fail, "Search", "The saved search could not continue", Some(error.to_string()));
     }
     prog.log.push(format!("Busca por candidatos: {}/{} tentativas consumidas, orçamento {:.1} h. Passe curto não autoriza descida; matriz completa obrigatória no mesmo par.",
         discovery.attempts_used, discovery.attempts_limit, discovery.time_budget_ms as f64 / 3_600_000.0));
@@ -8820,6 +8929,7 @@ fn measure_multiclock_undervolt_forge(
             forge_aborted = true;
             prog.log
                 .push(format!("Ledger de observações ilegível: {error}"));
+            live_event(&mut prog, LogTone::Fail, "Search", "The measurement history could not be read", Some(error.to_string()));
             0
         }
     };
@@ -8840,12 +8950,14 @@ fn measure_multiclock_undervolt_forge(
             Ok(candidate) => candidate,
             Err(reason) => {
                 prog.log.push(format!("Busca encerrada: {reason}"));
+                live_event(&mut prog, LogTone::Step, "Search", "Search finished", Some(reason.to_string()));
                 break;
             }
         };
         let target = candidate.target_clock_mhz;
         let mv = candidate.voltage_mv;
         let band = &discovery.bands[band_index];
+        let live_phase = band_phase(&band.id);
         let reference_offset = match (
             band.last_qualified_clock_mhz,
             band.last_qualified_voltage_mv,
@@ -8881,6 +8993,13 @@ fn measure_multiclock_undervolt_forge(
             "Tentativa {}/{} · {}: {target} MHz @ {mv} mV.",
             discovery.attempts_used, discovery.attempts_limit, band.id
         ));
+        live_event(
+            &mut prog,
+            LogTone::Step,
+            live_phase,
+            format!("Candidate {} of up to {}: {target} MHz at {mv} mV", discovery.attempts_used, discovery.attempts_limit),
+            None,
+        );
         set(progress, prog.clone());
         // A spent admission MUST be durable before any arm/write. Failure cannot renew a budget.
         if let Err(error) = save_forge_state_to_path(&forge_state_path(), &gpu_key, &prog) {
@@ -8888,6 +9007,7 @@ fn measure_multiclock_undervolt_forge(
             prog.log.push(format!(
                 "Admissão não persistida; nenhum candidato aplicado: {error}"
             ));
+            live_event(&mut prog, LogTone::Fail, live_phase, "This candidate could not be saved before testing · nothing was applied", Some(error.to_string()));
             break;
         }
         let mut exact_gate = false;
@@ -8938,6 +9058,7 @@ fn measure_multiclock_undervolt_forge(
                         &gpu_key,
                         &started,
                         elapsed_before_session_ms,
+                        live_phase,
                         event,
                     )
                 },
@@ -9050,6 +9171,7 @@ fn measure_multiclock_undervolt_forge(
                             &gpu_key,
                             &started,
                             elapsed_before_session_ms,
+                            live_phase,
                             event,
                         )
                     },
@@ -9070,6 +9192,7 @@ fn measure_multiclock_undervolt_forge(
                 if !is_exact {
                     prog.last_outcome = Some("EligibleForQualification".into());
                     prog.log.push(format!("{target} MHz @ {mv} mV: triagem concluída; aguardando matriz completa antes de refinar."));
+                    live_event(&mut prog, LogTone::Step, live_phase, format!("{target} MHz at {mv} mV passed the quick checks · full test matrix next"), None);
                     set(progress, prog.clone());
                 }
             }
@@ -9132,6 +9255,7 @@ fn measure_multiclock_undervolt_forge(
                 forge_aborted = true;
                 prog.log
                     .push(format!("Falha ao persistir erro de integridade: {error}"));
+                live_event(&mut prog, LogTone::Fail, live_phase, "The integrity error could not be saved", Some(error.to_string()));
             }
         }
         forge_aborted |= matches!(
@@ -9156,6 +9280,7 @@ fn measure_multiclock_undervolt_forge(
             forge_aborted = true;
             prog.log
                 .push(format!("Transição de busca recusada: {error}"));
+            live_event(&mut prog, LogTone::Fail, "Search", "The search could not record this result", Some(error.to_string()));
         }
         if let Some(hint) = power_hint.filter(|_| recorded == Outcome::PowerBound) {
             let next = &discovery.bands[band_index];
@@ -9166,7 +9291,32 @@ fn measure_multiclock_undervolt_forge(
                 ));
             }
         }
+        let (result_tone, verdict) = match outcome {
+            Outcome::Qualified => (LogTone::Pass, "qualified: it passed every test".to_string()),
+            Outcome::QualifiedHotBin => (
+                LogTone::Pass,
+                format!(
+                    "qualified, mostly at the hot clock bin · the game margin is set {} mV higher",
+                    crate::qualified_search::HOT_BIN_RELIEF_MV
+                ),
+            ),
+            Outcome::PowerBound => (LogTone::Attention, "held the power limit, not the clock".to_string()),
+            Outcome::IntegrityError => (LogTone::Fail, "failed: integrity error".to_string()),
+            Outcome::DriverFailure => (LogTone::Fail, "crashed the driver".to_string()),
+            Outcome::OperationalFailure => (LogTone::Fail, "could not be tested safely".to_string()),
+            Outcome::ControlMismatch => (LogTone::Attention, "left the requested clock and voltage".to_string()),
+            Outcome::Cancelled => (LogTone::Attention, "stopped before the end".to_string()),
+            Outcome::Inconclusive => (LogTone::Attention, "inconclusive: no proof and no failure".to_string()),
+        };
+        live_event(
+            &mut prog,
+            result_tone,
+            live_phase,
+            format!("{target} MHz at {mv} mV {verdict}"),
+            (!failure_reason.is_empty()).then(|| failure_reason.clone()),
+        );
         let next = &discovery.bands[band_index];
+        let lowest_text = next.last_qualified_voltage_mv.map_or("none".to_string(), |v| format!("{v} mV"));
         if recorded == Outcome::QualifiedHotBin {
             prog.log.push(format!(
                 "{target} MHz @ {mv} mV aprovado, mas as fases críticas rodaram mais da metade no bin quente ({} MHz): a margem de jogo ancora {} mV acima deste par.",
@@ -9187,11 +9337,28 @@ fn measure_multiclock_undervolt_forge(
                 "{target} MHz @ {mv} mV: {recorded:?}. Par de publicação {} MHz @ {} mV (≥{margin} mV acima da menor tensão aprovada, {lowest}) recebe a própria matriz antes de virar perfil.",
                 next.target_clock_mhz, next.voltage_mv
             ));
+            live_event(
+                &mut prog,
+                LogTone::Step,
+                live_phase,
+                format!(
+                    "Lowest passing voltage found · testing the profile pair {} MHz at {} mV, with the {margin} mV game margin",
+                    next.target_clock_mhz, next.voltage_mv
+                ),
+                None,
+            );
         } else if next.id == "compensated" && next.status == "pending" && next.target_clock_mhz < target {
             prog.log.push(format!(
                 "Par de margem {target} MHz @ {mv} mV não foi provado ({recorded:?}); o topo compensado desce para {} MHz @ {} mV.",
                 next.target_clock_mhz, next.voltage_mv
             ));
+            live_event(
+                &mut prog,
+                LogTone::Attention,
+                live_phase,
+                format!("Game-margin pair not proven · the top moves to {} MHz at {} mV", next.target_clock_mhz, next.voltage_mv),
+                None,
+            );
         } else if next.id != "performance" && next.status == "pending" && next.target_clock_mhz < target {
             prog.log.push(format!(
                 "Degrau {target} MHz terminou em {} mV, menos de 2 degraus abaixo do início ({} mV): o perfil não seria distinto do nível de cima. Tentativa {}/2 um bin de clock abaixo: {} MHz @ {} mV.",
@@ -9201,6 +9368,16 @@ fn measure_multiclock_undervolt_forge(
                 next.target_clock_mhz,
                 next.voltage_mv
             ));
+            live_event(
+                &mut prog,
+                LogTone::Attention,
+                live_phase,
+                format!(
+                    "Too close to the level above · trying one clock bin lower: {} MHz at {} mV",
+                    next.target_clock_mhz, next.voltage_mv
+                ),
+                None,
+            );
         }
         if let Some(reason) = next.stop_reason.as_deref().filter(|_| next.status == "closed") {
             match reason {
@@ -9219,14 +9396,63 @@ fn measure_multiclock_undervolt_forge(
                 )),
                 _ => {}
             }
+            match reason {
+                "integrity_edge" | "tdr_edge" | "evidence_boundary" | "voltage_floor_reached" => live_event(
+                    &mut prog,
+                    LogTone::Step,
+                    live_phase,
+                    format!("Edge found at {target} MHz · lowest passing voltage: {lowest_text}"),
+                    Some(reason.to_string()),
+                ),
+                "published" => live_event(
+                    &mut prog,
+                    LogTone::Pass,
+                    live_phase,
+                    format!("Profile pair {target} MHz at {mv} mV qualified, with game margin over {lowest_text}"),
+                    None,
+                ),
+                "compensated_top_unavailable" => live_event(
+                    &mut prog,
+                    LogTone::Attention,
+                    live_phase,
+                    "Game-margin top not proven · the lower levels start from the top's lowest passing voltage",
+                    None,
+                ),
+                "no_distinct_profile" => live_event(
+                    &mut prog,
+                    LogTone::Attention,
+                    live_phase,
+                    format!("{target} MHz could not go below its start · no separate profile at this level"),
+                    None,
+                ),
+                _ => {}
+            }
             if next.id == "performance"
                 && discovery.bands.iter().any(|b| b.stop_reason.as_deref() == Some("compensation_not_needed"))
             {
                 prog.log.push(format!(
                     "O topo {target} MHz já tem margem de jogo abaixo da tensão de potência; sem topo compensado."
                 ));
+                live_event(
+                    &mut prog,
+                    LogTone::Step,
+                    live_phase,
+                    format!("{target} MHz already has game margin · no separate game-margin top"),
+                    None,
+                );
             }
             if let Some(level) = discovery.bands.iter().find(|b| b.status == "pending") {
+                live_event(
+                    &mut prog,
+                    LogTone::Step,
+                    band_phase(&level.id),
+                    if level.id == "compensated" {
+                        format!("Next: the game-margin top at {} MHz, starting at {} mV", level.target_clock_mhz, level.voltage_mv)
+                    } else {
+                        format!("Next level: {} MHz at {} mV", level.target_clock_mhz, level.voltage_mv)
+                    },
+                    None,
+                );
                 prog.log.push(if level.id == "compensated" {
                     format!(
                         "Topo compensado pela margem de jogo: {} MHz; primeiro o par de margem {} mV (tensão de potência − {margin} mV), depois o par publicado.",
@@ -9246,6 +9472,13 @@ fn measure_multiclock_undervolt_forge(
                 "Topo {target} MHz @ {mv} mV inconclusivo: sem prova e sem falha, o par não é aprovado nem condenado. Descida única desta run para {} MHz @ {} mV como nova hipótese de topo.",
                 next.target_clock_mhz, next.voltage_mv
             ));
+            live_event(
+                &mut prog,
+                LogTone::Attention,
+                live_phase,
+                format!("Top {target} MHz inconclusive · trying {} MHz at {} mV as the new top", next.target_clock_mhz, next.voltage_mv),
+                None,
+            );
         }
         prog.last_outcome = Some(
             match outcome {
@@ -9291,6 +9524,7 @@ fn measure_multiclock_undervolt_forge(
             forge_aborted = true;
             prog.log
                 .push(format!("Checkpoint de busca não confirmado: {error}"));
+            live_event(&mut prog, LogTone::Fail, "Search", "The search checkpoint could not be saved", Some(error.to_string()));
         }
         set(progress, prog.clone());
     }
@@ -9339,6 +9573,7 @@ fn measure_multiclock_undervolt_forge(
         forge_complete = false;
         prog.profiles_qualified = false;
         prog.log.push(format!("Publicação recusada: {error}"));
+        live_event(&mut prog, LogTone::Fail, "Profiles", "Publishing the profiles failed", Some(error.to_string()));
     }
 
     // ALWAYS restore stock. Clear the boot flag only after the reset is confirmed.
@@ -9361,6 +9596,7 @@ fn measure_multiclock_undervolt_forge(
             prog.recommended = None;
             prog.profiles_qualified = false;
             prog.log.push(format!("Reset final NÃO confirmado: {e}"));
+            live_event(&mut prog, LogTone::Fail, "Finish", "The final return to stock was NOT confirmed", Some(format!("{e}")));
             false
         }
         Ok(()) => {
@@ -9369,6 +9605,7 @@ fn measure_multiclock_undervolt_forge(
                     "Recuperação permanece armada após DeviceLost/reset não confirmado; a inicialização deverá contabilizar a execução interrompida."
                         .into(),
                 );
+                live_event(&mut prog, LogTone::Attention, "Finish", "Recovery stays armed: the next start accounts for the interrupted run", None);
             }
             !retain_boot_flag
         }
@@ -9446,6 +9683,7 @@ fn measure_multiclock_undervolt_forge(
             }
             Err(error) => {
                 prog.log.push(format!("Perfis após crash não publicados: {error}"));
+                live_event(&mut prog, LogTone::Fail, "Profiles", "Profiles after the crash were not published", Some(error.to_string()));
                 false
             }
         };
@@ -9467,28 +9705,36 @@ fn measure_multiclock_undervolt_forge(
             None => "—".into(),
         };
         let readiness = if prog.profiles_qualified {
-            "perfis qualificados, prontos para aplicação explícita"
+            "qualified profiles, ready to apply"
         } else {
-            "prévia descoberta; execute Standard ou Long para qualificar antes de aplicar"
+            "preview only; run Standard or Long to qualify them before applying"
         };
         let unique = f2_unique_profile_points(&[prog.godforge, prog.brokkrs, prog.deep_calm]);
         let coverage = if prog.profile_search_complete {
-            "faixa econômica explorada; exclusões de segurança constam no relatório"
+            "the efficient range was explored; safety exclusions are in the report"
         } else {
-            "cobertura econômica incompleta; melhores alternativas podem não ter sido exploradas"
+            "efficiency coverage is incomplete; better trade-offs may be unexplored"
         };
         prog.note = Some(format!(
-            "Forja F2 · cap {cap:.0} W · {} configuração(ões) distinta(s): {} — {readiness}; {coverage}.",
+            "F2 Forge · power limit {cap:.0} W · {} distinct setting(s): {} — {readiness}; {coverage}.",
             unique.len(), unique.into_iter().map(|point| fmt(Some(point))).collect::<Vec<_>>().join(" · ")
         ));
+        let complete = if prog.profiles_qualified {
+            "Forge complete: the profiles are qualified and ready to apply"
+        } else {
+            "Forge complete: preview profiles ready; qualify them before applying"
+        };
+        live_event(&mut prog, LogTone::Pass, "Profiles", complete, None);
     } else {
         prog.note = Some(format!(
-            "Forja F2 parcial: {} novo(s) dwell(s) preservado(s) no Forge Knowledge; nenhum perfil definitivo novo foi criado.",
+            "Partial F2 Forge: {} new test result(s) kept in Forge Knowledge; no new final profile was created.",
             prog.learned_points
         ));
+        live_event(&mut prog, LogTone::Attention, "Finish", "The Forge ended without new final profiles", None);
     }
     if clock_control_blocked && final_reset_confirmed {
-        prog.note = Some("Forja interrompida: o clock ultrapassou o teto solicitado em mais de um teste. GPU retornou a stock; nenhum perfil definitivo foi criado. Exporte o relatório para revisar o controle de clock antes de outra validação.".into());
+        prog.note = Some("Forge stopped: the clock went above the requested ceiling in more than one test. The GPU returned to stock; no final profile was created. Export the report to review clock control before another run.".into());
+        live_event(&mut prog, LogTone::Fail, "Finish", "Stopped: the clock went above the requested ceiling more than once", None);
     }
     prog.frontier_complete = (forge_complete || crash_profiles_published) && prog.godforge.is_some();
     let this_session_elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
@@ -9512,8 +9758,7 @@ fn measure_multiclock_undervolt_forge(
         prog.profiles_qualified = false;
         prog.resume_available = false;
         prog.resume_block_reason = Some(
-            "ledger/estado de segurança ilegível; CandidateCrash pendente será reconciliado antes de liberar Resume"
-                .into(),
+            "the safety history could not be read; the pending crash is reconciled before Resume".into(),
         );
         if let Some(incident) = pending_tdr_incident.as_ref() {
             prog.current_clock_mhz = incident.target_mhz;
@@ -9521,8 +9766,9 @@ fn measure_multiclock_undervolt_forge(
             prog.last_outcome = Some("TdrOrCrash".into());
         }
         prog.note = Some(format!(
-            "Forge encerrada em modo fail-closed: {error}. O incidente pendente e o raw dwell foram preservados; nenhuma aprovação foi publicada."
+            "The Forge stopped safely: {error}. The pending incident and the raw test data are kept; nothing was approved."
         ));
+        live_event(&mut prog, LogTone::Fail, "Safety", "Stopped safely: the crash record must be confirmed first", Some(error.clone()));
         prog.log.push(format!(
             "TERMINAL FAIL-CLOSED: {error}; checkpoint não foi marcado interrupted até a condenação Rigid exact-v{F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION} ser confirmada por readback."
         ));
@@ -9543,28 +9789,37 @@ fn measure_multiclock_undervolt_forge(
             .flatten();
         if let Some(level) = next_level {
             prog.resume_block_reason = Some(format!(
-                "reinicie o Windows e reconheça o incidente; Retomar continua em {} MHz @ {} mV",
+                "restart Windows and acknowledge the incident; Resume continues at {} MHz at {} mV",
                 level.target_clock_mhz, level.voltage_mv
             ));
             prog.note = Some(format!(
-                "TDR no limite do degrau {target_mhz} MHz @ {anchor_mv} mV: par condenado e cone TDR aplicados. Restauração stock confirmada: {final_reset_confirmed}. Reinicie o Windows, reconheça o incidente e use Retomar: a mesma run continua em {} MHz @ {} mV com as provas já feitas.",
+                "A driver crash at {target_mhz} MHz at {anchor_mv} mV marked this level's edge; the pair is blocked. Return to stock {}. After Windows restarts and the incident is acknowledged, Resume continues the same run at {} MHz at {} mV with the proof it already has.",
+                if final_reset_confirmed { "confirmed" } else { "NOT confirmed" },
                 level.target_clock_mhz, level.voltage_mv
             ));
         } else {
             prog.resume_block_reason =
-                Some("TDR encerrou esta busca; recuperação e nova run exigem ação explícita".into());
+                Some("a driver crash ended this search; recovery and a new run need your action".into());
             let published = if crash_profiles_published {
-                " Perfis publicados só com pares que já tinham prova completa antes do crash; o cone TDR foi excluído e o Apply fica bloqueado até o incidente ser reconhecido."
+                " Profiles were published only from pairs fully proven before the crash; the crash area is excluded and Apply stays locked until the incident is acknowledged."
             } else {
                 ""
             };
             prog.note = Some(format!(
-                "TDR atribuído a {target_mhz} MHz @ {anchor_mv} mV; run encerrada e evidência preservada. Restauração stock confirmada: {final_reset_confirmed}.{published} Reinicie o Windows e reconheça o incidente antes de iniciar outra run."
+                "Driver crash attributed to {target_mhz} MHz at {anchor_mv} mV; the run ended and its evidence is kept. Return to stock {}.{published} Restart Windows and acknowledge the incident before another run.",
+                if final_reset_confirmed { "confirmed" } else { "NOT confirmed" }
             ));
         }
         prog.log.push(format!(
             "TDR/CRASH: CandidateCrash {target_mhz} MHz @ {anchor_mv} mV reconciliado no terminal; raw dwell preservado sem relabel, run pausada como interrupted."
         ));
+        live_event(
+            &mut prog,
+            LogTone::Fail,
+            "Safety",
+            format!("Driver crash at {target_mhz} MHz at {anchor_mv} mV · the pair is blocked and the run is interrupted"),
+            None,
+        );
     } else if manual_pause {
         prog.current_clock_mhz = None;
         prog.current_voltage_mv = None;
@@ -9572,12 +9827,13 @@ fn measure_multiclock_undervolt_forge(
         prog.resume_block_reason = if prog.resume_available {
             None
         } else {
-            Some("o backend não conseguiu registrar identidade completa de build/GPU/driver".into())
+            Some("the build, GPU and driver identity could not be recorded".into())
         };
         prog.note = Some(
-            "Forge pausado com segurança: GPU em stock e todo aprendizado concluído persistido. Use Resume para continuar explicitamente."
+            "Forge paused safely. The GPU is at stock and everything learned is saved. Use Resume to continue."
                 .into(),
         );
+        live_event(&mut prog, LogTone::Attention, "Finish", "Stopped by you · the run is paused and can resume", None);
         prog.log.push(
             "STOP manual concluído: checkpoint pausado gravado após reset confirmado para stock."
                 .into(),
@@ -9588,11 +9844,11 @@ fn measure_multiclock_undervolt_forge(
         prog.resume_available = false;
         if prog.phase != "paused" {
             prog.resume_block_reason = Some(match prog.phase.as_str() {
-                "finished" | "provisional" => "Forge já terminou".into(),
+                "finished" | "provisional" => "the Forge already finished".into(),
                 "interrupted" => {
-                    "interrupção/TDR não é uma pausa manual; recovery explícito é necessário".into()
+                    "an interruption or driver crash is not a manual pause; recovery needs your action".into()
                 }
-                _ => "não há checkpoint pausado por Stop manual".into(),
+                _ => "there is no checkpoint paused by Stop".into(),
             });
         }
     }
@@ -11853,6 +12109,25 @@ mod tests {
         assert!(!auto_resume_eligible(&restored, Some(&crash)), "the pending incident waits for the user");
         assert!(!auto_resume_eligible(&restored, None), "an orphan interrupted run waits for the user");
         assert!(auto_resume_eligible(&started_here, Some(&crash)));
+    }
+
+    #[test]
+    fn live_log_events_keep_tone_phase_and_detail_within_a_bounded_tail() {
+        let mut prog = PowerSweepProgress::default();
+        for index in 0..FORGE_LIVE_LOG_TAIL + 5 {
+            live_event(&mut prog, LogTone::Step, "Search", format!("event {index}"), None);
+        }
+        live_event(&mut prog, LogTone::Fail, "Performance", "1920 MHz at 900 mV failed: integrity error", Some("SilentError".into()));
+        assert_eq!(prog.log_entries.len(), FORGE_LIVE_LOG_TAIL);
+        assert_eq!(prog.log_entries[0].text, "event 6", "the oldest events go first");
+        let last = prog.log_entries.last().unwrap();
+        assert_eq!((last.tone, last.phase.as_str(), last.detail.as_deref()), (LogTone::Fail, "Performance", Some("SilentError")));
+        assert!(last.at_ms > 0);
+        let saved: serde_json::Value = serde_json::from_str(&encode_forge_state("gpu", &prog).unwrap()).unwrap();
+        let entries = saved["progress"]["log_entries"].as_array().unwrap();
+        assert_eq!(entries.len(), FORGE_STATE_LOG_TAIL, "the saved state keeps the short tail");
+        assert_eq!(entries.last().unwrap()["tone"], "fail");
+        assert_eq!(band_phase("compensated"), "Game margin");
     }
 
     #[test]
