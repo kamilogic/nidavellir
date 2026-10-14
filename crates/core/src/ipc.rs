@@ -51,6 +51,10 @@ pub enum IpcRequest {
     /// Opt in or out of automatic Resume after a staircase-edge TDR (2026-10-01). No hardware work;
     /// turning it off also cancels a pending countdown. Additive.
     SetForgeAutoResume { enabled: bool },
+    /// Cancel this run's pending automatic continuation (2026-10-13): the Resume countdown or the
+    /// Windows restart warning. The run then waits for the user; the saved auto-continue choice
+    /// stays as it is. No hardware work. Answers like `GetPowerSweepProgress`. Additive.
+    CancelForgeAutoContinue,
     /// Turn the Sentinel's GPU check while gaming on or off (2026-10-05). Off by default; driver-crash
     /// detection stays on either way. No hardware work. Answers like `GetPowerSweepProgress`. Additive.
     SetSentinelCanary { enabled: bool },
@@ -591,6 +595,11 @@ pub struct PowerSweepProgress {
     /// Epoch ms when a pending automatic Resume fires; `None` when none is scheduled.
     #[serde(default)]
     pub auto_resume_at_ms: Option<u64>,
+    /// Epoch ms when Nidavellir restarts Windows so the run can continue (2026-10-13): a driver
+    /// crash needs a new boot and the driver-only reset could not give one. `None` when no restart
+    /// is scheduled.
+    #[serde(default)]
+    pub auto_restart_at_ms: Option<u64>,
     /// The run was started by a build where auto-resume is on by default (2026-10-12), so only such
     /// a run may continue by itself. A run saved by an older build, when the option was opt-in,
     /// decodes as `false` and waits for the user's Resume.

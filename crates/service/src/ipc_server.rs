@@ -425,6 +425,11 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             Ok(progress) => IpcResponse::success(ResponseData::PowerSweep(progress)),
             Err(error) => IpcResponse::failure(error),
         },
+        IpcRequest::CancelForgeAutoContinue => {
+            #[cfg(windows)]
+            crate::auto_resume::cancel(&guard);
+            IpcResponse::success(ResponseData::PowerSweep(power_sweep_status(&guard)))
+        }
         IpcRequest::SetSentinelCanary { enabled } => match crate::tdr_sentinel::set_canary_enabled(*enabled) {
             Ok(()) => IpcResponse::success(ResponseData::PowerSweep(power_sweep_status(&guard))),
             Err(error) => IpcResponse::failure(error),

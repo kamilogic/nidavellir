@@ -1056,6 +1056,8 @@ pub struct PowerSweepHandle {
     auto_resume: Arc<AtomicBool>,
     /// Epoch ms of a pending automatic Resume; 0 when none.
     auto_resume_at_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Epoch ms of a pending automatic Windows restart; 0 when none.
+    auto_restart_at_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for PowerSweepHandle {
@@ -1067,6 +1069,7 @@ impl Default for PowerSweepHandle {
             running: Arc::new(AtomicBool::new(false)),
             auto_resume: Arc::new(AtomicBool::new(false)),
             auto_resume_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            auto_restart_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -1168,6 +1171,8 @@ impl PowerSweepHandle {
         progress.auto_resume = self.auto_resume.load(Ordering::SeqCst);
         progress.auto_resume_at_ms =
             Some(self.auto_resume_at_ms.load(Ordering::SeqCst)).filter(|at| *at > 0);
+        progress.auto_restart_at_ms =
+            Some(self.auto_restart_at_ms.load(Ordering::SeqCst)).filter(|at| *at > 0);
         progress
     }
     pub fn stop(&self) {
@@ -1478,6 +1483,12 @@ impl PowerSweepHandle {
                 save_forge_state(&current_gpu_key(), &progress);
             }
         }
+    }
+
+    /// The Windows restart warning (auto_resume.rs): its deadline, or `None` to clear it.
+    #[cfg(windows)]
+    pub(crate) fn set_auto_restart_at(&self, at_ms: Option<u64>) {
+        self.auto_restart_at_ms.store(at_ms.unwrap_or(0), Ordering::SeqCst);
     }
 
     fn start_with_intent(

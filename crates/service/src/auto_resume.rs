@@ -1,17 +1,22 @@
-//! Automatic continuation after a staircase-edge TDR (user decisions 2026-10-01), opt-in per run.
+//! Automatic continuation after a staircase-edge TDR (user decisions 2026-10-01; on by default since
+//! 2026-10-12).
 //!
 //! A supervisor thread waits [`AUTO_RESUME_DELAY_MS`] once a run becomes eligible (shown in the UI;
-//! turning the option off or starting anything cancels it). Then:
+//! a cancel, turning the option off or starting anything stops it). Then:
 //! - if this Windows boot still holds the TDR latch, the installed service resets only the GPU
 //!   driver (experimental, once per incident): it stops cleanly at stock, restarts the NVIDIA
 //!   display device, records the exact TDR the reset covers and exits non-zero so SCM recovery
-//!   starts a fresh process without that latch. Anything else keeps the reboot requirement.
+//!   starts a fresh process without that latch. When that reset is not possible, the installed
+//!   service warns on screen for [`AUTO_RESTART_DELAY_MS`] and restarts Windows (user decision
+//!   2026-10-13, once per incident); the service starts with Windows and continues the run.
+//!   Anything else keeps the reboot requirement.
 //! - otherwise it acknowledges only that run's own CandidateCrash and calls the same `resume` a
 //!   user click calls, so every guard applies, including the stock controls every run starts with.
 //!
 //! One attempt per incident, kept across Core restarts: a refusal is logged and the run waits for
 //! the user.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +30,8 @@ use crate::AppState;
 /// Long enough for Windows and the driver to settle after a boot or a driver reset, short enough
 /// that an overnight run loses little time.
 pub(crate) const AUTO_RESUME_DELAY_MS: u64 = 120_000;
+/// The on-screen warning before Nidavellir restarts Windows: time to save work or cancel.
+const AUTO_RESTART_DELAY_MS: u64 = 120_000;
 /// Residual nvlddmkm-153 events of one episode land within seconds of the incident; a TDR further
 /// away is another failure and keeps the reboot requirement.
 const SAME_EPISODE_MS: i64 = 60_000;
@@ -45,6 +52,10 @@ fn pending_incident(state: &AppState) -> Result<Option<ForgeIncident>, String> {
 /// Keys this process already acted on. Shared with the program session: the Core outlives the
 /// program only while a resume can still happen.
 static ATTEMPTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Bumped by every user cancel; a countdown or restart warning begun under an older value stops.
+static CANCELS: AtomicU64 = AtomicU64::new(0);
+/// A Windows restart warning is running: the Core stays up for it, with the program or without.
+static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
 /// Acknowledge+resume attempts are also saved, because the Core stops when the program closes. A
 /// driver-only reset is not: the restarted process must continue that same incident, and
 /// `gpu_driver_reset.json` already limits the reset to one.
@@ -88,9 +99,25 @@ fn eligible_keys(state: &AppState) -> Option<[String; 2]> {
         .then(|| [pending.map_or_else(|| run.clone(), |incident| incident.id), run])
 }
 
-/// True while this run will still continue on its own (countdown or next poll).
+/// True while this run will still continue on its own (countdown, next poll or restart warning).
 pub(crate) fn needs_core(state: &AppState) -> bool {
-    eligible_keys(state).is_some_and(|keys| !attempted(&keys[0]))
+    RESTART_PENDING.load(Ordering::SeqCst) || eligible_keys(state).is_some_and(|keys| !attempted(&keys[0]))
+}
+
+/// The user cancels this run's automatic continuation: a countdown or restart warning stops and
+/// the run waits for them. The saved auto-continue choice stays (2026-10-13: turning the option
+/// off was the only cancel, and it then stayed off for every later run).
+pub(crate) fn cancel(state: &AppState) {
+    let keys = eligible_keys(state);
+    if let (Some(keys), Ok(mut attempted)) = (&keys, ATTEMPTED.lock()) {
+        attempted.extend(keys.iter().cloned());
+    }
+    CANCELS.fetch_add(1, Ordering::SeqCst);
+    if let Some(keys) = keys {
+        if let Err(error) = save_attempt(&attempts_path(), &keys) {
+            tracing::warn!("auto-resume cancel not saved ({error}); a restarted Core may try once more");
+        }
+    }
 }
 
 fn run(state: &Mutex<AppState>) {
@@ -98,18 +125,22 @@ fn run(state: &Mutex<AppState>) {
     // acknowledgement gets no second countdown. A later incident of the run gets a new attempt.
     while !crate::shutdown::is_requested() {
         std::thread::sleep(Duration::from_secs(5));
+        // Read before the keys: a cancel from here on stops whatever follows.
+        let cancels = CANCELS.load(Ordering::SeqCst);
         let Some(keys) = state.lock().ok().and_then(|guard| eligible_keys(&guard)) else { continue };
         if attempted(&keys[0]) {
             continue;
         }
-        if countdown(state) {
-            act(state, keys);
+        if countdown(state, cancels) {
+            if let Some(reason) = act(state, &keys) {
+                restart_after_warning(state, &keys, &reason, cancels);
+            }
         }
     }
 }
 
-/// True when the delay ran out without the option being turned off or a run starting.
-fn countdown(state: &Mutex<AppState>) -> bool {
+/// True when the delay ran out without a cancel, the option being turned off or a run starting.
+fn countdown(state: &Mutex<AppState>, cancels: u64) -> bool {
     let deadline = now_ms() + AUTO_RESUME_DELAY_MS;
     {
         let Ok(guard) = state.lock() else { return false };
@@ -125,7 +156,7 @@ fn countdown(state: &Mutex<AppState>) -> bool {
         std::thread::sleep(Duration::from_secs(1));
         let Ok(guard) = state.lock() else { return false };
         let progress = guard.power_sweep.progress();
-        if !progress.auto_resume || progress.running {
+        if !progress.auto_resume || progress.running || CANCELS.load(Ordering::SeqCst) != cancels {
             if progress.auto_resume_at_ms.is_some() {
                 guard.power_sweep.note_auto_resume(None, LogTone::Step, "Automatic continuation cancelled.".into());
             }
@@ -135,8 +166,10 @@ fn countdown(state: &Mutex<AppState>) -> bool {
     true
 }
 
-fn act(state: &Mutex<AppState>, keys: [String; 2]) {
-    let Ok(guard) = state.lock() else { return };
+/// Some(reason) when Windows must restart next: the boot still holds the TDR latch and the
+/// driver-only reset is not possible for `reason`.
+fn act(state: &Mutex<AppState>, keys: &[String; 2]) -> Option<String> {
+    let Ok(guard) = state.lock() else { return None };
     // Under the state lock, so `needs_core` never sees the attempt before its outcome.
     if let Ok(mut attempted) = ATTEMPTED.lock() {
         attempted.extend(keys.iter().cloned());
@@ -145,6 +178,7 @@ fn act(state: &Mutex<AppState>, keys: [String; 2]) {
         guard.power_sweep.note_auto_resume(None, LogTone::Attention, format!(
             "Automatic continuation refused: {reason}. The run waits for you."
         ));
+        None
     };
     let progress = guard.power_sweep.progress();
     let pending = match pending_incident(&guard) {
@@ -155,18 +189,31 @@ fn act(state: &Mutex<AppState>, keys: [String; 2]) {
         return refuse("the run changed during the wait".into());
     }
     if let Some(latch) = crate::tdr_sentinel::reboot_required_event() {
-        let line = match pending.as_ref().ok_or_else(|| "the incident was already acknowledged".to_string())
+        let reason = match pending.as_ref().ok_or_else(|| "the incident was already acknowledged".to_string())
             .and_then(|incident| begin_driver_reset(incident, &latch))
         {
-            Ok(()) => "Restarting only the GPU driver: the service stops with the GPU at stock, restarts the NVIDIA adapter and comes back by itself; the run continues without a Windows restart.".into(),
-            Err(reason) => format!(
-                "This boot still holds driver crash {latch} and a driver-only restart is not available ({reason}). Restart Windows: with the installed service the run continues by itself after the restart."
-            ),
+            Ok(()) => {
+                guard.power_sweep.note_auto_resume(None, LogTone::Attention, "Restarting only the GPU driver: the service stops with the GPU at stock, restarts the NVIDIA adapter and comes back by itself; the run continues without a Windows restart.".into());
+                return None;
+            }
+            Err(reason) => reason,
         };
-        return guard.power_sweep.note_auto_resume(None, LogTone::Attention, line);
+        let restarted = restart_issued(&restart_marker_path(), &keys[0]);
+        if restart_allowed(crate::service_impl::under_scm(), restarted) {
+            // Set under the state lock, so the Core never looks unneeded before the warning starts.
+            RESTART_PENDING.store(true, Ordering::SeqCst);
+            return Some(reason);
+        }
+        let line = if restarted {
+            format!("Windows was already restarted once for this driver crash, and this boot still needs a restart ({latch}). The run waits for you.")
+        } else {
+            format!("This boot still holds driver crash {latch} and a driver-only restart is not available ({reason}). Restart Windows: with the installed service the run continues by itself after the restart.")
+        };
+        guard.power_sweep.note_auto_resume(None, LogTone::Attention, line);
+        return None;
     }
     // Saved before acting, so a Core the program restarts never tries this incident again.
-    if let Err(error) = save_attempt(&attempts_path(), &keys) {
+    if let Err(error) = save_attempt(&attempts_path(), keys) {
         tracing::warn!("auto-resume attempt not saved ({error}); a restarted Core may try it once more");
     }
     if let Some(incident) = pending.as_ref() {
@@ -182,7 +229,149 @@ fn act(state: &Mutex<AppState>, keys: [String; 2]) {
         if pending.is_some() { "; auto-continue acknowledged this run's driver crash" } else { "" }
     ));
     if let Err(error) = guard.power_sweep.resume(guard.safe_store.clone()) {
-        refuse(error);
+        return refuse(error);
+    }
+    None
+}
+
+/// The boot still needs a restart and the driver-only reset could not give one: warn on screen for
+/// [`AUTO_RESTART_DELAY_MS`], then restart Windows unless the user cancels (user decision
+/// 2026-10-13). The installed service starts with Windows and continues the run.
+fn restart_after_warning(state: &Mutex<AppState>, keys: &[String; 2], reason: &str, cancels: u64) {
+    let deadline = now_ms() + AUTO_RESTART_DELAY_MS;
+    let warned = state
+        .lock()
+        .map(|guard| {
+            guard.power_sweep.set_auto_restart_at(Some(deadline));
+            guard.power_sweep.note_auto_resume(None, LogTone::Attention, format!(
+                "This driver crash needs a Windows restart (a driver-only restart is not available: {reason}). Windows restarts in {} s and the run continues after it. Cancel to keep working; the run then waits for you.",
+                AUTO_RESTART_DELAY_MS / 1000
+            ));
+        })
+        .is_ok();
+    // No warning on screen, no restart.
+    let restarting = warned && {
+        let outcome = restart_when_due(state, &keys[0], deadline, cancels);
+        if let Ok(guard) = state.lock() {
+            guard.power_sweep.set_auto_restart_at(None);
+            let (tone, line) = match &outcome {
+                Ok(()) => (LogTone::Step, "Restarting Windows now. The run continues after the restart.".to_string()),
+                Err(line) => (LogTone::Attention, line.clone()),
+            };
+            guard.power_sweep.note_auto_resume(None, tone, line);
+        }
+        outcome.is_ok()
+    };
+    // A restart under way keeps the Core until Windows stops it.
+    if !restarting {
+        RESTART_PENDING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A refused driver reset leads to a Windows restart only in the installed service, and once per
+/// key: in console mode no Core starts with Windows, and a second restart could loop.
+fn restart_allowed(under_scm: bool, restarted_before: bool) -> bool {
+    under_scm && !restarted_before
+}
+
+/// What the warning does on each tick.
+#[derive(Debug, PartialEq)]
+enum WarningStep {
+    Wait,
+    Restart,
+    Stop(&'static str),
+}
+
+/// A cancel, auto-continue turned off or a run starting always wins, even at the deadline.
+fn warning_step(cancelled: bool, auto_resume: bool, running: bool, due: bool) -> WarningStep {
+    if cancelled {
+        WarningStep::Stop("Windows restart cancelled. The run waits for you: restart Windows when you are ready, then continue it from the Forge screen.")
+    } else if !auto_resume || running {
+        WarningStep::Stop("Windows restart cancelled. The run waits for you.")
+    } else if due {
+        WarningStep::Restart
+    } else {
+        WarningStep::Wait
+    }
+}
+
+/// Restarts Windows when the warning runs out with the run still waiting for it; Err carries the
+/// line that says why Windows was not restarted.
+fn restart_when_due(state: &Mutex<AppState>, key: &str, deadline: u64, cancels: u64) -> Result<(), String> {
+    loop {
+        if crate::shutdown::is_requested() {
+            return Err("The Core stopped during the warning; Windows was not restarted.".into());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let guard = state.lock().map_err(|_| "Windows was not restarted: the Core state is unavailable.".to_string())?;
+        let progress = guard.power_sweep.progress();
+        match warning_step(
+            CANCELS.load(Ordering::SeqCst) != cancels,
+            progress.auto_resume,
+            progress.running,
+            now_ms() >= deadline,
+        ) {
+            WarningStep::Wait => continue,
+            WarningStep::Stop(line) => return Err(line.into()),
+            WarningStep::Restart => {}
+        }
+        let pending = pending_incident(&guard)
+            .map_err(|error| format!("Windows was not restarted: the Safe Loop state could not be read ({error})."))?;
+        if !auto_resume_eligible(&progress, pending.as_ref()) {
+            return Err("Windows was not restarted: the run changed during the warning.".into());
+        }
+        // The boot after the restart refuses Resume while the flag is armed (safety audit 2026-10-13).
+        if guard.safe_store.is_boot_flag_armed() {
+            return Err("Windows was not restarted: the Safe Loop boot flag is still armed, so the run could not continue after it. The run waits for you.".into());
+        }
+        // Still under the state lock: nothing starts between these checks and the restart.
+        return issue_restart(key);
+    }
+}
+
+/// The record comes first, so a boot that still needs a restart waits for the user instead of
+/// restarting again.
+fn issue_restart(key: &str) -> Result<(), String> {
+    save_restart_marker(&restart_marker_path(), key).map_err(|error| {
+        format!("Windows was not restarted: the restart record could not be saved ({error}). Restart Windows yourself; the run continues after it.")
+    })?;
+    restart_windows()
+        .map_err(|error| format!("Windows could not be restarted ({error}). Restart Windows yourself; the run continues after it."))
+}
+
+fn restart_marker_path() -> std::path::PathBuf {
+    nidavellir_core::safe_loop::default_data_dir().join("forge_restart.json")
+}
+
+/// Windows was already restarted for this key (the incident, or the run once acknowledged). An
+/// unreadable record counts as restarted, so a damaged file never loops restarts.
+fn restart_issued(path: &std::path::Path, key: &str) -> bool {
+    match std::fs::read(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(bytes) => serde_json::from_slice::<String>(&bytes).map_or(true, |saved| saved == key),
+    }
+}
+
+fn save_restart_marker(path: &std::path::Path, key: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, serde_json::to_vec(key).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+/// Windows' own restart, by absolute path (the service runs as LocalSystem). `/f` closes open
+/// programs without saving, as the warning said.
+fn restart_windows() -> Result<(), String> {
+    let root = std::env::var_os("SystemRoot").ok_or("SystemRoot is not set")?;
+    let status = std::process::Command::new(std::path::Path::new(&root).join(r"System32\shutdown.exe"))
+        .args(["/r", "/f", "/t", "0", "/d", "p:4:1", "/c", "Nidavellir restarts Windows to continue the Forge after a GPU driver crash."])
+        .status()
+        .map_err(|e| format!("shutdown.exe: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("shutdown.exe exited with {:?}", status.code()))
     }
 }
 
@@ -363,6 +552,32 @@ mod tests {
         assert!(!saved.contains(&"incident-a".to_string()), "oldest keys go first");
         std::fs::write(&path, "not json").unwrap();
         assert!(saved_attempts(&path).is_empty(), "a damaged file never blocks every future run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_restart_warning_yields_to_any_cancel_and_restarts_only_the_installed_service_once() {
+        assert_eq!(warning_step(false, true, false, false), WarningStep::Wait);
+        assert_eq!(warning_step(false, true, false, true), WarningStep::Restart);
+        assert!(matches!(warning_step(true, true, false, true), WarningStep::Stop(_)), "a cancel wins even at the deadline");
+        assert!(matches!(warning_step(false, false, false, true), WarningStep::Stop(_)), "auto-continue turned off");
+        assert!(matches!(warning_step(false, true, true, true), WarningStep::Stop(_)), "a run started");
+        assert!(restart_allowed(true, false));
+        assert!(!restart_allowed(false, false), "console mode never restarts Windows");
+        assert!(!restart_allowed(true, true), "one automatic restart per incident");
+    }
+
+    #[test]
+    fn windows_restarts_once_per_incident_and_a_damaged_record_never_restarts_it() {
+        let dir = std::env::temp_dir().join(format!("nidavellir-restart-{}", std::process::id()));
+        let path = dir.join("forge_restart.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!restart_issued(&path, "incident-a"), "no record: the first restart may happen");
+        save_restart_marker(&path, "incident-a").unwrap();
+        assert!(restart_issued(&path, "incident-a"), "the same incident never restarts Windows twice");
+        assert!(!restart_issued(&path, "incident-b"), "a later incident may restart once");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(restart_issued(&path, "incident-b"), "a damaged record never loops restarts");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
