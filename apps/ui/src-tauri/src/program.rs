@@ -2,7 +2,7 @@
 //! service, a heartbeat keeps it, Exit stops it at stock. The tray keeps the program running with
 //! the window hidden and offers the forged profiles, Stock and Exit.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -236,8 +236,20 @@ async fn ensure_core() {
     }
 }
 
+/// Deadline of the Windows restart warning the window was last brought up for.
+static RESTART_WARNED: AtomicU64 = AtomicU64::new(0);
+
+/// A Windows restart warning brings the window up, even from the tray, so the user can still cancel.
+fn surface_restart_warning(app: &AppHandle, progress: Option<&Value>) {
+    let at = progress.and_then(|response| response["data"]["auto_restart_at_ms"].as_u64()).unwrap_or(0);
+    if at != 0 && RESTART_WARNED.swap(at, Ordering::SeqCst) != at {
+        show_main(app);
+    }
+}
+
 async fn refresh_tray(app: &AppHandle) {
     let progress = call("GetPowerSweepProgress", None).await.ok();
+    surface_restart_warning(app, progress.as_ref());
     let applied = call("GetAppliedProfile", None).await.ok();
     let safe = call("GetSafeLoopStatus", None).await.ok();
     let state = tray_state(progress.as_ref(), applied.as_ref(), safe.as_ref());
@@ -347,10 +359,11 @@ pub fn request_exit(app: &AppHandle) {
 }
 
 /// The user confirmed: stop the run and its automatic continuation (it stays resumable), then exit.
+/// The saved auto-continue choice stays as it is.
 #[tauri::command]
 pub async fn exit_program(app: AppHandle) -> Result<(), String> {
     let _ = call("StopPowerSweep", None).await;
-    let _ = call("SetForgeAutoResume", Some(json!({ "enabled": false }))).await;
+    let _ = call("CancelForgeAutoContinue", None).await;
     let deadline = Instant::now() + FORGE_STOP_TIMEOUT;
     loop {
         match exit(&app).await {

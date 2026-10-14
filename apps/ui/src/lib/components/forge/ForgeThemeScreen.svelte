@@ -11,6 +11,7 @@
   import ForgeProgress from "./ForgeProgress.svelte";
   import AutoResumeToggle from "./AutoResumeToggle.svelte";
   import PreForgeSheet from "./PreForgeSheet.svelte";
+  import RestartWarning from "./RestartWarning.svelte";
   import { distinctForgeProfiles, forgePrimaryAction, nvidiaGpu } from "../../forge-workflow.js";
   import LiveGpu from "./LiveGpu.svelte";
   import { liveGpuView } from "../../live-gpu-view.js";
@@ -808,6 +809,9 @@
       </button>
     </aside>
   {/if}
+
+  <!-- On every page: the Core may restart Windows so a run can continue. -->
+  <RestartWarning {powerSweep} />
 
   {#if resetConfirmOpen}
     <dialog

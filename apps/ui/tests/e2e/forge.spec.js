@@ -81,6 +81,10 @@ async function openForge(page, scenario = "ready") {
           if (args.params.enabled) state.power.sentinel_advice = null;
           return ok(state.power);
         }
+        if (method === "CancelForgeAutoContinue") {
+          state.power = { ...state.power, auto_resume_at_ms: null, auto_restart_at_ms: null };
+          return ok(state.power);
+        }
         if (method === "GetAppliedProfile") return ok(state.applied);
         if (method === "GetSentinelStatus" && scenario === "slow-reset" && state.resetCompleted) {
           return new Promise(() => {});
@@ -974,4 +978,38 @@ test("Sentinel: the page shows protection, what happened and the blocked points 
   await expect.poll(() => page.evaluate(() => window.__forgeTest.calls.includes("SetSentinelCanary"))).toBe(true);
   await sentinel.getByRole("button", { name: /Show the list/ }).click();
   await expect(sentinel.locator(".blocked-list li")).toHaveCount(3);
+});
+
+test("Restart: a driver crash that needs a fresh Windows start warns on any page, Escape keeps the warning and Cancel keeps Windows running", async ({ page }, testInfo) => {
+  await openForge(page);
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.evaluate(() => Object.assign(window.__forgeTest.power, {
+    phase: "interrupted", auto_resume: true, auto_restart_at_ms: Date.now() + 95_000,
+  }));
+  const warning = page.getByRole("dialog", { name: /Windows restarts in/ });
+  await expect(warning).toBeVisible({ timeout: 10_000 });
+  await expect(warning).toContainText("open programs close without saving");
+  await expect(warning.locator(".clock")).toHaveText(/^1:[23]\d$/);
+  await page.keyboard.press("Escape");
+  await expect(warning).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("restart-warning.png"), animations: "disabled" });
+  await warning.getByRole("button", { name: "Cancel restart" }).click();
+  await expect(warning).toBeHidden();
+  const calls = await page.evaluate(() => window.__forgeTest.calls);
+  expect(calls).toContain("CancelForgeAutoContinue");
+  expect(calls).not.toContain("SetForgeAutoResume");
+});
+
+test("UX: cancelling the auto-continue countdown stops this run only; the option stays on", async ({ page }) => {
+  await openForge(page);
+  await page.evaluate(() => Object.assign(window.__forgeTest.power, {
+    phase: "interrupted", auto_resume: true, auto_resume_at_ms: Date.now() + 90_000,
+  }));
+  const countdown = page.getByRole("status").filter({ hasText: "Continuing in" }).first();
+  await expect(countdown).toBeVisible({ timeout: 10_000 });
+  await countdown.getByRole("button", { name: "Cancel" }).click();
+  await expect.poll(() => page.evaluate(() => window.__forgeTest.calls.includes("CancelForgeAutoContinue"))).toBe(true);
+  await expect(countdown).toBeHidden();
+  expect(await page.evaluate(() => window.__forgeTest.calls.includes("SetForgeAutoResume"))).toBe(false);
+  await expect(page.getByRole("switch", { name: "Continue automatically after a driver crash" }).first()).toBeChecked();
 });

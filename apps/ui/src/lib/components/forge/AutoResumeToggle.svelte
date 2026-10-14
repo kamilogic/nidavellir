@@ -25,6 +25,17 @@
     return () => clearInterval(timer);
   });
 
+  // Stops this run's countdown only; the saved choice stays on for the next runs.
+  async function cancelCountdown() {
+    error = null;
+    try {
+      const response = await serviceCall("CancelForgeAutoContinue");
+      if (response?.ok === false) throw new Error(response.error ?? "The service refused to cancel.");
+    } catch (e) {
+      error = String(e?.message ?? e);
+    }
+  }
+
   async function setEnabled(next) {
     busy = true;
     override = next;
@@ -42,12 +53,12 @@
 </script>
 
 <div class="auto-resume">
-  <label class="option-row" title="If the GPU driver crashes at a test edge, the installed service resets only the driver, or the run waits for the next Windows start, then the same run continues.">
+  <label class="option-row" title="If the GPU driver crashes at a test edge, Nidavellir restarts only the driver, or restarts Windows after a 2-minute warning, then the same run continues.">
     <span class="option-text">
       <span class="option-eyebrow">After a driver crash</span>
       <span class="option-value">Continue automatically<em>Recommended</em></span>
       {#if detail}
-        <span class="option-detail">Nidavellir waits 2 minutes (you can cancel), then continues the same run. The failed point is saved and never tested again. When this is off, the run stops and waits for you.</span>
+        <span class="option-detail">Nidavellir waits 2 minutes (you can cancel), then continues the same run. If the driver needs a fresh Windows start, it warns you for 2 minutes and restarts Windows by itself. The failed point is saved and never tested again. When this is off, the run stops and waits for you.</span>
       {/if}
     </span>
     <input
@@ -62,7 +73,7 @@
   {#if seconds != null}
     <p class="auto-resume-countdown" role="status">
       Continuing in {seconds}s
-      <button type="button" onclick={() => setEnabled(false)}>Cancel</button>
+      <button type="button" onclick={cancelCountdown}>Cancel</button>
     </p>
   {/if}
   {#if error}<p class="auto-resume-error" role="alert">{error}</p>{/if}

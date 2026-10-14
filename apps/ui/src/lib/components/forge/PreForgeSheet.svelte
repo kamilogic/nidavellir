@@ -76,7 +76,7 @@
   <ul class="expect">
     <li>Close games and GPU-heavy apps. The tests need the GPU to themselves.</li>
     <li>The screen may flicker or go black for a few seconds when a test finds the GPU's limit. That is expected.</li>
-    <li>Keep the PC on. A driver crash may restart Windows.</li>
+    <li>Keep the PC on and save your work in other programs. After a driver crash, Nidavellir may restart Windows, after a 2-minute warning you can cancel.</li>
   </ul>
 
   <div class="auto"><AutoResumeToggle {powerSweep} disabled={!serviceReady} detail /></div>

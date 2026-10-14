@@ -45,6 +45,9 @@
   const autoResumeSeconds = $derived(
     powerSweep?.auto_resume_at_ms ? Math.max(0, Math.ceil((powerSweep.auto_resume_at_ms - now) / 1000)) : null,
   );
+  const autoRestartSeconds = $derived(
+    powerSweep?.auto_restart_at_ms ? Math.max(0, Math.ceil((powerSweep.auto_restart_at_ms - now) / 1000)) : null,
+  );
   const hasRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
   const isInterrupted = $derived(powerSweep?.phase === "interrupted");
   const isPaused = $derived(powerSweep?.phase === "paused");
@@ -163,6 +166,7 @@
       ? `A driver crash stopped the test${pair}.`
       : `The run stopped before finishing${pair}.`;
     if (autoResumeSeconds != null) return `${cause} Continuing automatically in ${autoResumeSeconds}s.`;
+    if (autoRestartSeconds != null) return `${cause} Windows restarts in ${autoRestartSeconds}s; the run then continues by itself.`;
     const after = powerSweep?.auto_resume ? " The run then continues by itself." : "";
     return rebootRequired
       ? `${cause} Progress is saved; restart Windows to continue.${after}`
