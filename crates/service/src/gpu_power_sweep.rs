@@ -4128,7 +4128,11 @@ fn load_and_measure_for(
     target_mhz: Option<u32>,
     cancel: Option<&AtomicBool>,
 ) -> Measured {
-    load_and_measure_for_with_phase_hook(ms, purpose, target_mhz, cancel, None)
+    // A dwell left blocked by a driver crash ends like one that lost its device (2026-10-17).
+    gpu_work(cancel, move |cancel| {
+        load_and_measure_for_with_phase_hook(ms, purpose, target_mhz, cancel.as_deref(), None)
+    })
+    .unwrap_or_else(|| Measured::degenerate(StabilityResult::Crash, 0))
 }
 
 #[cfg(windows)]
@@ -4599,6 +4603,55 @@ fn driver_crashed_during_stock(latch_before: Option<&str>) -> bool {
 
 fn new_tdr_latch(before: Option<&str>, latch: &str) -> bool {
     before != Some(latch) && chrono::DateTime::parse_from_rfc3339(latch).is_ok()
+}
+
+/// How long Forge GPU work may take to fail by itself after Windows reported a driver crash.
+#[cfg(windows)]
+const TDR_WORK_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs Forge GPU work on its own thread. A driver crash can leave a Vulkan or DirectX call blocked
+/// for good: on 2026-10-17 an RTX 5070's stock reference never returned and held the run for 10 h,
+/// with no pause, restart or report. Once the sentinel latches a new TDR, the work gets
+/// [`TDR_WORK_GRACE`] to return; after that it is told to cancel and left behind (`None`), and the
+/// caller goes on as after a lost device. The Windows restart that follows a TDR ends it. A panic in
+/// the work reaches the caller as before; `cancel` reaches the work as its token.
+#[cfg(windows)]
+fn gpu_work<T: Send + 'static>(
+    cancel: Option<&AtomicBool>,
+    work: impl FnOnce(Option<Arc<AtomicBool>>) -> T + Send + 'static,
+) -> Option<T> {
+    gpu_work_with(crate::tdr_sentinel::reboot_required_event, TDR_WORK_GRACE, cancel, work)
+}
+
+fn gpu_work_with<T: Send + 'static>(
+    latch: impl Fn() -> Option<String>,
+    grace: std::time::Duration,
+    cancel: Option<&AtomicBool>,
+    work: impl FnOnce(Option<Arc<AtomicBool>>) -> T + Send + 'static,
+) -> Option<T> {
+    let before = latch();
+    let token = Arc::new(AtomicBool::new(false));
+    let work_token = cancel.map(|_| Arc::clone(&token));
+    let handle = std::thread::spawn(move || work(work_token));
+    let mut crashed_at: Option<std::time::Instant> = None;
+    while !handle.is_finished() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            token.store(true, Ordering::SeqCst);
+        }
+        if crashed_at.is_none() && latch().is_some_and(|now| new_tdr_latch(before.as_deref(), &now)) {
+            crashed_at = Some(std::time::Instant::now());
+        }
+        if crashed_at.is_some_and(|at| at.elapsed() >= grace) && !handle.is_finished() {
+            token.store(true, Ordering::SeqCst);
+            warn!("GPU work still blocked {} s after the driver crash; left behind until Windows restarts", grace.as_secs());
+            return None;
+        }
+    }
+    match handle.join() {
+        Ok(value) => Some(value),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 /// A driver crash during the stock reference pauses the run for one retry after a Windows restart
@@ -8844,12 +8897,16 @@ fn measure_multiclock_undervolt_forge(
         live_event(&mut prog, LogTone::Step, "Stock baseline", "Recording stock reference results for the error checks", None);
         set(progress, prog.clone());
         // wgpu panics when the device is lost (a driver crash at stock); the candidate dwells catch
-        // that, and so must the stock reference (field report 2026-10-14, RTX 5070).
+        // that, and so must the stock reference (field report 2026-10-14, RTX 5070). A test left
+        // blocked by the crash ends the same way (field report 2026-10-17).
         let stock_reference = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            capture_fsgl3_render_goldens().and_then(|goldens| {
-                validate_v27_api_matrix_stock(goldens, V27_API_MATRIX_STOCK_CHECK_MS, None)?;
-                Ok(goldens)
+            gpu_work(None, |_| {
+                capture_fsgl3_render_goldens().and_then(|goldens| {
+                    validate_v27_api_matrix_stock(goldens, V27_API_MATRIX_STOCK_CHECK_MS, None)?;
+                    Ok(goldens)
+                })
             })
+            .unwrap_or_else(|| Err("a graphics test stopped responding after a driver crash".into()))
         }))
         .unwrap_or_else(|_| Err("a graphics test stopped abruptly (lost device)".into()));
         match stock_reference {
@@ -12230,6 +12287,54 @@ mod tests {
         progress.phase = "interrupted".into();
         progress.auto_resume = false;
         assert!(!auto_resume_eligible(&progress, Some(&crash("run-a"))));
+    }
+
+    /// 2026-10-17 field report (RTX 5070): GPU work left blocked by a driver crash is left behind
+    /// only after a new TDR and its grace; anything else is waited for, and panics still propagate.
+    #[test]
+    fn gpu_work_is_left_behind_only_after_a_new_driver_crash_and_its_grace() {
+        use std::time::{Duration, Instant};
+        let latch = Arc::new(Mutex::new(None::<String>));
+        let read = { let latch = Arc::clone(&latch); move || latch.lock().unwrap().clone() };
+        let grace = Duration::from_millis(300);
+        assert_eq!(gpu_work_with(&read, grace, None, |_| 7), Some(7));
+        let cancel = AtomicBool::new(true);
+        let stopped = gpu_work_with(&read, grace, Some(&cancel), |token| {
+            let token = token.expect("a cancellable caller hands a token");
+            while !token.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            "cancelled"
+        });
+        assert_eq!(stopped, Some("cancelled"), "the caller's cancel reaches the work");
+
+        // Blocked in the driver: kept while no new TDR is latched, left behind `grace` after one.
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let set_latch = { let latch = Arc::clone(&latch); std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            *latch.lock().unwrap() = Some("2026-10-17T07:53:13.3360076Z".into());
+        }) };
+        let started = Instant::now();
+        assert_eq!(gpu_work_with(&read, grace, None, move |_| blocked.recv().is_ok()), None);
+        assert!(started.elapsed() >= Duration::from_millis(700), "waited for the latch, then the grace");
+        set_latch.join().unwrap();
+        drop(release);
+
+        // A latch from before the work, or one without an event time, is not this work's crash.
+        let slow = |_: Option<Arc<AtomicBool>>| { std::thread::sleep(Duration::from_millis(700)); "done" };
+        assert_eq!(gpu_work_with(&read, grace, None, slow), Some("done"));
+        *latch.lock().unwrap() = None;
+        let error_latch = { let latch = Arc::clone(&latch); std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            *latch.lock().unwrap() = Some("event-log-query-error:tdr".into());
+        }) };
+        assert_eq!(gpu_work_with(&read, grace, None, slow), Some("done"));
+        error_latch.join().unwrap();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gpu_work_with(&read, grace, None, |_| -> u8 { panic!("lost device") })
+        }));
+        assert!(panicked.is_err(), "a panic reaches the caller as before");
     }
 
     /// 2026-10-14 field report (RTX 5070): the first driver crash during the stock reference pauses
