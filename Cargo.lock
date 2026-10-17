@@ -2351,6 +2351,7 @@ dependencies = [
  "nidavellir-core",
  "nidavellir-gpu-nvapi",
  "nidavellir-gpu-stress",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2365,6 +2366,8 @@ name = "nidavellir-ui"
 version = "0.7.1"
 dependencies = [
  "nidavellir-core",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tauri",

@@ -1,4 +1,5 @@
 <script>
+  import { invoke } from "@tauri-apps/api/core";
   import commandMark from "../../assets/themes/nidavellir-mark.png";
   import copperPlate from "../../assets/themes/copper-plate.png";
   import AutoResumeToggle from "./AutoResumeToggle.svelte";
@@ -25,6 +26,34 @@
   let dialog = $state(null);
   let cancelButton = $state(null);
   const mode = $derived(MODES.find((entry) => entry.id === forgeMode) ?? MODES[0]);
+
+  // Error reports are asked once (user decision 2026-10-16): null until answered, then the choice
+  // lives in Settings. Outside the desktop app there is nothing to ask.
+  let windowSettings = null;
+  let reportChoice = $state(undefined);
+  let reportError = $state(null);
+
+  $effect(() => {
+    if (!open) return;
+    invoke("get_window_settings")
+      .then((settings) => {
+        windowSettings = settings;
+        reportChoice = settings?.errorReports ?? null;
+      })
+      .catch(() => (reportChoice = undefined));
+  });
+
+  async function chooseReports(enabled) {
+    // Saving a partial object would reset the window options (privacy audit 2026-10-17).
+    if (!windowSettings) return;
+    reportError = null;
+    try {
+      windowSettings = await invoke("set_window_settings", { settings: { ...windowSettings, errorReports: enabled } });
+      reportChoice = enabled;
+    } catch (error) {
+      reportError = `The choice was not saved: ${error}`;
+    }
+  }
 
   $effect(() => {
     if (!dialog) return;
@@ -81,9 +110,31 @@
 
   <div class="auto"><AutoResumeToggle {powerSweep} disabled={!serviceReady} detail /></div>
 
+  {#if reportChoice === null}
+    <div class="reports" role="group" aria-labelledby="preforge-reports-label">
+      <span class="label" id="preforge-reports-label">Error reports</span>
+      <p class="mode-note">
+        When a Forge fails or finishes, Nidavellir can send a report so problems get fixed for everyone: the GPU
+        model, the driver and Windows versions, and the run's logs. Never your name, your PC's name or your files.
+        Reports go to the developer's private GitHub. You can change this in Settings.
+      </p>
+      <div class="report-choice">
+        <button type="button" onclick={() => chooseReports(true)}>Send automatically</button>
+        <button type="button" onclick={() => chooseReports(false)}>Don't send</button>
+      </div>
+      {#if reportError}<p class="report-error" role="alert">{reportError}</p>{/if}
+    </div>
+  {/if}
+
   <div class="actions">
     <button bind:this={cancelButton} type="button" class="cancel" onclick={close}>Cancel</button>
-    <button type="button" class="plate" onclick={start}><img src={copperPlate} alt="" /><span>Start Forge</span></button>
+    <button
+      type="button"
+      class="plate"
+      onclick={start}
+      disabled={reportChoice === null}
+      title={reportChoice === null ? "Choose whether to send error reports first" : undefined}
+    ><img src={copperPlate} alt="" /><span>Start Forge</span></button>
   </div>
 </dialog>
 
@@ -262,8 +313,48 @@
     transition: filter 150ms ease, transform 100ms ease;
   }
 
-  .plate:hover { filter: brightness(1.07); }
-  .plate:active { transform: scale(0.96); }
+  .plate:hover:not(:disabled) { filter: brightness(1.07); }
+  .plate:active:not(:disabled) { transform: scale(0.96); }
+  .plate:disabled { cursor: not-allowed; filter: grayscale(0.7) brightness(0.65); }
+
+  .reports {
+    margin-top: 4px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+    padding-bottom: 14px;
+  }
+
+  .report-choice {
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+  }
+
+  .report-choice button {
+    min-height: 36px;
+    border: 1px solid rgba(197, 134, 79, 0.6);
+    border-radius: 6px;
+    padding: 0 16px;
+    background: rgba(10, 12, 13, 0.35);
+    color: #e9ba79;
+    font: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .report-choice button:last-child {
+    border-color: rgba(174, 181, 186, 0.35);
+    color: #c3c8cb;
+  }
+
+  .report-choice button:hover { background: rgba(197, 134, 79, 0.12); }
+  .report-choice button:focus-visible { outline: 2px solid #c5864f; outline-offset: 2px; }
+
+  .report-error {
+    margin: 8px 0 0;
+    color: #f0b8bc;
+    font-size: 13px;
+  }
 
   .plate img {
     position: absolute;

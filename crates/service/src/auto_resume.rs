@@ -175,9 +175,9 @@ fn act(state: &Mutex<AppState>, keys: &[String; 2]) -> Option<String> {
         attempted.extend(keys.iter().cloned());
     }
     let refuse = |reason: String| {
-        guard.power_sweep.note_auto_resume(None, LogTone::Attention, format!(
-            "Automatic continuation refused: {reason}. The run waits for you."
-        ));
+        let line = format!("Automatic continuation refused: {reason}. The run waits for you.");
+        crate::reports::queue("error", "auto_continue_refused", line.clone(), Some(guard.power_sweep.progress()));
+        guard.power_sweep.note_auto_resume(None, LogTone::Attention, line);
         None
     };
     let progress = guard.power_sweep.progress();
@@ -338,11 +338,12 @@ fn restart_when_due(state: &Mutex<AppState>, key: &str, deadline: u64, cancels: 
 /// The record comes first, so a boot that still needs a restart waits for the user instead of
 /// restarting again.
 fn issue_restart(key: &str) -> Result<(), String> {
-    save_restart_marker(&restart_marker_path(), key).map_err(|error| {
-        format!("Windows was not restarted: the restart record could not be saved ({error}). Restart Windows yourself; the run continues after it.")
-    })?;
-    restart_windows()
-        .map_err(|error| format!("Windows could not be restarted ({error}). Restart Windows yourself; the run continues after it."))
+    save_restart_marker(&restart_marker_path(), key)
+        .map_err(|error| format!("Windows was not restarted: the restart record could not be saved ({error}). Restart Windows yourself; the run continues after it."))
+        .and_then(|()| {
+            restart_windows().map_err(|error| format!("Windows could not be restarted ({error}). Restart Windows yourself; the run continues after it."))
+        })
+        .inspect_err(|line| crate::reports::queue("error", "auto_restart_failed", line.clone(), None))
 }
 
 fn restart_marker_path() -> std::path::PathBuf {

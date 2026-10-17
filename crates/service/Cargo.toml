@@ -16,6 +16,8 @@ nidavellir-gpu-stress = { path = "../gpu-stress" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+# Error reports scrub user folders, the computer name and GPU IDs (already in the lock via tooling).
+regex = "1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

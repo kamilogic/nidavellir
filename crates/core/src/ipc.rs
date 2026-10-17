@@ -55,6 +55,10 @@ pub enum IpcRequest {
     /// Windows restart warning. The run then waits for the user; the saved auto-continue choice
     /// stays as it is. No hardware work. Answers like `GetPowerSweepProgress`. Additive.
     CancelForgeAutoContinue,
+    /// The program delivered this queued error report or Forge summary (2026-10-17): the Core moves
+    /// it from `reports/pending/` to `reports/sent/`. `id` is the file name the Core wrote. No
+    /// hardware work. Additive.
+    MarkReportSent { id: String },
     /// Turn the Sentinel's GPU check while gaming on or off (2026-10-05). Off by default; driver-crash
     /// detection stays on either way. No hardware work. Answers like `GetPowerSweepProgress`. Additive.
     SetSentinelCanary { enabled: bool },

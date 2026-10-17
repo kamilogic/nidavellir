@@ -430,6 +430,16 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             crate::auto_resume::cancel(&guard);
             IpcResponse::success(ResponseData::PowerSweep(power_sweep_status(&guard)))
         }
+        IpcRequest::MarkReportSent { id } => {
+            #[cfg(windows)]
+            let marked = crate::reports::mark_sent(id);
+            #[cfg(not(windows))]
+            let marked: Result<(), String> = { let _ = id; Ok(()) };
+            match marked {
+                Ok(()) => IpcResponse::success(ResponseData::Pong),
+                Err(error) => IpcResponse::failure(error),
+            }
+        }
         IpcRequest::SetSentinelCanary { enabled } => match crate::tdr_sentinel::set_canary_enabled(*enabled) {
             Ok(()) => IpcResponse::success(ResponseData::PowerSweep(power_sweep_status(&guard))),
             Err(error) => IpcResponse::failure(error),

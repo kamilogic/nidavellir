@@ -2,7 +2,7 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { Activity, AppWindow, Check, Languages, RefreshCw, Settings, ShieldCheck } from "@lucide/svelte";
+  import { Activity, AppWindow, Check, Languages, RefreshCw, Send, Settings, ShieldCheck } from "@lucide/svelte";
   import { locale } from "../../i18n.js";
   import { liveGpuView } from "../../live-gpu-view.js";
   import { serviceCall } from "../../service.js";
@@ -61,6 +61,39 @@
   let windowSaving = $state(false);
   let windowError = $state(null);
 
+  // Error reports (user decision 2026-10-16): the Core queues them, the program sends them.
+  let reportStatus = $state(null);
+  let reportSending = $state(false);
+  let reportError = $state(null);
+  const reportNote = $derived.by(() => {
+    if (!reportStatus) return null;
+    const parts = [];
+    if (reportStatus.pending) parts.push(`${reportStatus.pending} report${reportStatus.pending === 1 ? "" : "s"} waiting.`);
+    if (reportStatus.lastSentMs) parts.push(`Last sent ${new Date(reportStatus.lastSentMs).toLocaleString()}.`);
+    return parts.join(" ") || "No report so far.";
+  });
+
+  async function refreshReports() {
+    try {
+      reportStatus = await invoke("report_status");
+    } catch {
+      reportStatus = null;
+    }
+  }
+
+  async function sendReportsNow() {
+    reportSending = true;
+    reportError = null;
+    try {
+      await invoke("send_reports_now");
+    } catch (error) {
+      reportError = `Not sent: ${error}`;
+    } finally {
+      reportSending = false;
+      refreshReports();
+    }
+  }
+
   async function saveWindowSetting(input, key) {
     if (!windowSettings || windowSaving) return;
     windowSaving = true;
@@ -94,6 +127,7 @@
       .catch(() => {
         if (active) windowUnavailable = true;
       });
+    refreshReports();
 
     return () => {
       active = false;
@@ -228,6 +262,44 @@
           <p class="setting-error" role="alert">{sentinelError}</p>
         {:else if !serviceReady}
           <p class="setting-note">Available while the Core Service is running.</p>
+        {/if}
+      </div>
+    </section>
+
+    <section class="settings-row" aria-labelledby="reports-setting-title">
+      <div class="setting-label">
+        <Send size={23} strokeWidth={1.6} />
+        <div>
+          <h2 id="reports-setting-title">Error reports</h2>
+          <p>When a Forge fails or finishes, a report helps fix problems for everyone. It holds the GPU model, the driver and Windows versions and the run's logs, never your name, your PC's name or your files.</p>
+        </div>
+      </div>
+
+      <div class="setting-control">
+        {#if windowSettings}
+          <div class="toggle-list" role="group" aria-label="Error reports">
+            <label class="toggle-row">
+              <span><strong>Send automatically</strong><small>One report at a time, to the developer's private GitHub.</small></span>
+              <input
+                type="checkbox"
+                role="switch"
+                checked={windowSettings.errorReports === true}
+                disabled={windowSaving}
+                onchange={(event) => saveWindowSetting(event.currentTarget, "errorReports")}
+              />
+            </label>
+          </div>
+          {#if reportNote}
+            <p class="setting-note">
+              {reportNote}
+              {#if reportStatus?.pending}
+                <button class="update-action" type="button" onclick={sendReportsNow} disabled={reportSending}>{reportSending ? "Sending…" : "Send now"}</button>
+              {/if}
+            </p>
+          {/if}
+          {#if reportError}<p class="setting-error" role="alert">{reportError}</p>{/if}
+        {:else}
+          <p class="setting-note">{windowUnavailable ? "Available in the installed app." : "Reading…"}</p>
         {/if}
       </div>
     </section>

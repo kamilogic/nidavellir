@@ -1609,6 +1609,18 @@ impl PowerSweepHandle {
                     record_runtime_forge_incident(&store, prog);
                 }
             }
+            // An error report or a summary, queued off this thread (reports.rs). A staircase-edge
+            // crash is the search working, not an error.
+            #[cfg(windows)]
+            if let Ok(prog) = progress.lock().map(|p| p.clone()) {
+                let pending = store.load_record().pending_forge_incident;
+                let edge_crash = pending.as_ref().is_some_and(|incident| {
+                    incident.kind == nidavellir_core::safe_loop::ForgeIncidentKind::CandidateCrash
+                        && incident.run_id.is_some()
+                        && incident.run_id == prog.run_id
+                });
+                crate::reports::after_run(&prog, result.is_err(), edge_crash || auto_resume_eligible(&prog, pending.as_ref()));
+            }
             let terminal = progress.lock().ok().map(|p| (p.phase.clone(), p.run_id.clone()));
             crate::development_validation::finish(
                 terminal.as_ref().map(|p| p.0.as_str()).unwrap_or("worker exit"),
@@ -2343,19 +2355,24 @@ pub(crate) fn record_active_forge_tdr(
     Ok(recorded || condemnation_added)
 }
 
-/// Write a rich, human-readable log of the current/last F2 forge run to a timestamped file under the
-/// data dir: run metadata, contract versions, published profiles, frontier summary, the live progress
-/// log, reconciled incidents, and only the dwells belonging to this run/resume sequence. Read-only —
-/// reads persisted evidence + the live progress; touches no hardware. Cross-platform (pure fs).
-pub fn export_forge_log(
-    prog: &PowerSweepProgress,
-) -> Result<nidavellir_core::ipc::ForgeLogExport, String> {
+/// The human-readable log of the current/last F2 forge run, plus what the export writes next to it.
+pub(crate) struct ForgeLogText {
+    pub(crate) text: String,
+    generated: String,
+    observations: Vec<nidavellir_core::f2_observation::F2Observation>,
+    run_ids: Vec<String>,
+    incident_count: usize,
+}
+
+/// Run metadata, contract versions, published profiles, frontier summary, the live progress log,
+/// reconciled incidents, and only the dwells belonging to this run/resume sequence. Read-only:
+/// reads persisted evidence and the live progress, touches no hardware, writes nothing. Shared by
+/// the export and the error reports.
+pub(crate) fn forge_log_text(prog: &PowerSweepProgress) -> Result<ForgeLogText, String> {
     use nidavellir_core::f2_observation::{
         F2ObservationStore, F2_DISCOVERY_CONTRACT_VERSION,
         F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION, F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION,
     };
-    let data_dir = nidavellir_core::safe_loop::default_data_dir();
-    std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
     let generated = nidavellir_core::f2_observation::now_rfc3339();
     let all_observations = F2ObservationStore::system().load_all();
     let mut run_ids = prog.run_sequence.clone();
@@ -2570,6 +2587,17 @@ pub fn export_forge_log(
         ));
     }
 
+    Ok(ForgeLogText { text: out, generated, observations, run_ids, incident_count: incidents.len() })
+}
+
+/// Write the Forge run log (`forge_log_text`) and its scoped raw observations to timestamped files
+/// under the data dir. Touches no hardware. Cross-platform (pure fs).
+pub fn export_forge_log(
+    prog: &PowerSweepProgress,
+) -> Result<nidavellir_core::ipc::ForgeLogExport, String> {
+    let ForgeLogText { text: out, generated, observations, run_ids, incident_count } = forge_log_text(prog)?;
+    let data_dir = nidavellir_core::safe_loop::default_data_dir();
+    std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
     let stamp: String = generated
         .chars()
         .map(|c| if c == ':' || c == '.' { '-' } else { c })
@@ -2593,12 +2621,12 @@ pub fn export_forge_log(
         bytes,
         observation_count: observations.len(),
         run_ids: run_ids.clone(),
-        incident_count: incidents.len(),
+        incident_count,
         note: format!(
             "Log salvo: {} run(s), {} dwell(s), {} incidente(s), {:.0} KB",
             run_ids.len(),
             observations.len(),
-            incidents.len(),
+            incident_count,
             bytes as f64 / 1024.0
         ),
     })

@@ -178,6 +178,20 @@ Safety is part of the product, not an afterthought.
 
 ---
 
+## Error reports
+
+Nidavellir asks once, before your first Forge, whether to send error reports. Nothing is sent until you answer, and you can change your choice in **Settings → Error reports**.
+
+When a Forge fails, finishes, or the Sentinel catches a driver crash with a profile applied, the report holds:
+
+* the GPU model, VRAM, the NVIDIA driver version and the Windows build;
+* the Forge mode, phase and result, the run's log and the Live log events;
+* the end of the Core log and the latest NVIDIA driver events from Windows.
+
+It never holds your user name, your PC's name, GPU serial IDs or any of your files: these are removed before a report is written, and a random install ID stands in for your PC. Reports go to the developer's private GitHub through a small relay whose code is in [`tools/report-relay`](tools/report-relay). Fixes ship to everyone in normal updates.
+
+---
+
 ## Installing
 
 Nidavellir is in beta, validated on one GPU so far. Try a profile in your own games before relying on it.

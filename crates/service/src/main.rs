@@ -13,6 +13,8 @@ mod ipc_server;
 mod manual_point;
 mod program_session;
 mod qualified_search;
+#[cfg(windows)]
+mod reports;
 mod safe_loop_runtime;
 mod sensor_gather;
 mod shutdown;
@@ -78,6 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(file, "{} PANIC in thread {:?}: {info}", chrono::Utc::now().to_rfc3339(), std::thread::current().name());
         }
+        #[cfg(windows)]
+        reports::note_panic(info.to_string());
         default_hook(info);
     }));
 

@@ -9,7 +9,8 @@ async function openForge(page, scenario = "ready") {
     const pending = ["recover", "missing", "ack-failure", "double-click"].includes(scenario);
     const state = {
       calls: [], offline: scenario === "offline", acknowledged: false,
-      window: { closeToTray: true, minimizeToTray: false, startWithWindows: false },
+      window: { closeToTray: true, minimizeToTray: false, startWithWindows: false, errorReports: false },
+      reports: { pending: 0, lastSentMs: null },
       applied: JSON.parse(sessionStorage.getItem("fixture-applied") || "null") || { type: "GpuApply", core: null, label: null },
       safe: { type: "SafeLoop", state: pending ? "unstable" : "idle", safe_mode: false, boot_flag_armed: false, recovery_pending_ack: pending, gpu_reboot_required: scenario === "reboot", blacklist: [], condemnations: [] },
       power: { type: "PowerSweep", phase: scenario === "missing" ? "idle" : pending ? "interrupted" : "idle", running: false, auto_resume: true, resume_available: false, points: [], log: [], start_block_reason: scenario === "safety-limit" ? "Forge safety limit reached. Soft Reset preserves known failures; Full Reset erases all GPU learning." : null },
@@ -39,6 +40,12 @@ async function openForge(page, scenario = "ready") {
           return args.handler;
         }
         if (command === "get_window_settings") return structuredClone(state.window);
+        if (command === "report_status") return structuredClone(state.reports);
+        if (command === "send_reports_now") {
+          state.calls.push("send_reports_now");
+          state.reports = { pending: 0, lastSentMs: Date.now() };
+          return 1;
+        }
         if (command === "set_window_settings") {
           state.calls.push("set_window_settings");
           state.window = { ...args.settings };
@@ -665,7 +672,7 @@ test("Program: window and startup options save through the desktop bridge", asyn
   await page.screenshot({ path: testInfo.outputPath("settings-window.png") });
   await start.click();
   await expect(start).toBeChecked();
-  expect(await page.evaluate(() => window.__forgeTest.window)).toEqual({ closeToTray: true, minimizeToTray: false, startWithWindows: true });
+  expect(await page.evaluate(() => window.__forgeTest.window)).toEqual({ closeToTray: true, minimizeToTray: false, startWithWindows: true, errorReports: false });
 });
 
 test("Sentinel: the GPU check is off by default and is switched in Settings", async ({ page }, testInfo) => {
@@ -1029,4 +1036,36 @@ test("UX: a driver crash at stock says what comes next, and promises to continue
   await expect(page.getByRole("heading", { name: "Restart Windows to continue" })).toBeVisible();
   await page.evaluate(() => Object.assign(window.__forgeTest.power, { auto_continue_pending: true }));
   await expect(note).toContainText("The run then continues by itself.");
+});
+
+test("Reports: the first Forge asks once whether to send error reports, and Start waits for the answer", async ({ page }, testInfo) => {
+  await openForge(page);
+  await page.evaluate(() => { window.__forgeTest.window.errorReports = null; });
+  await page.locator(".plate-button").click();
+  const sheet = page.getByRole("dialog", { name: "Before the Forge starts" });
+  const reports = sheet.getByRole("group", { name: "Error reports" });
+  await expect(reports).toBeVisible();
+  await expect(reports).toContainText("Never your name, your PC's name or your files.");
+  await expect(sheet.getByRole("button", { name: "Start Forge" })).toBeDisabled();
+  await page.screenshot({ path: testInfo.outputPath("pre-forge-reports.png"), animations: "disabled" });
+  await reports.getByRole("button", { name: "Send automatically" }).click();
+  await expect(reports).toBeHidden();
+  expect(await page.evaluate(() => window.__forgeTest.window.errorReports)).toBe(true);
+  await sheet.getByRole("button", { name: "Start Forge" }).click();
+  await expect.poll(() => page.evaluate(() => window.__forgeTest.calls.some((m) => m.startsWith("Start")))).toBe(true);
+});
+
+test("Reports: Settings switches automatic sending and sends waiting reports on demand", async ({ page }) => {
+  await openForge(page);
+  await page.evaluate(() => { window.__forgeTest.reports = { pending: 2, lastSentMs: null }; });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const row = page.locator("section[aria-labelledby='reports-setting-title']");
+  await expect(row).toContainText("2 reports waiting.");
+  const toggle = row.getByRole("switch");
+  await expect(toggle).not.toBeChecked();
+  await toggle.check();
+  await expect.poll(() => page.evaluate(() => window.__forgeTest.window.errorReports)).toBe(true);
+  await row.getByRole("button", { name: "Send now" }).click();
+  await expect.poll(() => page.evaluate(() => window.__forgeTest.calls.includes("send_reports_now"))).toBe(true);
+  await expect(row).toContainText("Last sent");
 });

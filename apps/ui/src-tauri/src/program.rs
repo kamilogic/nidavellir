@@ -16,6 +16,8 @@ use tauri::{App, AppHandle, Emitter, Manager, Window, WindowEvent, Wry};
 use crate::ipc_client::call_service_with_params as call;
 
 const HEARTBEAT: Duration = Duration::from_secs(5);
+/// Waiting error reports go out one per minute (reports.rs).
+const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 /// Until the Core first answers, the heartbeat retries at this pace: that first heartbeat reapplies
 /// the profile (2026-10-07: at the 5 s pace a started Core sat idle ~5 s before every reapply).
 const FIRST_CONTACT_RETRY: Duration = Duration::from_millis(250);
@@ -61,12 +63,15 @@ pub struct WindowSettings {
     close_to_tray: bool,
     minimize_to_tray: bool,
     start_with_windows: bool,
+    /// Send error reports and Forge summaries automatically: `None` until the user answers once
+    /// (user decision 2026-10-16).
+    error_reports: Option<bool>,
 }
 
 impl Default for WindowSettings {
     fn default() -> Self {
         // Closing keeps the program in the tray, so an applied profile stays active.
-        Self { close_to_tray: true, minimize_to_tray: false, start_with_windows: false }
+        Self { close_to_tray: true, minimize_to_tray: false, start_with_windows: false, error_reports: None }
     }
 }
 
@@ -203,7 +208,17 @@ fn notify(app: &AppHandle, message: String) {
 async fn heartbeat_loop(app: AppHandle) {
     ensure_core().await;
     let started = Instant::now();
+    let mut reports_checked: Option<Instant> = None;
     loop {
+        // Once a minute, with the user's consent: one waiting report, off this loop.
+        if settings(&app).error_reports == Some(true) && reports_checked.is_none_or(|at| at.elapsed() >= REPORT_INTERVAL) {
+            reports_checked = Some(Instant::now());
+            tauri::async_runtime::spawn(async {
+                if let Err(error) = crate::reports::send_pending(1).await {
+                    eprintln!("error report not sent ({error}); retrying later");
+                }
+            });
+        }
         if !EXITING.load(Ordering::SeqCst) {
             if !SESSION_READY.load(Ordering::SeqCst) {
                 // The startup screen names the profile this first heartbeat reapplies.

@@ -1,5 +1,6 @@
 mod ipc_client;
 mod program;
+mod reports;
 
 use serde_json::Value;
 
@@ -22,7 +23,9 @@ pub fn run() {
             program::set_window_settings,
             program::exit_program,
             program::window_visible,
-            program::core_session_ready
+            program::core_session_ready,
+            reports::report_status,
+            reports::send_reports_now
         ])
         .setup(|app| {
             program::setup(app)?;

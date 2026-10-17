@@ -1150,6 +1150,8 @@ fn handle_failure(
             if let Err(error) = &recovery {
                 warn!("sentinel: {kind} containment incomplete ({error})");
             }
+            #[cfg(windows)]
+            crate::reports::field_failure(kind, target_mhz, failed_mv);
             append_sentinel_log(&format!(
                 "\"event\":\"{kind}\",\"action\":\"stock\",\"target_mhz\":{target_mhz},\"failed_mv\":{failed_mv},\"suggested_mv\":{new_anchor_mv},\"recovery_ok\":{}",
                 recovery.is_ok()
@@ -1184,6 +1186,8 @@ fn handle_failure(
             if let Err(error) = &recovery {
                 warn!("sentinel: {kind} containment incomplete ({error})");
             }
+            #[cfg(windows)]
+            crate::reports::field_failure(kind, target_mhz, failed_anchor_mv);
             append_sentinel_log(&format!(
                 "\"event\":\"{kind}\",\"action\":\"stock\",\"reason\":\"ladder-exhausted\",\"recovery_ok\":{}",
                 recovery.is_ok()
