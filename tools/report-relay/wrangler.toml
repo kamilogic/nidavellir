@@ -1,0 +1,13 @@
+name = "nidavellir-reports"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+# Per-IP throttle (approximate, per Cloudflare location). No separate charge on the Free plan.
+[[ratelimits]]
+name = "LIMITER"
+namespace_id = "1001"
+
+  [ratelimits.simple]
+  limit = 6
+  period = 60
