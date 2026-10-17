@@ -212,23 +212,28 @@ fn f2_current_crash_budget_error(
 /// A run interrupted at a staircase-edge TDR may resume itself when auto-resume is on and the run
 /// was started by a build where it is on by default (`auto_resume_consent`: a run saved by an
 /// older, opt-in build waits for the user). Its search must still be open (unexpected TDRs close
-/// it) and the only pending incident, if any, is this run's own CandidateCrash. Every Resume guard
-/// (reboot latch, boot flag, Safe Mode, crash ceiling, build and driver identity) still runs
-/// inside `resume`.
+/// it) and the only pending incident, if any, is this run's own CandidateCrash.
+///
+/// A run paused by its first driver crash during the stock reference (2026-10-14) qualifies too.
+/// It has no search yet, and the sentinel holds that TDR as this run's unattributed
+/// RuntimeFailure. Every Resume guard (reboot latch, boot flag, Safe Mode, crash ceiling, build and
+/// driver identity) still runs inside `resume`.
 #[cfg(windows)]
 pub(crate) fn auto_resume_eligible(
     progress: &PowerSweepProgress,
     pending: Option<&nidavellir_core::safe_loop::ForgeIncident>,
 ) -> bool {
+    use nidavellir_core::safe_loop::ForgeIncidentKind;
+    let edge_crash = progress.phase == "interrupted"
+        && progress.discovery_search.as_ref().is_some_and(|search| search.stop_reason.is_none());
+    let stock_crash = progress.phase == "paused" && progress.stock_crash_paused && progress.stock_crashes == 1;
+    let expected = if stock_crash { ForgeIncidentKind::RuntimeFailure } else { ForgeIncidentKind::CandidateCrash };
     progress.auto_resume
         && progress.auto_resume_consent
         && !progress.running
-        && progress.phase == "interrupted"
-        && progress.discovery_search.as_ref().is_some_and(|search| search.stop_reason.is_none())
+        && (edge_crash || stock_crash)
         && pending.is_none_or(|incident| {
-            incident.kind == nidavellir_core::safe_loop::ForgeIncidentKind::CandidateCrash
-                && incident.run_id.is_some()
-                && incident.run_id == progress.run_id
+            incident.kind == expected && incident.run_id.is_some() && incident.run_id == progress.run_id
         })
 }
 
@@ -921,6 +926,13 @@ fn refresh_resume_availability_with_recovery(
 ) {
     if progress.phase == "paused" {
         refresh_resume_availability(progress, current);
+        // `resume` refuses a pending incident: Recover Forge acknowledges it first (safety audit
+        // 2026-10-14; a driver crash at stock leaves one).
+        if progress.resume_available && record.pending_forge_incident.is_some() {
+            progress.resume_available = false;
+            progress.resume_block_reason =
+                Some("a pending Forge incident needs acknowledgement first (Recover Forge)".into());
+        }
         return;
     }
 
@@ -4538,6 +4550,80 @@ fn load_and_measure_for_with_phase_hook(
         evidence_provenance,
         prehang_stall_detected,
     }
+}
+
+/// The sentinel latches a TDR within about a second of the Windows event. After a failed stock
+/// reference, wait briefly so a driver crash is told apart from an ordinary check failure. Only a
+/// new latch holding a real event time counts, not one set before the stock reference or an
+/// event-log query error (safety audit 2026-10-14).
+#[cfg(windows)]
+fn driver_crashed_during_stock(latch_before: Option<&str>) -> bool {
+    for _ in 0..10 {
+        if crate::tdr_sentinel::reboot_required_event()
+            .is_some_and(|latch| new_tdr_latch(latch_before, &latch))
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    false
+}
+
+fn new_tdr_latch(before: Option<&str>, latch: &str) -> bool {
+    before != Some(latch) && chrono::DateTime::parse_from_rfc3339(latch).is_ok()
+}
+
+/// A driver crash during the stock reference pauses the run for one retry after a Windows restart
+/// (user decision 2026-10-14): only the run's first, only at confirmed stock, only when resumable.
+fn stock_crash_pauses(previous_crashes: u32, at_stock: bool, resumable: bool) -> bool {
+    previous_crashes == 0 && at_stock && resumable
+}
+
+/// A driver crash during the stock reference is not a tuning result: nothing was applied. The
+/// first pauses the run so it repeats the stock checks after a Windows restart, by itself with
+/// auto-continue; a second ends the run.
+#[cfg(windows)]
+fn stock_crash_stop(prog: &mut PowerSweepProgress, detail: &str, reset_error: Option<&String>) {
+    let pause = stock_crash_pauses(prog.stock_crashes, reset_error.is_none(), prog.resume_compatibility.is_some());
+    let again = prog.stock_crashes > 0;
+    prog.stock_crashes = prog.stock_crashes.saturating_add(1);
+    prog.stock_crash_paused = pause;
+    prog.current_clock_mhz = None;
+    prog.current_voltage_mv = None;
+    let stock = reset_error.map_or_else(
+        || "The GPU is at stock; nothing was applied.".to_string(),
+        |error| format!("The return to stock was NOT confirmed ({error})."),
+    );
+    if pause {
+        prog.phase = "paused".into();
+        prog.resume_available = true;
+        prog.resume_block_reason = None;
+        prog.note = Some(format!(
+            "The GPU driver crashed during the stock checks, before any tuning. Restart Windows: the run then repeats the stock checks, by itself when auto-continue is on. {stock}"
+        ));
+        live_event(prog, LogTone::Fail, "Stock baseline", "The driver crashed during the stock checks · after a Windows restart the run repeats them", Some(detail.to_string()));
+    } else if again {
+        prog.phase = "incomplete".into();
+        prog.resume_available = false;
+        prog.resume_block_reason = Some("the GPU driver crashed again during the stock checks".into());
+        prog.note = Some(format!(
+            "The GPU driver crashed again during the stock checks, at factory settings, before any tuning. Update the NVIDIA driver, restart Windows and start a new Forge. {stock}"
+        ));
+        live_event(prog, LogTone::Fail, "Stock baseline", "The driver crashed again during the stock checks · update the NVIDIA driver before another Forge", Some(detail.to_string()));
+    } else {
+        prog.phase = "incomplete".into();
+        prog.resume_available = false;
+        prog.resume_block_reason = Some("the GPU driver crashed during the stock checks and the run cannot resume".into());
+        prog.note = Some(format!(
+            "The GPU driver crashed during the stock checks, before any tuning, and this run cannot resume. Restart Windows and start a new Forge. {stock}"
+        ));
+        live_event(prog, LogTone::Fail, "Stock baseline", "The driver crashed during the stock checks · restart Windows and start a new Forge", Some(detail.to_string()));
+    }
+    prog.log.push(format!(
+        "Crash do driver durante a referência stock (#{}): {detail}. {}",
+        prog.stock_crashes,
+        if pause { "Run pausada para repetir a referência após reiniciar o Windows." } else { "Run encerrada." }
+    ));
 }
 
 #[cfg(windows)]
@@ -8428,6 +8514,8 @@ fn measure_multiclock_undervolt_forge(
     // Only a run started by this build may continue by itself; a resumed run keeps what it had, so
     // a run from an older, opt-in build never resumes unattended (2026-10-12 safety audit).
     prog.auto_resume_consent = if resume_requested { previous.auto_resume_consent } else { true };
+    // A resumed run keeps its count, so a second driver crash during the stock reference ends it.
+    prog.stock_crashes = if resume_requested { previous.stock_crashes } else { 0 };
     if resumed_run_sequence.is_empty() {
         resumed_run_sequence.push(run_id.clone());
     }
@@ -8589,6 +8677,8 @@ fn measure_multiclock_undervolt_forge(
         Some(format!("up to {} windows of {} s", F2_PREHEAT_MAX_WINDOWS, F2_PREHEAT_WINDOW_MS / 1000)),
     );
     set(progress, prog.clone());
+    // A latch already set before the stock reference is not a crash of it (safety audit 2026-10-14).
+    let latch_before_stock = crate::tdr_sentinel::reboot_required_event();
     let preheat = match run_f2_stock_preheat(progress, stop.as_ref(), &mut prog) {
         Ok(preheat) => preheat,
         Err(e) => {
@@ -8617,6 +8707,11 @@ fn measure_multiclock_undervolt_forge(
                 );
                 live_event(&mut prog, LogTone::Attention, "Stock baseline", "Stopped by you during the stock measurement · the run can resume", None);
                 task_tracker.finish(&mut prog);
+                save_forge_state(&gpu_key, &prog);
+            } else if driver_crashed_during_stock(latch_before_stock.as_deref()) {
+                stock_crash_stop(&mut prog, &e, reset.as_ref().err());
+                task_tracker.finish(&mut prog);
+                // The retry happens after a Windows restart, so the pause must be on disk.
                 save_forge_state(&gpu_key, &prog);
             } else {
                 prog.phase = "incomplete".into();
@@ -8720,10 +8815,16 @@ fn measure_multiclock_undervolt_forge(
         ));
         live_event(&mut prog, LogTone::Step, "Stock baseline", "Recording stock reference results for the error checks", None);
         set(progress, prog.clone());
-        match capture_fsgl3_render_goldens().and_then(|goldens| {
-            validate_v27_api_matrix_stock(goldens, V27_API_MATRIX_STOCK_CHECK_MS, None)?;
-            Ok(goldens)
-        }) {
+        // wgpu panics when the device is lost (a driver crash at stock); the candidate dwells catch
+        // that, and so must the stock reference (field report 2026-10-14, RTX 5070).
+        let stock_reference = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture_fsgl3_render_goldens().and_then(|goldens| {
+                validate_v27_api_matrix_stock(goldens, V27_API_MATRIX_STOCK_CHECK_MS, None)?;
+                Ok(goldens)
+            })
+        }))
+        .unwrap_or_else(|_| Err("a graphics test stopped abruptly (lost device)".into()));
+        match stock_reference {
             Ok(goldens) => {
                 prog.log.push(format!(
                     "Qualificação exact-Apply v{F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION} (matriz v27): controles stock Vulkan, DX11 v3 e DX12 aprovados neste boot."
@@ -8733,13 +8834,20 @@ fn measure_multiclock_undervolt_forge(
                 Some(goldens)
             }
             Err(e) => {
-                let _ = final_reset(store, true);
+                let reset = final_reset(store, true);
                 prog.running = false;
-                prog.phase = "incomplete".into();
-                prog.note = Some(format!(
-                    "The Forge stopped before testing: a stock check of the Vulkan, DX11 or DX12 test failed ({e}). Restart Windows before another run. The GPU is at stock; nothing was applied."
-                ));
-                live_event(&mut prog, LogTone::Fail, "Stock baseline", "A stock check of the error tests failed · restart Windows before another run", Some(format!("{e}")));
+                if driver_crashed_during_stock(latch_before_stock.as_deref()) {
+                    stock_crash_stop(&mut prog, &e, reset.as_ref().err());
+                    task_tracker.finish(&mut prog);
+                    // The retry happens after a Windows restart, so the pause must be on disk.
+                    save_forge_state(&gpu_key, &prog);
+                } else {
+                    prog.phase = "incomplete".into();
+                    prog.note = Some(format!(
+                        "The Forge stopped before testing: a stock check of the Vulkan, DX11 or DX12 test failed ({e}). Restart Windows before another run. The GPU is at stock; nothing was applied."
+                    ));
+                    live_event(&mut prog, LogTone::Fail, "Stock baseline", "A stock check of the error tests failed · restart Windows before another run", Some(format!("{e}")));
+                }
                 set(progress, prog);
                 warn!("f2-forge: v27 API-matrix stock control failed: {e}");
                 return;
@@ -12094,6 +12202,60 @@ mod tests {
         progress.phase = "interrupted".into();
         progress.auto_resume = false;
         assert!(!auto_resume_eligible(&progress, Some(&crash("run-a"))));
+    }
+
+    /// 2026-10-14 field report (RTX 5070): the first driver crash during the stock reference pauses
+    /// the run for one automatic retry. Manual pauses, another run's incident and a second crash
+    /// never continue by themselves.
+    #[cfg(windows)]
+    #[test]
+    fn a_driver_crash_at_stock_pauses_for_one_retry_and_a_second_ends_the_run() {
+        use nidavellir_core::safe_loop::{ForgeIncident, ForgeIncidentKind};
+        assert!(stock_crash_pauses(0, true, true));
+        assert!(!stock_crash_pauses(1, true, true), "a second crash ends the run");
+        assert!(!stock_crash_pauses(0, false, true), "stock not confirmed");
+        assert!(!stock_crash_pauses(0, true, false), "no resumable identity");
+
+        let mut prog = PowerSweepProgress {
+            auto_resume: true,
+            auto_resume_consent: true,
+            phase: "power".into(),
+            run_id: Some("run-stock".into()),
+            resume_compatibility: Some(Default::default()),
+            ..Default::default()
+        };
+        stock_crash_stop(&mut prog, "lost device", None);
+        assert_eq!((prog.phase.as_str(), prog.stock_crash_paused, prog.stock_crashes), ("paused", true, 1));
+        let incident = |kind, run: &str| {
+            ForgeIncident::new(kind, Some(run.into()), Some("gpu".into()), None, None, "tdr outside a candidate window")
+        };
+        assert!(auto_resume_eligible(&prog, Some(&incident(ForgeIncidentKind::RuntimeFailure, "run-stock"))));
+        assert!(auto_resume_eligible(&prog, None));
+        assert!(!auto_resume_eligible(&prog, Some(&incident(ForgeIncidentKind::RuntimeFailure, "run-other"))));
+        assert!(!auto_resume_eligible(&prog, Some(&incident(ForgeIncidentKind::CandidateCrash, "run-stock"))));
+        let manual = PowerSweepProgress { stock_crash_paused: false, ..prog.clone() };
+        assert!(!auto_resume_eligible(&manual, None), "a manual pause never resumes by itself");
+
+        // The pause survives the Windows restart it asks for (safety audit 2026-10-14).
+        let saved: ForgeStateFile = serde_json::from_str(&encode_forge_state("gpu", &prog).unwrap()).unwrap();
+        assert!(auto_resume_eligible(&saved.progress, Some(&incident(ForgeIncidentKind::RuntimeFailure, "run-stock"))));
+        // Resume waits for Recover Forge to acknowledge the pending incident.
+        let mut record = nidavellir_core::safe_loop::SafeLoopRecord::default();
+        record.record_forge_incident(incident(ForgeIncidentKind::RuntimeFailure, "run-stock"));
+        let mut shown = prog.clone();
+        refresh_resume_availability_with_recovery(&mut shown, Ok(&Default::default()), &record, false, false, &[]);
+        assert!(!shown.resume_available, "a pending incident hides Resume");
+        // Only a new latch with a real event time counts as a crash of the stock reference.
+        assert!(new_tdr_latch(None, "2026-10-14T07:25:01.1234567Z"));
+        assert!(!new_tdr_latch(Some("2026-10-14T07:25:01.1234567Z"), "2026-10-14T07:25:01.1234567Z"));
+        assert!(!new_tdr_latch(None, "event-log-query-error:tdr"));
+
+        // The resumed run keeps the count, so its next crash at stock ends it.
+        let mut resumed = PowerSweepProgress { phase: "power".into(), stock_crash_paused: false, ..prog.clone() };
+        stock_crash_stop(&mut resumed, "lost device", None);
+        assert_eq!((resumed.phase.as_str(), resumed.stock_crash_paused, resumed.stock_crashes), ("incomplete", false, 2));
+        assert!(resumed.note.as_deref().is_some_and(|note| note.contains("Update the NVIDIA driver")));
+        assert!(!auto_resume_eligible(&resumed, None));
     }
 
     /// 2026-10-12 safety audit: with auto-resume on by default, a run interrupted under an older,

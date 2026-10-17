@@ -189,9 +189,15 @@ fn act(state: &Mutex<AppState>, keys: &[String; 2]) -> Option<String> {
         return refuse("the run changed during the wait".into());
     }
     if let Some(latch) = crate::tdr_sentinel::reboot_required_event() {
-        let reason = match pending.as_ref().ok_or_else(|| "the incident was already acknowledged".to_string())
-            .and_then(|incident| begin_driver_reset(incident, &latch))
-        {
+        // A crash at factory settings gets a full Windows restart; the driver-only reset is for
+        // test edges (user decision 2026-10-14).
+        let reset = if progress.stock_crash_paused {
+            Err("a driver crash during the stock checks needs a full Windows restart".to_string())
+        } else {
+            pending.as_ref().ok_or_else(|| "the incident was already acknowledged".to_string())
+                .and_then(|incident| begin_driver_reset(incident, &latch))
+        };
+        let reason = match reset {
             Ok(()) => {
                 guard.power_sweep.note_auto_resume(None, LogTone::Attention, "Restarting only the GPU driver: the service stops with the GPU at stock, restarts the NVIDIA adapter and comes back by itself; the run continues without a Windows restart.".into());
                 return None;

@@ -134,14 +134,17 @@
   const endedEarly = $derived(["incomplete", "needs_attention", "field_rejected"].includes(powerSweep?.phase));
   // Live detail only while a run can still move; a settled run shows a summary and Run details.
   const active = $derived(Boolean(powerRunning || isPaused || isInterrupted || isStopping));
+  // A pending incident goes through Recover Forge first; Resume alone would be refused.
   const canResume = $derived(
-    Boolean(!rebootRequired && !powerRunning && isPaused && powerSweep?.resume_available),
+    Boolean(!rebootRequired && !safeLoop?.recovery_pending_ack && !powerRunning && isPaused && powerSweep?.resume_available),
   );
+  // A driver crash during the stock reference pauses the run to repeat those checks after a restart.
+  const stockCrashPause = $derived(Boolean(isPaused && powerSweep?.stock_crash_paused));
   const title = $derived(
     isInterrupted
       ? (rebootRequired ? "Restart Windows to continue" : "Forge interrupted")
       : isPaused
-        ? "Forge paused"
+        ? (stockCrashPause && rebootRequired ? "Restart Windows to continue" : "Forge paused")
         : isProvisional
           ? "Forge preview ready"
           : isFinished
@@ -160,16 +163,20 @@
     return parts.join(" · ");
   });
   const interruptionNote = $derived.by(() => {
-    if (!isInterrupted) return null;
+    if (!isInterrupted && !stockCrashPause) return null;
     const pair = currentPairLabel === "—" ? "" : ` at ${currentPairLabel}`;
-    const cause = latchedLastOutcome === "TdrOrCrash"
-      ? `A driver crash stopped the test${pair}.`
-      : `The run stopped before finishing${pair}.`;
+    const cause = stockCrashPause
+      ? "The GPU driver crashed during the stock checks, before any tuning."
+      : latchedLastOutcome === "TdrOrCrash"
+        ? `A driver crash stopped the test${pair}.`
+        : `The run stopped before finishing${pair}.`;
     if (autoResumeSeconds != null) return `${cause} Continuing automatically in ${autoResumeSeconds}s.`;
     if (autoRestartSeconds != null) return `${cause} Windows restarts in ${autoRestartSeconds}s; the run then continues by itself.`;
-    const after = powerSweep?.auto_resume ? " The run then continues by itself." : "";
+    // Promised only when the Core confirms it will continue this run.
+    const after = powerSweep?.auto_continue_pending ? " The run then continues by itself." : "";
+    const next = stockCrashPause ? "restart Windows to repeat the stock checks" : "restart Windows to continue";
     return rebootRequired
-      ? `${cause} Progress is saved; restart Windows to continue.${after}`
+      ? `${cause} Progress is saved; ${next}.${after}`
       : `${cause} Progress is saved.`;
   });
   const runState = $derived(

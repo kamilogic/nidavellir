@@ -1013,3 +1013,20 @@ test("UX: cancelling the auto-continue countdown stops this run only; the option
   expect(await page.evaluate(() => window.__forgeTest.calls.includes("SetForgeAutoResume"))).toBe(false);
   await expect(page.getByRole("switch", { name: "Continue automatically after a driver crash" }).first()).toBeChecked();
 });
+
+test("UX: a driver crash at stock says what comes next, and promises to continue only when the Core will", async ({ page }) => {
+  await openForge(page);
+  await page.evaluate(() => {
+    window.__forgeTest.safe.gpu_reboot_required = true;
+    Object.assign(window.__forgeTest.power, {
+      phase: "paused", run_id: "run-stock", stock_crashes: 1, stock_crash_paused: true, auto_resume: true, auto_continue_pending: false,
+    });
+  });
+  const note = page.locator(".reboot-note");
+  await expect(note).toContainText("The GPU driver crashed during the stock checks, before any tuning.", { timeout: 10_000 });
+  await expect(note).toContainText("restart Windows to repeat the stock checks");
+  await expect(note).not.toContainText("continues by itself");
+  await expect(page.getByRole("heading", { name: "Restart Windows to continue" })).toBeVisible();
+  await page.evaluate(() => Object.assign(window.__forgeTest.power, { auto_continue_pending: true }));
+  await expect(note).toContainText("The run then continues by itself.");
+});

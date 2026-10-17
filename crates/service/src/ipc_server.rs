@@ -762,6 +762,10 @@ fn power_sweep_status(state: &AppState) -> nidavellir_core::ipc::PowerSweepProgr
     progress.development_validation_note = crate::development_validation::status_note();
     progress.sentinel_canary = crate::tdr_sentinel::canary_enabled();
     progress.sentinel_advice = crate::tdr_sentinel::analysis_advice(applied_point(&progress).as_ref());
+    #[cfg(windows)]
+    {
+        progress.auto_continue_pending = crate::auto_resume::needs_core(state);
+    }
     progress
 }
 

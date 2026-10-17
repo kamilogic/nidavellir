@@ -600,6 +600,19 @@ pub struct PowerSweepProgress {
     /// is scheduled.
     #[serde(default)]
     pub auto_restart_at_ms: Option<u64>,
+    /// The run will continue by itself (a countdown, a restart warning, or the next poll after a
+    /// restart), so the UI may promise it. Filled by `GetPowerSweepProgress` (2026-10-14).
+    #[serde(default)]
+    pub auto_continue_pending: bool,
+    /// Driver crashes during this run's stock reference (preheat or goldens), kept on Resume
+    /// (2026-10-14). The first pauses the run to repeat the stock checks after a Windows restart;
+    /// a second ends it.
+    #[serde(default)]
+    pub stock_crashes: u32,
+    /// The run is paused because the driver crashed during the stock reference: auto-continue may
+    /// resume it after a Windows restart. Cleared when any run starts.
+    #[serde(default)]
+    pub stock_crash_paused: bool,
     /// The run was started by a build where auto-resume is on by default (2026-10-12), so only such
     /// a run may continue by itself. A run saved by an older build, when the option was opt-in,
     /// decodes as `false` and waits for the user's Resume.

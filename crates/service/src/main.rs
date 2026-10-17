@@ -68,6 +68,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .with(file)
         .init();
+    // The installed service has no console: without this, a panic message (a Forge worker's
+    // included) never reaches core.log (field report 2026-10-14). It writes the file directly, not
+    // through tracing, whose writer lock the panicking thread may already hold (safety audit).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let path = nidavellir_core::safe_loop::default_data_dir().join("core.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{} PANIC in thread {:?}: {info}", chrono::Utc::now().to_rfc3339(), std::thread::current().name());
+        }
+        default_hook(info);
+    }));
 
     let args: Vec<OsString> = std::env::args_os().collect();
     if args.len() > 1 {
