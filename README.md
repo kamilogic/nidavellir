@@ -182,7 +182,7 @@ Safety is part of the product, not an afterthought.
 
 Nidavellir asks once, before your first Forge, whether to send error reports. Nothing is sent until you answer, and you can change your choice in **Settings → Error reports**.
 
-When a Forge fails, finishes, or the Sentinel catches a driver crash with a profile applied, the report holds:
+A report goes out when a Forge fails or finishes, when the GPU driver crashes during a Forge, when a Forge stops making progress, when a blue screen or a power loss cuts a Forge off, and when the Sentinel catches a driver crash with a profile applied. Nidavellir's background service sends it, so it also goes out with the app closed or after Nidavellir restarted Windows. The report holds:
 
 * the GPU model, VRAM, the NVIDIA driver version and the Windows build;
 * the Forge mode, phase and result, the run's log and the Live log events;

@@ -116,7 +116,8 @@
       <p class="mode-note">
         When a Forge fails or finishes, Nidavellir can send a report so problems get fixed for everyone: the GPU
         model, the driver and Windows versions, and the run's logs. Never your name, your PC's name or your files.
-        Reports go to the developer's private GitHub. You can change this in Settings.
+        Reports go to the developer's private GitHub, sent in the background, even with the app closed. You can
+        change this in Settings.
       </p>
       <div class="report-choice">
         <button type="button" onclick={() => chooseReports(true)}>Send automatically</button>

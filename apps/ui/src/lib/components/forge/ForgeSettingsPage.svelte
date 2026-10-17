@@ -61,7 +61,8 @@
   let windowSaving = $state(false);
   let windowError = $state(null);
 
-  // Error reports (user decision 2026-10-16): the Core queues them, the program sends them.
+  // Error reports (user decisions 2026-10-16/17): the Core writes and sends them, with the app closed
+  // too; the program mirrors the choice to it.
   let reportStatus = $state(null);
   let reportSending = $state(false);
   let reportError = $state(null);
@@ -86,6 +87,16 @@
     reportError = null;
     try {
       await invoke("send_reports_now");
+      // The Core sends in the background, a few seconds apart: follow the count for a while.
+      for (let second = 0; second < 30 && reportStatus?.pending; second++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await refreshReports();
+      }
+      if (reportStatus?.pending) {
+        reportError = windowSettings?.errorReports
+          ? "Not sent yet. Nidavellir keeps trying every minute."
+          : "Not sent yet. Try again in a minute.";
+      }
     } catch (error) {
       reportError = `Not sent: ${error}`;
     } finally {
@@ -279,7 +290,7 @@
         {#if windowSettings}
           <div class="toggle-list" role="group" aria-label="Error reports">
             <label class="toggle-row">
-              <span><strong>Send automatically</strong><small>One report at a time, to the developer's private GitHub.</small></span>
+              <span><strong>Send automatically</strong><small>In the background, even with the app closed, to the developer's private GitHub.</small></span>
               <input
                 type="checkbox"
                 role="switch"

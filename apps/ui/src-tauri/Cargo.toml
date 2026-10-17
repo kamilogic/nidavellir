@@ -25,9 +25,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 nidavellir-core = { workspace = true }
 tokio = { version = "1", features = ["net", "io-util", "time"] }
-# Error reports go to the relay with the updater's own HTTPS stack: no new crates.
-reqwest = { version = "0.13", default-features = false }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

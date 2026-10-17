@@ -44,7 +44,7 @@ async function openForge(page, scenario = "ready") {
         if (command === "send_reports_now") {
           state.calls.push("send_reports_now");
           state.reports = { pending: 0, lastSentMs: Date.now() };
-          return 1;
+          return null;
         }
         if (command === "set_window_settings") {
           state.calls.push("set_window_settings");

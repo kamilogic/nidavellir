@@ -440,6 +440,25 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                 Err(error) => IpcResponse::failure(error),
             }
         }
+        IpcRequest::SetErrorReports { enabled } => {
+            #[cfg(windows)]
+            let saved = if crate::gpu_power_sweep::load_forge_option("error_reports", false) == *enabled {
+                Ok(())
+            } else {
+                crate::gpu_power_sweep::save_forge_option("error_reports", *enabled)
+            };
+            #[cfg(not(windows))]
+            let saved: Result<(), String> = { let _ = enabled; Ok(()) };
+            match saved {
+                Ok(()) => IpcResponse::success(ResponseData::Pong),
+                Err(error) => IpcResponse::failure(error),
+            }
+        }
+        IpcRequest::SendReportsNow => {
+            #[cfg(windows)]
+            crate::reports::send_now();
+            IpcResponse::success(ResponseData::Pong)
+        }
         IpcRequest::SetSentinelCanary { enabled } => match crate::tdr_sentinel::set_canary_enabled(*enabled) {
             Ok(()) => IpcResponse::success(ResponseData::PowerSweep(power_sweep_status(&guard))),
             Err(error) => IpcResponse::failure(error),

@@ -522,6 +522,8 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     console_shutdown::install(Arc::clone(&state));
     #[cfg(windows)]
     auto_resume::spawn(Arc::clone(&state));
+    #[cfg(windows)]
+    reports::spawn_sender();
     let result = ipc_server::run_pipe_server(Arc::clone(&state), None);
     // A fatal listener error must also release workers and restore any applied tuning.
     let cleanup = shutdown::complete(state, std::time::Duration::from_secs(30));

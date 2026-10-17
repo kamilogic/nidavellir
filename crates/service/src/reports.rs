@@ -1,17 +1,30 @@
 //! Error reports and Forge summaries (user decisions 2026-10-16/17): one consent in the program,
-//! then automatic. The Core only writes reports to `reports/pending/`. The program sends each one to
-//! the relay (`tools/report-relay`) and acknowledges it, so this process never talks to the network.
+//! then automatic. The Core writes each report to `reports/pending/` and sends it to the relay
+//! (`tools/report-relay`) itself, so reports go out with the program closed, after an automatic
+//! Windows restart and while a Forge is stuck (user decision 2026-10-17). The program mirrors the
+//! consent into `forge_options.json`; nothing goes out without it, except a "Send now" click.
 //! Personal data stays out: user folders, the computer name and GPU identifiers are scrubbed, and a
 //! random install ID stands in for the machine. Hardware models, driver versions and the run's
 //! numbers stay, because the fixes need them.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use nidavellir_core::ipc::{PowerSweepPoint, PowerSweepProgress};
 use regex::Regex;
 
-/// Reports waiting for the program; the oldest go first when more arrive.
+const RELAY: &str = "https://nidavellir-reports.kamilogic.workers.dev/report";
+/// One waiting report a minute; "Send now" sends them all a few seconds apart, because the relay
+/// groups same-signature reports and its label search lags a few seconds.
+const SEND_EVERY: Duration = Duration::from_secs(60);
+const SPACING: Duration = Duration::from_secs(3);
+/// When nothing else needs the Core, it stays up this long after writing a report, and this long
+/// trying to send one.
+const WRITE_HOLD_MS: u64 = 60_000;
+const SEND_HOLD_MS: u64 = 10 * 60_000;
+/// Reports waiting to be sent; the oldest go first when more arrive.
 const MAX_PENDING: usize = 20;
 /// Sent reports kept for Settings.
 const MAX_SENT: usize = 5;
@@ -68,6 +81,7 @@ pub(crate) fn field_failure(kind: &str, target_mhz: u32, anchor_mv: u32) {
 /// Builds and writes a report on its own thread: the Forge worker and the Sentinel never wait for
 /// log reads or event queries.
 pub(crate) fn queue(kind: &'static str, class: &'static str, message: String, prog: Option<PowerSweepProgress>) {
+    WRITING_UNTIL_MS.fetch_max(now_ms() + WRITE_HOLD_MS, Ordering::SeqCst);
     std::thread::spawn(move || {
         if let Err(error) = write_pending(kind, class, &message, prog.as_ref()) {
             tracing::warn!("report {class} not queued ({error})");
@@ -116,16 +130,155 @@ fn write_pending(kind: &str, class: &str, message: &str, prog: Option<&PowerSwee
     Ok(())
 }
 
-/// The program sent this report: move it to `sent/`, keeping the last few for Settings.
+/// Set by "Send now"; the sender picks it up within a second.
+static SEND_NOW: AtomicBool = AtomicBool::new(false);
+/// A report being written keeps the Core up until then (epoch ms).
+static WRITING_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// When sending started failing (epoch ms); 0 while it works.
+static FAILING_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// The choice the program mirrors from its Settings; no answer yet means no.
+fn consented() -> bool {
+    crate::gpu_power_sweep::load_forge_option("error_reports", false)
+}
+
+/// "Send now" in Settings: every waiting report, with or without automatic sending.
+pub(crate) fn send_now() {
+    SEND_NOW.store(true, Ordering::SeqCst);
+}
+
+/// The Core stays up for reports alone while one is being written, or while one waits with consent
+/// and sending has not been failing for [`SEND_HOLD_MS`].
+pub(crate) fn needs_core() -> bool {
+    let now = now_ms();
+    if now < WRITING_UNTIL_MS.load(Ordering::SeqCst) {
+        return true;
+    }
+    let failing_since = FAILING_SINCE_MS.load(Ordering::SeqCst);
+    (failing_since == 0 || now.saturating_sub(failing_since) < SEND_HOLD_MS)
+        && consented()
+        && !waiting(&pending_dir()).is_empty()
+}
+
+/// The sender: one waiting report a minute with consent, all of them on "Send now", and one report
+/// when a running Forge stops publishing progress.
+pub(crate) fn spawn_sender() {
+    std::thread::spawn(|| {
+        // Room for the network after a boot.
+        let mut next = Instant::now() + Duration::from_secs(10);
+        let mut stalled_run = None;
+        while !crate::shutdown::is_requested() {
+            std::thread::sleep(Duration::from_secs(1));
+            let manual = SEND_NOW.swap(false, Ordering::SeqCst);
+            if !manual && Instant::now() < next {
+                continue;
+            }
+            if !manual {
+                next = Instant::now() + SEND_EVERY;
+                report_stalled_forge(&mut stalled_run);
+                if !consented() {
+                    continue;
+                }
+            }
+            match send_pending(RELAY, &pending_dir(), &sent_dir(), if manual { MAX_PENDING } else { 1 }) {
+                Ok(_) => FAILING_SINCE_MS.store(0, Ordering::SeqCst),
+                Err(error) => {
+                    if FAILING_SINCE_MS.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                        tracing::warn!("reports not sent ({error}); retrying every minute");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Once per run: a Forge that publishes nothing for 45 min is stuck where no other report sees it.
+fn report_stalled_forge(reported_run: &mut Option<String>) {
+    let Some(progress) = crate::gpu_power_sweep::stalled_forge_progress() else { return };
+    let run = progress.run_id.clone().unwrap_or_default();
+    if reported_run.as_deref() == Some(run.as_str()) {
+        return;
+    }
+    *reported_run = Some(run);
+    queue("error", "forge_stalled", "The Forge published no progress for 45 minutes while running".into(), Some(progress));
+}
+
+/// Report files in `dir`, oldest first: their names start with the creation time.
+fn waiting(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    paths.retain(|path| path.extension().is_some_and(|ext| ext == "json"));
+    paths.sort();
+    paths
+}
+
+/// Posts up to `limit` waiting reports, oldest first. Each one the relay took, or refused for good,
+/// moves to `sent`. Returns how many it took.
+fn send_pending(relay: &str, pending: &Path, sent: &Path, limit: usize) -> Result<usize, String> {
+    let reports = waiting(pending);
+    if reports.is_empty() {
+        return Ok(0);
+    }
+    let client = client()?;
+    let mut delivered = 0;
+    for (index, path) in reports.into_iter().take(limit).enumerate() {
+        if index > 0 {
+            std::thread::sleep(SPACING);
+        }
+        let body = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let status = client
+            .post(relay)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .map_err(|e| format!("relay: {e}"))?
+            .status();
+        // Too many or a relay fault: retry later. Any other refusal never changes: drop it.
+        if status.as_u16() == 429 || status.is_server_error() {
+            return Err(format!("relay answered {status}"));
+        }
+        if status.is_success() {
+            delivered += 1;
+        } else {
+            tracing::warn!("report {} refused by the relay ({status}); dropped", path.display());
+        }
+        move_to(&path, sent)?;
+    }
+    Ok(delivered)
+}
+
+/// rustls with ring as the process provider: the stack the program used before.
+fn client() -> Result<reqwest::blocking::Client, String> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    reqwest::blocking::Client::builder()
+        .user_agent(concat!("Nidavellir/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Moves a handled report to `sent`, keeping the last few for Settings.
+fn move_to(report: &Path, sent: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(sent).map_err(|e| e.to_string())?;
+    let name = report.file_name().ok_or("report without a file name")?;
+    std::fs::rename(report, sent.join(name)).map_err(|e| format!("{}: {e}", report.display()))?;
+    keep_newest(sent, MAX_SENT);
+    Ok(())
+}
+
+/// A program from before 0.8.1 sent this report itself.
 pub(crate) fn mark_sent(id: &str) -> Result<(), String> {
     if !valid_id(id) {
         return Err("invalid report id".into());
     }
-    let sent = sent_dir();
-    std::fs::create_dir_all(&sent).map_err(|e| e.to_string())?;
-    std::fs::rename(pending_dir().join(id), sent.join(id)).map_err(|e| format!("report {id}: {e}"))?;
-    keep_newest(&sent, MAX_SENT);
-    Ok(())
+    move_to(&pending_dir().join(id), &sent_dir())
 }
 
 /// Only names this module writes: `<millis>-<kind>-<class>.json`, never a path.
@@ -403,5 +556,51 @@ mod tests {
         assert!(valid_id("1791962702636-error-stock_crash.json"));
         assert!(!valid_id(r"..\..\Windows\win.ini") && !valid_id("a/b.json") && !valid_id("x.txt"));
         assert_eq!(head_and_tail("abcdef", 4), "ab\n…\nef");
+    }
+
+    #[test]
+    fn the_core_sends_the_oldest_report_first_and_keeps_only_what_the_relay_asks_to_retry() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("nidavellir-send-{}", std::process::id()));
+        let (pending, sent) = (dir.join("pending"), dir.join("sent"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&pending).unwrap();
+        for (name, body) in [("2-error-b.json", "b"), ("1-error-a.json", "a"), ("3-error-c.json", "c")] {
+            std::fs::write(pending.join(name), body).unwrap();
+        }
+        // A stand-in relay: it takes the first report, refuses the second and fails on the third.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = format!("http://{}/report", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            ["200 OK", "400 Bad Request", "503 Service Unavailable"].map(|status| {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let body = loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head.lines().find_map(|line| {
+                            let line = line.to_ascii_lowercase();
+                            line.strip_prefix("content-length:").and_then(|value| value.trim().parse::<usize>().ok())
+                        });
+                        if body.len() >= length.unwrap_or(0) {
+                            break body.to_owned();
+                        }
+                    }
+                    assert!(read > 0, "request cut short");
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                body
+            })
+        });
+        assert_eq!(send_pending(&relay, &pending, &sent, 1), Ok(1), "taken");
+        assert_eq!(send_pending(&relay, &pending, &sent, 1), Ok(0), "refused for good: dropped");
+        assert!(send_pending(&relay, &pending, &sent, 1).is_err(), "a relay fault is retried later");
+        assert_eq!(server.join().unwrap(), ["a", "b", "c"], "oldest first");
+        assert_eq!(waiting(&sent).len(), 2);
+        assert_eq!(waiting(&pending), [pending.join("3-error-c.json")], "kept for the next minute");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -106,8 +106,19 @@ pub(crate) fn exit(state: &AppState) -> Result<(), String> {
     crate::gpu_power_sweep::reset_to_stock_checked()
 }
 
-fn should_stop(idle: Duration, in_flight: usize, forge_needs_core: bool) -> bool {
-    in_flight == 0 && idle >= SESSION_TIMEOUT && !forge_needs_core
+fn should_stop(idle: Duration, in_flight: usize, core_needed: bool) -> bool {
+    in_flight == 0 && idle >= SESSION_TIMEOUT && !core_needed
+}
+
+/// A report is being written, or one waits to be sent (0.8.1: the Core sends them).
+#[cfg(windows)]
+fn reports_need_core() -> bool {
+    crate::reports::needs_core()
+}
+
+#[cfg(not(windows))]
+fn reports_need_core() -> bool {
+    false
 }
 
 /// Installed service only: console mode has nobody to start the Core again.
@@ -123,11 +134,13 @@ pub(crate) fn spawn_watchdog(state: Arc<Mutex<AppState>>) {
             if !should_stop(idle(), IN_FLIGHT.load(Ordering::SeqCst), false) {
                 continue;
             }
+            // Read before the state lock: it lists the reports folder.
+            let reports_waiting = reports_need_core();
             let Ok(guard) = state.lock() else { continue };
             // A request that arrives now waits for this lock and is already counted in flight.
-            if should_stop(idle(), IN_FLIGHT.load(Ordering::SeqCst), forge_needs_core(&guard)) {
+            if should_stop(idle(), IN_FLIGHT.load(Ordering::SeqCst), forge_needs_core(&guard) || reports_waiting) {
                 drop(guard);
-                tracing::info!("program closed and no Forge run needs the Core; stopping at stock");
+                tracing::info!("program closed and no Forge run or report needs the Core; stopping at stock");
                 crate::service_impl::request_clean_stop();
                 return;
             }

@@ -57,8 +57,14 @@ pub enum IpcRequest {
     CancelForgeAutoContinue,
     /// The program delivered this queued error report or Forge summary (2026-10-17): the Core moves
     /// it from `reports/pending/` to `reports/sent/`. `id` is the file name the Core wrote. No
-    /// hardware work. Additive.
+    /// hardware work. Additive. Since 0.8.1 the Core sends reports itself; kept for older programs.
     MarkReportSent { id: String },
+    /// The user's error-report choice from the program's Settings (0.8.1): the Core sends reports
+    /// itself, with the program closed too, only while this is on. No hardware work. Additive.
+    SetErrorReports { enabled: bool },
+    /// "Send now" in Settings (0.8.1): the Core sends every waiting report in the background, with or
+    /// without automatic sending, and answers at once. No hardware work. Additive.
+    SendReportsNow,
     /// Turn the Sentinel's GPU check while gaming on or off (2026-10-05). Off by default; driver-crash
     /// detection stays on either way. No hardware work. Answers like `GetPowerSweepProgress`. Additive.
     SetSentinelCanary { enabled: bool },

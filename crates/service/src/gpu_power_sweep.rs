@@ -1324,6 +1324,8 @@ pub(crate) static FORGE_ACTIVE: std::sync::atomic::AtomicBool =
 struct ActiveForgeStop {
     stop: Weak<AtomicBool>,
     manual_stop: Weak<AtomicBool>,
+    /// For reports written while the worker runs or hangs (2026-10-17).
+    progress: Weak<Mutex<PowerSweepProgress>>,
 }
 
 static ACTIVE_FORGE_STOP: OnceLock<Mutex<Option<ActiveForgeStop>>> = OnceLock::new();
@@ -1332,13 +1334,47 @@ fn active_forge_stop_slot() -> &'static Mutex<Option<ActiveForgeStop>> {
     ACTIVE_FORGE_STOP.get_or_init(|| Mutex::new(None))
 }
 
-fn register_active_forge_stop(stop: &Arc<AtomicBool>, manual_stop: &Arc<AtomicBool>) {
+fn register_active_forge_stop(
+    stop: &Arc<AtomicBool>,
+    manual_stop: &Arc<AtomicBool>,
+    progress: &Arc<Mutex<PowerSweepProgress>>,
+) {
     if let Ok(mut slot) = active_forge_stop_slot().lock() {
         *slot = Some(ActiveForgeStop {
             stop: Arc::downgrade(stop),
             manual_stop: Arc::downgrade(manual_stop),
+            progress: Arc::downgrade(progress),
         });
     }
+}
+
+/// The live progress of the running Forge, read without its worker.
+pub(crate) fn active_forge_progress() -> Option<PowerSweepProgress> {
+    // The slot lock is released before the progress lock is taken.
+    let progress = active_forge_stop_slot().lock().ok()?.as_ref()?.progress.upgrade()?;
+    let snapshot = progress.lock().ok()?.clone();
+    Some(snapshot)
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// When the Forge worker last published progress (epoch ms).
+static LAST_PROGRESS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A running Forge that published nothing for this long is stuck: its longest single step, the
+/// Long endurance dwell, takes 20 min.
+const FORGE_STALL_MS: u64 = 45 * 60_000;
+
+/// The running Forge's progress once its worker has published nothing for [`FORGE_STALL_MS`].
+pub(crate) fn stalled_forge_progress() -> Option<PowerSweepProgress> {
+    let quiet = epoch_ms().saturating_sub(LAST_PROGRESS_MS.load(Ordering::SeqCst));
+    if !FORGE_ACTIVE.load(Ordering::SeqCst) || quiet < FORGE_STALL_MS {
+        return None;
+    }
+    active_forge_progress().filter(|progress| progress.running)
 }
 
 fn clear_active_forge_stop() {
@@ -1545,8 +1581,9 @@ impl PowerSweepHandle {
         // v17 audit #2: coarse run-wide interlock — the TDR sentinel must never reset/blacklist/
         // re-apply while a forge run owns the GPU (the per-step boot flag has clear inter-step
         // windows a forge-induced TDR event can land in).
+        LAST_PROGRESS_MS.store(epoch_ms(), Ordering::SeqCst);
         FORGE_ACTIVE.store(true, Ordering::SeqCst);
-        register_active_forge_stop(&self.stop, &self.manual_stop);
+        register_active_forge_stop(&self.stop, &self.manual_stop, &self.progress);
         let progress = Arc::clone(&self.progress);
         let stop = Arc::clone(&self.stop);
         let manual_stop = Arc::clone(&self.manual_stop);
@@ -2076,7 +2113,25 @@ pub(crate) fn ensure_reconciled_candidate_crash_condemnation(
 
 #[cfg(windows)]
 pub fn reconcile_interrupted_forge(store: &SafeLoopStore) -> bool {
-    reconcile_interrupted_forge_from_path(store, &forge_state_path())
+    let path = forge_state_path();
+    // The run as it was when Windows or the Core went down, read before it is reconciled.
+    let running = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<ForgeStateFile>(json.trim_start_matches('\u{feff}')).ok())
+        .map(|file| file.progress)
+        .filter(|progress| progress.running);
+    let clean_shutdown = store.is_clean_shutdown_present();
+    let reconciled = reconcile_interrupted_forge_from_path(store, &path);
+    // A run cut off by a blue screen, a power loss or a Core crash is reported at this boot; a
+    // Windows shutdown is the user's choice (user decision 2026-10-17).
+    if let Some(progress) = running.filter(|_| reconciled && !clean_shutdown) {
+        let message = store.load_record().pending_forge_incident.map_or_else(
+            || "The previous Forge run ended without a terminal checkpoint".to_string(),
+            |incident| incident.message,
+        );
+        crate::reports::queue("error", "forge_lost", message, Some(progress));
+    }
+    reconciled
 }
 
 #[cfg(windows)]
@@ -2333,6 +2388,11 @@ pub(crate) fn record_active_forge_tdr(
         store
             .save_record(&record)
             .map_err(|error| format!("persist active Forge TDR incident: {error}"))?;
+    }
+    // Reported now, not when the run ends: the run can stay blocked after this (field report
+    // 2026-10-17). A crash at a test edge is the search working; the final summary has it.
+    if recorded && forge_boot_flag.is_none() {
+        crate::reports::queue("error", "forge_driver_crash", message.clone(), active_forge_progress());
     }
     let condemnation_added = match (forge_boot_flag, target_mhz, anchor_mv, gpu_key.as_deref()) {
         (Some(_), Some(target), Some(anchor), Some(gpu_key)) => {
@@ -2898,6 +2958,7 @@ fn set(progress: &Arc<Mutex<PowerSweepProgress>>, mut p: PowerSweepProgress) {
     if let Ok(mut g) = progress.lock() {
         *g = p;
     }
+    LAST_PROGRESS_MS.store(epoch_ms(), Ordering::SeqCst);
 }
 
 /// Precise per-dwell measurement under the max-power load. Returns the stability

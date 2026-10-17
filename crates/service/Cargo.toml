@@ -25,6 +25,10 @@ windows-service = "0.7"
 
 [target.'cfg(windows)'.dependencies]
 nidavellir-gpu-nvapi = { path = "../gpu-nvapi" }
+# The Core sends the error reports itself, with the program's former HTTPS stack (already in the
+# lock): rustls with ring, no new crates.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
