@@ -2337,6 +2337,7 @@ name = "nidavellir-gpu-stress"
 version = "0.8.1"
 dependencies = [
  "bytemuck",
+ "log",
  "nidavellir-core",
  "nidavellir-gpu-nvapi",
  "pollster",

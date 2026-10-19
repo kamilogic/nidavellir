@@ -447,14 +447,14 @@ pub fn vf_qualifier_workload_fingerprint(pattern: VfQualifierPattern) -> &'stati
         VfQualifierPattern::Fsgl3B => "f2q-texhop-v10-r1/fsgl3-b",
         VfQualifierPattern::V8HighFps => "f2q-texhop-v10-r1/v8-high-fps",
         VfQualifierPattern::V8Texture => {
-            "f2q-texhop-v13-r5/v13-stock-checked-field-concurrency-load-steps"
+            "f2q-texhop-v13-r6/v13-stock-checked-field-concurrency-load-steps"
         }
         VfQualifierPattern::V8Transitions => {
             "f2q-texhop-v10-r1/v8-transitions"
         }
         VfQualifierPattern::V8Memory => "f2q-texhop-v10-r1/v8-memory",
         VfQualifierPattern::Endurance => {
-            "f2q-texhop-v13-r4/endurance-stock-checked-field-concurrency"
+            "f2q-texhop-v13-r5/endurance-stock-checked-field-concurrency"
         }
         VfQualifierPattern::TransitionShock => {
             "f2q-texhop-v10-r1/transition-shock"
@@ -703,6 +703,20 @@ fn run_field_workers(
         merge_field_canary(&mut primary, secondary, phase);
         primary
     })
+}
+
+/// How many 256 MB tables the CompositeGameLoad pool gets. Past VRAM, gpu-alloc places a buffer
+/// in system memory instead of failing (any memory type suits a GPU-only buffer), so the OOM guard
+/// alone never stopped the pool: on a 12 GB RTX 5070 its 12 GB spilled into system RAM, and a
+/// gather over PCIe stretched one submit past the 2 s TDR limit at stock (field reports
+/// 2026-10-17/18). Keeps 1 GiB plus an eighth of the room free for the canary device, other
+/// programs and the driver. Without a reading, 8 tables: the VRAM-pressure load's 4 GB-card bound.
+fn composite_pool_tables(room_bytes: Option<u64>, table_bytes: u64) -> usize {
+    const MAX_TABLES: u64 = 48;
+    const UNKNOWN_ROOM_TABLES: usize = 8;
+    let Some(room) = room_bytes else { return UNKNOWN_ROOM_TABLES };
+    let reserve = (1u64 << 30) + room / 8;
+    (room.saturating_sub(reserve) / table_bytes.max(1)).min(MAX_TABLES) as usize
 }
 
 /// Marginal-silicon frame-time gate for the banded/light regimes (TextureStream, BoostEdge): true
@@ -3728,11 +3742,10 @@ impl GpuCtx {
         // Sum of per-frame drain times (µs) for the BoostEdge degradation gate.
         let mut boost_frame_us_total: u64 = 0;
 
-        // v16.1 composite: allocate a near-full VRAM-resident pool (OOM-guarded — fills whatever
-        // remains after the render's own buffers, degrading on smaller cards) + a scattered-gather
-        // pipeline. Each frame issues a gather over one pool table in the SAME submit as the heavy
-        // render, so texture hops and DRAM/controller pressure load the shared core rail together.
-        const COMPOSITE_MAX_TABLES: usize = 48; // up to ~12 GB attempted; OOM-guard keeps what fits
+        // v16.1 composite: allocate a near-full VRAM-resident pool (sized to the VRAM this process
+        // may still use, see `composite_pool_tables`) + a scattered-gather pipeline. Each frame
+        // issues a gather over one pool table in the SAME submit as the heavy render, so texture
+        // hops and DRAM/controller pressure load the shared core rail together.
         const COMPOSITE_LANES: u32 = 262_144;
         const COMPOSITE_GATHERS: u32 = 96;
         let composite_table_len = {
@@ -3740,8 +3753,14 @@ impl GpuCtx {
             (bytes / 4) as u32
         };
         let composite_pool: Vec<wgpu::Buffer> = if profile == VfWorkload::CompositeGameLoad {
+            #[cfg(windows)]
+            let room = dx11::local_vram_room(self.adapter_identity.vendor_id, self.adapter_identity.device_id);
+            #[cfg(not(windows))]
+            let room = None;
+            let tables = composite_pool_tables(room, u64::from(composite_table_len) * 4);
             let mut pool = Vec::new();
-            for _ in 0..COMPOSITE_MAX_TABLES {
+            for _ in 0..tables {
+                // Catches only memory running out everywhere; a spill into system memory passes.
                 self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
                 let table = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("composite-vram-table"),
@@ -3754,6 +3773,13 @@ impl GpuCtx {
                 }
                 pool.push(table);
             }
+            // In core.log, so a field report shows the memory pressure this run applied.
+            log::info!(
+                "composite VRAM pool: {} of {tables} tables of {} MiB (room {:?} MiB)",
+                pool.len(),
+                (u64::from(composite_table_len) * 4) >> 20,
+                room.map(|bytes| bytes >> 20)
+            );
             pool
         } else {
             Vec::new()
@@ -4517,6 +4543,21 @@ mod tests {
         }
     }
 
+    /// 2026-10-18 field report (RTX 5070, 12 GB): the composite pool stays inside the VRAM this
+    /// process may use, with room left for the canary device and the rest of the system.
+    #[test]
+    fn the_composite_pool_stays_inside_the_vram_left_to_this_process() {
+        const GIB: u64 = 1 << 30;
+        let table = 256 * 1024 * 1024;
+        // 12 GB card with about 11 GiB of room: 8.6 GiB of tables, never the old 12 GB.
+        assert_eq!(composite_pool_tables(Some(11 * GIB), table), 34);
+        assert_eq!(composite_pool_tables(Some(7 * GIB), table), 20, "8 GB card");
+        assert_eq!(composite_pool_tables(Some(3 * GIB), table), 6, "4 GB card");
+        assert_eq!(composite_pool_tables(Some(GIB), table), 0, "no room: no pool, never system memory");
+        assert_eq!(composite_pool_tables(Some(40 * GIB), table), 48, "large cards keep the old ceiling");
+        assert_eq!(composite_pool_tables(None, table), 8, "no reading: the 4 GB-card bound");
+    }
+
     #[test]
     fn workload_fingerprints_are_pattern_specific_and_capture_texture_hop_revision() {
         let texture = vf_qualifier_workload_fingerprint(VfQualifierPattern::V8Texture);
@@ -4524,11 +4565,11 @@ mod tests {
         assert_ne!(texture, endurance);
         assert_eq!(
             texture,
-            "f2q-texhop-v13-r5/v13-stock-checked-field-concurrency-load-steps"
+            "f2q-texhop-v13-r6/v13-stock-checked-field-concurrency-load-steps"
         );
         assert_eq!(
             endurance,
-            "f2q-texhop-v13-r4/endurance-stock-checked-field-concurrency"
+            "f2q-texhop-v13-r5/endurance-stock-checked-field-concurrency"
         );
         assert!(vf_qualifier_checksum_method().contains("secondary=persistent-device"));
         assert!(!vf_qualifier_checksum_method().contains("fresh-device"));

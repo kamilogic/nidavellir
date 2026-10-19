@@ -11,6 +11,8 @@ nidavellir-core = { workspace = true }
 wgpu = "0.20"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
+# The service routes these records into core.log (wgpu already uses it; no new crate).
+log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

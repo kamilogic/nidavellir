@@ -698,6 +698,35 @@ fn result(
     }
 }
 
+/// Local video memory this process can still use on the adapter with these PCI IDs: the budget
+/// Windows gives it, never more than the card's own VRAM, minus what it already uses, across every
+/// graphics API. `None` without a reading.
+pub(crate) fn local_vram_room(vendor_id: u32, device_id: u32) -> Option<u64> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::{
+        IDXGIAdapter3, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
+    };
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        for index in 0..32 {
+            let adapter = factory.EnumAdapters1(index).ok()?;
+            let desc = adapter.GetDesc1().ok()?;
+            if desc.VendorId != vendor_id || desc.DeviceId != device_id {
+                continue;
+            }
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            adapter
+                .cast::<IDXGIAdapter3>()
+                .ok()?
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+                .ok()?;
+            let budget = info.Budget.min(desc.DedicatedVideoMemory as u64);
+            return Some(budget.saturating_sub(info.CurrentUsage));
+        }
+        None
+    }
+}
+
 unsafe fn select_nvidia_adapter() -> Result<(IDXGIAdapter1, Dx11AdapterIdentity), String> {
     let factory: IDXGIFactory1 =
         CreateDXGIFactory1().map_err(|e| format!("CreateDXGIFactory1 failed: {e}"))?;
