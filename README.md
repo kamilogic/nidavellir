@@ -185,8 +185,10 @@ Nidavellir asks once, before your first Forge, whether to send error reports. No
 A report goes out when a Forge fails or finishes, when the GPU driver crashes during a Forge, when a Forge stops making progress, when a blue screen or a power loss cuts a Forge off, and when the Sentinel catches a driver crash with a profile applied. Nidavellir's background service sends it, so it also goes out with the app closed or after Nidavellir restarted Windows. The report holds:
 
 * the GPU model, VRAM, the NVIDIA driver version and the Windows build;
+* the card's chip and board IDs, VBIOS version, PCIe link and power limits (from `nvidia-smi`), the CPU, the amount of memory, the GPU scheduling and driver-timeout settings, the display modes, and which of a fixed list of GPU tools are open (Afterburner, RivaTuner, overlays and the like, by name only);
 * the Forge mode, phase and result, the run's log and the Live log events;
-* the end of the Core log and the latest NVIDIA driver events from Windows.
+* the end of the Core log, which names the test step that was running and, after a DirectX 12 crash, Windows' record of the GPU's last commands;
+* the latest NVIDIA driver resets, blue screens and unexpected restarts recorded by Windows.
 
 It never holds your user name, your PC's name, GPU serial IDs or any of your files: these are removed before a report is written, and a random install ID stands in for your PC. Reports go to the developer's private GitHub through a small relay whose code is in [`tools/report-relay`](tools/report-relay). Fixes ship to everyone in normal updates.
 

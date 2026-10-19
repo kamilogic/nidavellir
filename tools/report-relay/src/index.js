@@ -103,12 +103,15 @@ function render(report, signature) {
   ];
   const table = ["| | |", "|---|---|", ...facts.map(([name, value]) => `| ${name} | ${String(value).replaceAll("|", "\\|")} |`)].join("\n");
   let body = `${table}\n\n**${String(report.message ?? "").slice(0, 500)}**\n\n`;
+  // Most important first: a body over the issue limit loses its end, and the Forge log is the largest.
   body += fenced("Panic", report.panic);
+  body += fenced("Core log (tail)", report.core_log);
+  body += fenced("Driver events", report.driver_events);
+  body += fenced("System", report.system && Object.keys(report.system).length ? report.system : null);
+  body += fenced("nvidia-smi", report.nvidia_smi);
   body += fenced("Live log events", report.events);
   body += fenced("Forge result", report.result);
   body += fenced("Forge log", report.forge_log);
-  body += fenced("Driver events", report.driver_events);
-  body += fenced("Core log (tail)", report.core_log);
   return body.length > MAX_ISSUE_CHARS ? `${body.slice(0, MAX_ISSUE_CHARS)}\n\n…(truncated)` : body;
 }
 

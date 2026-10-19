@@ -111,6 +111,12 @@ fn write_pending(kind: &str, class: &str, message: &str, prog: Option<&PowerSwee
         "gpu_family": gpu_family(&gpu),
         "vram_mb": nvml.as_ref().and_then(|reading| reading.vram_total_mb),
         "driver": system.driver,
+        "system": system
+            .details
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::Value::String(clean(value.as_str().unwrap_or_default()))))
+            .collect::<serde_json::Map<_, _>>(),
+        "nvidia_smi": clean(&nvidia_smi()),
         "forge": prog.map(forge_facts),
         "message": clean(message),
         "panic": panic.as_deref().map(clean),
@@ -492,32 +498,123 @@ fn system32(program: &str) -> PathBuf {
     Path::new(&root).join("System32").join(program)
 }
 
-/// The latest NVIDIA driver and display events from the Windows System log.
+/// The latest GPU driver and crash events from Windows with their data, since an nvlddmkm 153 has
+/// no message text: driver resets (nvlddmkm, Display), blue screens (BugCheck), unexpected restarts
+/// (Kernel-Power 41) and the kernel reports Windows wrote for them (LiveKernelEvent 141/117).
 fn driver_events() -> String {
-    output_within(
-        std::process::Command::new(system32("wevtutil.exe"))
-            .args(["qe", "System", "/q:*[System[Provider[@Name='nvlddmkm' or @Name='Display']]]", "/c:10", "/rd:true", "/f:text"]),
-        std::time::Duration::from_secs(15),
-    )
+    // Separate queries, so a run of unexpected restarts never crowds the driver resets out.
+    let query = |log: &str, filter: &str, count: u32| {
+        event_lines(&output_within(
+            std::process::Command::new(system32("wevtutil.exe"))
+                .args(["qe", log, &format!("/q:{filter}"), &format!("/c:{count}"), "/rd:true", "/f:xml"]),
+            std::time::Duration::from_secs(15),
+        ))
+    };
+    let mut lines = query("System", "*[System[Provider[@Name='nvlddmkm' or @Name='Display']]]", 12);
+    lines.extend(query(
+        "System",
+        "*[System[Provider[@Name='Microsoft-Windows-WER-SystemErrorReporting'] or (Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=41)]]",
+        4,
+    ));
+    lines.extend(
+        query("Application", "*[System[Provider[@Name='Windows Error Reporting'] and EventID=1001]]", 15)
+            .into_iter()
+            .filter(|line| line.contains("LiveKernelEvent") || line.contains("BlueScreen"))
+            .take(6),
+    );
+    lines.join("\n")
+}
+
+static EVENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<Event[ >].*?</Event>").expect("static pattern"));
+static EVENT_PROVIDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<Provider Name=['"]([^'"]*)"#).expect("static pattern"));
+static EVENT_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<EventID[^>]*>(\d+)</EventID>").expect("static pattern"));
+static EVENT_TIME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"SystemTime=['"]([^'"]*)"#).expect("static pattern"));
+static EVENT_DATA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<Data(?: Name=['][^']*[']| Name=[^>]*)?>(.*?)</Data>").expect("static pattern"));
+
+/// `time provider id: data | data` per event of a wevtutil XML answer, newest first.
+fn event_lines(xml: &str) -> Vec<String> {
+    EVENT
+        .find_iter(xml)
+        .map(|event| {
+            let event = event.as_str();
+            let field = |pattern: &Regex| pattern.captures(event).map(|found| found[1].to_owned()).unwrap_or_default();
+            let data: Vec<String> = EVENT_DATA
+                .captures_iter(event)
+                .map(|found| unescape_xml(found[1].trim()))
+                .filter(|value| !value.is_empty())
+                .collect();
+            let line = format!("{} {} {}: {}", field(&EVENT_TIME), field(&EVENT_PROVIDER), field(&EVENT_ID), data.join(" | "));
+            line.chars().take(500).collect()
+        })
+        .collect()
+}
+
+fn unescape_xml(text: &str) -> String {
+    text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+/// The NVIDIA tool's view of the card: exact chip and board IDs, VBIOS, PCIe link, power limits and
+/// memory, which differ across the 10- to 50-series. Header line plus values; empty without it.
+fn nvidia_smi() -> String {
+    const FIELDS: &str = "name,pci.device_id,pci.sub_device_id,vbios_version,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,power.default_limit,power.min_limit,power.max_limit,clocks.max.graphics,clocks.max.memory,memory.total,memory.used,temperature.gpu";
+    let legacy = Path::new(r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe").to_path_buf();
+    [system32("nvidia-smi.exe"), legacy]
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(|path| {
+            output_within(
+                std::process::Command::new(path).args([format!("--query-gpu={FIELDS}"), "--format=csv".into()]),
+                std::time::Duration::from_secs(10),
+            )
+        })
+        .map(|output| output.trim().to_owned())
+        .find(|output| !output.is_empty())
+        .unwrap_or_default()
 }
 
 struct SystemFacts {
     windows: String,
     driver: String,
+    /// CPU, memory, GPU scheduling and timeout settings, displays and the GPU tools that are open.
+    details: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Windows build and the NVIDIA driver version ("576.80"), read without touching the GPU.
+/// Windows build, the NVIDIA driver version ("576.80") and the machine around the GPU, read without
+/// touching it. GPU tools are reported only by name from a fixed list (overlays and other tuners
+/// that can fight the Forge's curve), never the rest of what runs.
 fn system_facts() -> SystemFacts {
-    let script = "$v = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'; \"$($v.CurrentBuild).$($v.UBR) $($v.DisplayVersion)\"; (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1).DriverVersion";
+    let script = [
+        r#"$v = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'"#,
+        r#""windows=$($v.CurrentBuild).$($v.UBR) $($v.DisplayVersion)""#,
+        r#""driver=$((Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1).DriverVersion)""#,
+        r#""cpu=$((Get-CimInstance Win32_Processor | Select-Object -First 1).Name)""#,
+        r#""ram_gb=$([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB))""#,
+        r#"$g = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -ErrorAction SilentlyContinue"#,
+        r#""gpu_scheduling=$($g.HwSchMode)""#,
+        r#""tdr_settings=delay $($g.TdrDelay) ddi $($g.TdrDdiDelay) level $($g.TdrLevel)""#,
+        r#""displays=$((Get-CimInstance Win32_VideoController | ForEach-Object { '{0} {1}x{2}@{3}' -f $_.Name, $_.CurrentHorizontalResolution, $_.CurrentVerticalResolution, $_.CurrentRefreshRate }) -join ' / ')""#,
+        r#""gpu_tools=$((Get-Process -Name MSIAfterburner,RTSS,PrecisionX_x64,GPUTweakIII,'NVIDIA app','NVIDIA Overlay',Discord,steam,obs64,HWiNFO64,GPU-Z,OCCT,FurMark -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique) -join ', ')""#,
+    ]
+    .join("; ");
     let output = output_within(
         std::process::Command::new(system32("WindowsPowerShell\\v1.0\\powershell.exe"))
-            .args(["-NoProfile", "-NonInteractive", "-Command", script]),
-        std::time::Duration::from_secs(20),
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script]),
+        std::time::Duration::from_secs(25),
     );
-    let mut lines = output.lines().map(str::trim);
-    let windows = lines.next().filter(|line| !line.is_empty()).unwrap_or("unknown").to_owned();
-    let driver = lines.next().map(nvidia_driver_version).unwrap_or_else(|| "unknown".into());
-    SystemFacts { windows, driver }
+    let mut details = serde_json::Map::new();
+    let (mut windows, mut driver) = ("unknown".to_owned(), "unknown".to_owned());
+    for (key, value) in output.lines().filter_map(|line| line.trim().split_once('=')) {
+        let value = value.trim();
+        match key {
+            "windows" if !value.is_empty() => windows = value.to_owned(),
+            "driver" if !value.is_empty() => driver = nvidia_driver_version(value),
+            "windows" | "driver" => {}
+            _ => {
+                details.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+            }
+        }
+    }
+    SystemFacts { windows, driver, details }
 }
 
 /// Windows lists the NVIDIA driver as "32.0.15.7680"; its last five digits are "576.80".
@@ -556,6 +653,25 @@ mod tests {
         assert!(valid_id("1791962702636-error-stock_crash.json"));
         assert!(!valid_id(r"..\..\Windows\win.ini") && !valid_id("a/b.json") && !valid_id("x.txt"));
         assert_eq!(head_and_tail("abcdef", 4), "ab\n…\nef");
+    }
+
+    #[test]
+    fn windows_events_keep_their_data_because_a_driver_reset_has_no_message_text() {
+        let xml = concat!(
+            "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='nvlddmkm'/>",
+            "<EventID Qualifiers='49322'>153</EventID><TimeCreated SystemTime='2026-10-19T10:19:22.3270000Z'/>",
+            "<Computer>DESKTOP-ABC12</Computer></System><EventData><Data>\\Device\\Video3</Data>",
+            "<Data>Error occurred on GPUID: 100</Data><Data></Data></EventData></Event>",
+            "<Event xmlns='x'><System><Provider Name='Windows Error Reporting'/><EventID>1001</EventID>",
+            "<TimeCreated SystemTime='2026-10-19T10:19:40.0000000Z'/></System><EventData>",
+            "<Data>0</Data><Data>LiveKernelEvent</Data><Data>141</Data><Data>a &amp; b</Data></EventData></Event>",
+        );
+        let lines = event_lines(xml);
+        assert_eq!(lines, [
+            r"2026-10-19T10:19:22.3270000Z nvlddmkm 153: \Device\Video3 | Error occurred on GPUID: 100",
+            "2026-10-19T10:19:40.0000000Z Windows Error Reporting 1001: 0 | LiveKernelEvent | 141 | a & b",
+        ]);
+        assert!(lines.iter().all(|line| !line.contains("DESKTOP")), "the computer name stays out");
     }
 
     #[test]
