@@ -4052,6 +4052,7 @@ pub(crate) fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
         label: &str,
         workload: VfWorkload,
     ) -> Result<(u32, u32), String> {
+        info!("stock reference: {label}");
         let ctx = nidavellir_gpu_stress::GpuCtx::new_for_backend(backend)
             .map_err(|e| format!("{label}: GpuCtx init failed: {e}"))?;
         ctx.capture_one_golden(workload, V8_GOLDEN_SAMPLE_MS)
@@ -4103,6 +4104,7 @@ pub(crate) fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
 
     let vulkan = capture_set(WgpuBackend::Vulkan, "Vulkan")?;
     let dx12 = capture_set(WgpuBackend::Dx12, "DX12")?;
+    info!("stock reference: DX11 v3 golden");
     let dx11 = nidavellir_gpu_stress::Dx11Qualifier::new()
         .map_err(|e| format!("DX11 v3 golden init failed: {e}"))?
         .capture_golden(V8_GOLDEN_SAMPLE_MS)
@@ -4137,6 +4139,7 @@ pub(crate) fn validate_v27_api_matrix_stock(
         if let Some(callback) = on_lane_start.as_deref_mut() {
             callback(index, lane);
         }
+        info!("stock control lane {}: {api}, {duration_ms} ms", index + 1);
         let ctx = nidavellir_gpu_stress::GpuCtx::new_for_backend(backend)
             .map_err(|e| format!("{api} stock control init failed: {e}"))?;
         let phase_state = AtomicU8::new(VfQualifierPhase::NONE_CODE);
@@ -4166,9 +4169,20 @@ pub(crate) fn validate_v27_api_matrix_stock(
     if let Some(callback) = on_lane_start.as_deref_mut() {
         callback(2, "dx11_v3");
     }
+    info!("stock control lane 3: DX11 v3, {duration_ms} ms");
     let dx11 = nidavellir_gpu_stress::Dx11Qualifier::new()
         .map_err(|e| format!("DX11 v3 stock control init failed: {e}"))?
         .run_with_golden(duration_ms, goldens.dx11, None);
+    info!(
+        "stock control lane 3 done: {:?}, {} frames, {} checks ({} compute), {} ms{}{}",
+        dx11.result,
+        dx11.frames,
+        dx11.checks,
+        dx11.compute_checks,
+        dx11.elapsed_ms,
+        if dx11.timed_out { ", GPU completion timed out" } else { "" },
+        dx11.inconclusive_reason.as_deref().map(|reason| format!(" ({reason})")).unwrap_or_default()
+    );
     if dx11.inconclusive_reason.is_some()
         || dx11.result != StabilityResult::Stable
         || dx11.checks == 0
@@ -4713,6 +4727,30 @@ fn gpu_work_with<T: Send + 'static>(
         Ok(value) => Some(value),
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+/// One core.log line per run: the curve the search walks differs by GPU family (point count,
+/// voltage and clock steps), while the game margin assumes 6.25 mV and 15 MHz bins.
+fn vf_curve_summary(curve: &[(usize, u32, u32)], boost_mhz: u32) -> String {
+    fn sorted(values: impl Iterator<Item = u32>) -> Vec<u32> {
+        let mut values: Vec<u32> = values.collect();
+        values.sort_unstable();
+        values.dedup();
+        values
+    }
+    let smallest_step = |values: &[u32]| values.windows(2).map(|pair| pair[1] - pair[0]).min();
+    let volts = sorted(curve.iter().map(|&(_, mv, _)| mv));
+    let clocks = sorted(curve.iter().map(|&(_, _, mhz)| mhz));
+    format!(
+        "VF curve: {} points, {}-{} mV (smallest step {} mV), {}-{} MHz (smallest step {} MHz), stock boost {boost_mhz} MHz",
+        curve.len(),
+        volts.first().unwrap_or(&0),
+        volts.last().unwrap_or(&0),
+        smallest_step(&volts).unwrap_or(0),
+        clocks.first().unwrap_or(&0),
+        clocks.last().unwrap_or(&0),
+        smallest_step(&clocks).unwrap_or(0)
+    )
 }
 
 /// A driver crash during the stock reference pauses the run for one retry after a Windows restart
@@ -8937,6 +8975,7 @@ fn measure_multiclock_undervolt_forge(
         set(progress, prog);
         return;
     };
+    info!("{}", vf_curve_summary(&f2_inputs.sane_base_curve, seed.stock_boost_max_mhz));
 
     let qualification_needs_goldens =
         mode_policy.qualification_passes > 0 || mode_policy.final_gate_passes > 0;
@@ -12348,6 +12387,20 @@ mod tests {
         progress.phase = "interrupted".into();
         progress.auto_resume = false;
         assert!(!auto_resume_eligible(&progress, Some(&crash("run-a"))));
+    }
+
+    /// Every GPU family logs the curve the search walks: points, voltage and clock steps.
+    #[test]
+    fn the_vf_curve_summary_shows_the_steps_each_gpu_family_uses() {
+        let curve = [(0, 700, 1500), (1, 706, 1515), (2, 712, 1530), (3, 718, 1530), (4, 725, 1545)];
+        assert_eq!(
+            vf_curve_summary(&curve, 1890),
+            "VF curve: 5 points, 700-725 mV (smallest step 6 mV), 1500-1545 MHz (smallest step 15 MHz), stock boost 1890 MHz"
+        );
+        assert_eq!(
+            vf_curve_summary(&[], 0),
+            "VF curve: 0 points, 0-0 mV (smallest step 0 mV), 0-0 MHz (smallest step 0 MHz), stock boost 0 MHz"
+        );
     }
 
     /// 2026-10-17 field report (RTX 5070): GPU work left blocked by a driver crash is left behind

@@ -18,6 +18,8 @@ use nidavellir_core::gpu_sweep::StabilityResult;
 use wgpu::util::DeviceExt;
 
 #[cfg(windows)]
+mod dred;
+#[cfg(windows)]
 mod dx11;
 #[cfg(windows)]
 pub use dx11::Dx11Qualifier;
@@ -704,6 +706,10 @@ fn run_field_workers(
         primary
     })
 }
+
+/// A segment whose frames average this long leaves little room under Windows' 2 s driver timeout
+/// (TdrDelay); entry-level cards (GTX 1050, GTX 1650) are the ones to approach it.
+const SLOW_FRAME_WARN_MS: u64 = 500;
 
 /// How many 256 MB tables a VRAM pool (CompositeGameLoad, VramPressure) gets. Past VRAM, gpu-alloc places a buffer
 /// in system memory instead of failing (any memory type suits a GPU-only buffer), so the OOM guard
@@ -1642,6 +1648,32 @@ pub struct GpuCtx {
     /// Largest single storage buffer we may allocate (bytes).
     pub max_buffer_bytes: u64,
     crashed: Arc<AtomicBool>,
+    /// The D3D12 device under a DX12 context, to report why it was removed (dred.rs).
+    #[cfg(windows)]
+    dx12_device: Option<windows::Win32::Graphics::Direct3D12::ID3D12Device>,
+}
+
+/// A removed DX12 device logs its reason and last commands when its context goes away, also while
+/// a device-lost panic unwinds. Contexts on one wgpu adapter share the D3D12 device (the primary
+/// and the canary), so an identical report is logged once.
+#[cfg(windows)]
+impl Drop for GpuCtx {
+    fn drop(&mut self) {
+        // This runs during unwinding: a second panic escaping here would abort the Core before its
+        // return to stock (safety audit 2026-10-19).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+            let Some(device) = &self.dx12_device else { return };
+            let Some(report) = dred::removal_report(device) else { return };
+            if let Ok(mut last) = LAST.lock() {
+                if *last == report {
+                    return;
+                }
+                last.clone_from(&report);
+            }
+            log::error!("{report}");
+        }));
+    }
 }
 
 /// Implicit Vulkan layers (OBS capture hook, RivaTuner, Steam overlay and Fossilize) load into every
@@ -1668,6 +1700,10 @@ impl GpuCtx {
 
     fn new_with_backends(backends: wgpu::Backends) -> Result<Self, String> {
         keep_implicit_vulkan_layers_out();
+        #[cfg(windows)]
+        if backends.contains(wgpu::Backends::DX12) {
+            dred::enable();
+        }
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
             ..Default::default()
@@ -1710,9 +1746,43 @@ impl GpuCtx {
         {
             let crashed = crashed.clone();
             device.on_uncaptured_error(Box::new(move |e| {
-                eprintln!("wgpu device error: {e}");
+                // In core.log (the service has no console), so reports carry it.
+                log::error!("wgpu device error: {e}");
                 crashed.store(true, Ordering::SeqCst);
             }));
+        }
+        #[cfg(windows)]
+        let dx12_device = if adapter_identity.backend == "dx12" {
+            // SAFETY: the handle is only cloned (AddRef), never destroyed by us.
+            unsafe {
+                device.as_hal::<wgpu::hal::api::Dx12, _, _>(|hal| {
+                    use windows::core::Interface;
+                    let raw = hal?.raw_device().as_mut_ptr().cast::<std::ffi::c_void>();
+                    windows::Win32::Graphics::Direct3D12::ID3D12Device::from_raw_borrowed(&raw).cloned()
+                })
+            }
+            .flatten()
+        } else {
+            None
+        };
+        // Once per backend per process: what each graphics API reports for this GPU.
+        static LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        if LOGGED.lock().is_ok_and(|mut logged| {
+            let fresh = !logged.contains(&adapter_identity.backend);
+            if fresh {
+                logged.push(adapter_identity.backend.clone());
+            }
+            fresh
+        }) {
+            log::info!(
+                "GPU context: {} via {} (device {:#06x}, driver {} {}), max storage buffer {} MiB",
+                adapter_identity.name,
+                adapter_identity.backend,
+                adapter_identity.device_id,
+                adapter_identity.driver,
+                adapter_identity.driver_info,
+                max_buffer_bytes >> 20
+            );
         }
         Ok(Self {
             adapter,
@@ -1722,6 +1792,8 @@ impl GpuCtx {
             adapter_identity,
             max_buffer_bytes,
             crashed,
+            #[cfg(windows)]
+            dx12_device,
         })
     }
 
@@ -3132,6 +3204,8 @@ impl GpuCtx {
         let mut frames = 0u64;
         let mut reports = Vec::new();
         let plan = vf_qualifier_plan(target_ms, pattern);
+        let segments = plan.len();
+        let backend = self.adapter_identity.backend.clone();
 
         for (segment_index, segment) in plan.into_iter().enumerate() {
             if cancel.is_some_and(|token| token.load(Ordering::SeqCst)) {
@@ -3140,6 +3214,14 @@ impl GpuCtx {
             phase_state.store(segment.phase.code(), Ordering::SeqCst);
             segment_hook(segment_index, segment.phase, segment.duration_ms);
             let workload = segment.workload;
+            // core.log names the segment a hang or crash happened in (field report 2026-10-19).
+            log::info!(
+                "{backend} segment {}/{segments}: {} ({workload:?}), {} ms",
+                segment_index + 1,
+                segment.phase.label(),
+                segment.duration_ms
+            );
+            let segment_started = std::time::Instant::now();
             let result = match workload {
                 VfWorkload::ComputeBurst => {
                     let stage = self.run_alu_with_cancel(
@@ -3210,6 +3292,23 @@ impl GpuCtx {
                     cancel,
                 ),
             };
+            let elapsed_ms = segment_started.elapsed().as_millis() as u64;
+            let frame_ms = (result.frames > 0).then(|| elapsed_ms / result.frames);
+            log::info!(
+                "{backend} segment {} done: {:?}{}, {} frames in {elapsed_ms} ms{}",
+                segment_index + 1,
+                result.result,
+                result.inconclusive_reason.as_deref().map(|reason| format!(" ({reason})")).unwrap_or_default(),
+                result.frames,
+                frame_ms.map(|ms| format!(" ({ms} ms/frame)")).unwrap_or_default()
+            );
+            if frame_ms.is_some_and(|ms| ms >= SLOW_FRAME_WARN_MS) {
+                log::warn!(
+                    "{backend} segment {}: frames average {} ms, near the 2 s Windows driver timeout on this GPU",
+                    segment_index + 1,
+                    frame_ms.unwrap_or_default()
+                );
+            }
             frames = frames.saturating_add(result.frames);
             let inconclusive_reason = result.inconclusive_reason.clone();
             reports.extend(result.phase_reports);
@@ -3370,6 +3469,7 @@ impl GpuCtx {
         }
         let start = std::time::Instant::now();
         let mut frames: u64 = 0;
+        let frame_label = format!("{profile:?} frame");
         const DIM: u32 = 1536; // 1536*4 = 6144 B/row (256-aligned for copy)
         // Overdraw factor. 8 full-screen triangles at 1536² already swamp the GPU's
         // parallel fragment capacity (18.9M frags ≫ thousands of ALUs) so it stays
@@ -3894,7 +3994,9 @@ impl GpuCtx {
                 let band_h = DIM / STREAM_BANDS;
                 for band in 0..STREAM_BANDS {
                     let band_start = std::time::Instant::now();
-                    let mut benc = self.device.create_command_encoder(&Default::default());
+                    let mut benc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some(frame_label.as_str()),
+                    });
                     {
                         let mut rp = benc.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("render-stream-band"),
@@ -3938,7 +4040,10 @@ impl GpuCtx {
                     break;
                 }
             }
-            let mut enc = self.device.create_command_encoder(&Default::default());
+            // Named, so a DX12 crash record (dred.rs) says which workload's frame the GPU stopped in.
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some(frame_label.as_str()),
+            });
             let rotating_order = rotating_game.then(|| mixed_game_draw_order(frames));
             if let (Some((first_pipe, first_bind, second_pipe, second_bind)), Some(order)) =
                 (&rotating_resources, rotating_order)

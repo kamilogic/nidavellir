@@ -87,6 +87,19 @@ pub struct Dx11Qualifier {
     adapter: Dx11AdapterIdentity,
 }
 
+/// D3D11 has no crash record like DX12's DRED: a removed device logs Windows' reason when the
+/// qualifier goes away, also while a panic unwinds (never a second panic out of here).
+impl Drop for Dx11Qualifier {
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Err(error) = unsafe { self.device.GetDeviceRemovedReason() } {
+                let code = error.code().0 as u32;
+                log::error!("DX11 device removed: {} ({code:#010x})", crate::dred::reason_name(code));
+            }
+        }));
+    }
+}
+
 impl Dx11Qualifier {
     pub fn new() -> Result<Self, String> {
         unsafe {
