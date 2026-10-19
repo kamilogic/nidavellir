@@ -150,7 +150,9 @@ pub fn f2_clock_held(clock: u32, target: u32) -> bool {
 /// short to evaluate are skipped, not refused.
 /// v33 (2026-09-28): screening residency counts the one hot bin below the target as held.
 /// v34 (2026-10-01): the screening runs Texture Hop r5 (load steps), 34.5 s.
-pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 34;
+/// v35 (2026-10-18): Texture Hop r6: the CompositeGameLoad VRAM pool stays inside this process's
+/// VRAM budget; before, part of it spilled into system memory (user decision: re-forge).
+pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 35;
 
 /// v29 (2026-08-11): three consecutive, provenance-identical native DX11 v2 exact-Apply dwells that
 /// finish reset-clean and off-cap with at least 95% of clocks below the requested target are a
@@ -174,7 +176,9 @@ pub const F2_FRONTIER_QUALIFICATION_CONTRACT_VERSION: u32 = 34;
 /// exact label is no longer proven when hot; a two-bin drop still fails.
 /// v39 (2026-10-01): Texture and DX12 lanes run Texture Hop r5 with ~30 idle→slam load steps each
 /// (138 s); a pass that held its target only through the hot bin anchors the game margin higher.
-pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 39;
+/// v40 (2026-10-18): Texture Hop r6 and Endurance r5, with the composite VRAM pool inside the
+/// VRAM budget (user decision: every earlier profile is re-forged).
+pub const F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION: u32 = 40;
 
 /// Backward-compatible alias for callers that expose one latest profile-publication contract.
 /// Frontier qualification has an independent version because exact-Apply policy changes must not

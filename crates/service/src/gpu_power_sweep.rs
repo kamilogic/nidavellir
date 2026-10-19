@@ -1862,7 +1862,7 @@ fn decode_forge_state(json: &str, gpu_key: &str) -> ForgeStateLoad {
             prog.phase = "provisional".into();
         }
         prog.note = Some(format!(
-            "Perfis F2 restaurados não possuem qualificação exact-Apply v{F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION}; execute Forge novamente."
+            "These profiles were forged with an older version of the Forge tests (they need exact-Apply v{F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION}). Run a Standard Forge to qualify them again before applying."
         ));
     }
     if prog.running {
