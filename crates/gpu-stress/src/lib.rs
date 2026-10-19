@@ -447,12 +447,12 @@ pub fn vf_qualifier_workload_fingerprint(pattern: VfQualifierPattern) -> &'stati
         VfQualifierPattern::Fsgl3B => "f2q-texhop-v10-r1/fsgl3-b",
         VfQualifierPattern::V8HighFps => "f2q-texhop-v10-r1/v8-high-fps",
         VfQualifierPattern::V8Texture => {
-            "f2q-texhop-v13-r6/v13-stock-checked-field-concurrency-load-steps"
+            "f2q-texhop-v13-r7/v13-stock-checked-field-concurrency-load-steps"
         }
         VfQualifierPattern::V8Transitions => {
             "f2q-texhop-v10-r1/v8-transitions"
         }
-        VfQualifierPattern::V8Memory => "f2q-texhop-v10-r1/v8-memory",
+        VfQualifierPattern::V8Memory => "f2q-texhop-v10-r2/v8-memory",
         VfQualifierPattern::Endurance => {
             "f2q-texhop-v13-r5/endurance-stock-checked-field-concurrency"
         }
@@ -705,13 +705,13 @@ fn run_field_workers(
     })
 }
 
-/// How many 256 MB tables the CompositeGameLoad pool gets. Past VRAM, gpu-alloc places a buffer
+/// How many 256 MB tables a VRAM pool (CompositeGameLoad, VramPressure) gets. Past VRAM, gpu-alloc places a buffer
 /// in system memory instead of failing (any memory type suits a GPU-only buffer), so the OOM guard
 /// alone never stopped the pool: on a 12 GB RTX 5070 its 12 GB spilled into system RAM, and a
 /// gather over PCIe stretched one submit past the 2 s TDR limit at stock (field reports
 /// 2026-10-17/18). Keeps 1 GiB plus an eighth of the room free for the canary device, other
 /// programs and the driver. Without a reading, 8 tables: the VRAM-pressure load's 4 GB-card bound.
-fn composite_pool_tables(room_bytes: Option<u64>, table_bytes: u64) -> usize {
+fn vram_pool_tables(room_bytes: Option<u64>, table_bytes: u64) -> usize {
     const MAX_TABLES: u64 = 48;
     const UNKNOWN_ROOM_TABLES: usize = 8;
     let Some(room) = room_bytes else { return UNKNOWN_ROOM_TABLES };
@@ -2071,9 +2071,17 @@ impl GpuCtx {
         let start = std::time::Instant::now();
         let table_bytes = (256u64 * 1024 * 1024).min(self.max_buffer_bytes).max(64 * 1024 * 1024);
         let table_len = (table_bytes / 4) as u32;
+        // Inside the VRAM this process may use, like the composite pool: on a 2–4 GB card
+        // (GTX 1050/1650, RTX 3050 4 GB) eight tables would spill into system memory. The first
+        // table always stays.
+        #[cfg(windows)]
+        let room = dx11::local_vram_room(self.adapter_identity.vendor_id, self.adapter_identity.device_id);
+        #[cfg(not(windows))]
+        let room = None;
+        let wanted = vram_pool_tables(room, table_bytes).clamp(1, MAX_TABLES);
 
         let mut tables: Vec<wgpu::Buffer> = Vec::new();
-        for _ in 0..MAX_TABLES {
+        for _ in 0..wanted {
             // OOM-guarded: a failed allocation pops as an error (not a device loss) and we keep
             // the tables already resident.
             self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
@@ -2088,6 +2096,12 @@ impl GpuCtx {
             }
             tables.push(table);
         }
+        log::info!(
+            "VRAM pressure: {} of {wanted} tables of {} MiB (room {:?} MiB)",
+            tables.len(),
+            table_bytes >> 20,
+            room.map(|bytes| bytes >> 20)
+        );
         if tables.is_empty() {
             // Allocation failed outright — inconclusive hardware state, not proof of stability.
             return StageReport {
@@ -3743,7 +3757,7 @@ impl GpuCtx {
         let mut boost_frame_us_total: u64 = 0;
 
         // v16.1 composite: allocate a near-full VRAM-resident pool (sized to the VRAM this process
-        // may still use, see `composite_pool_tables`) + a scattered-gather pipeline. Each frame
+        // may still use, see `vram_pool_tables`) + a scattered-gather pipeline. Each frame
         // issues a gather over one pool table in the SAME submit as the heavy render, so texture
         // hops and DRAM/controller pressure load the shared core rail together.
         const COMPOSITE_LANES: u32 = 262_144;
@@ -3757,7 +3771,7 @@ impl GpuCtx {
             let room = dx11::local_vram_room(self.adapter_identity.vendor_id, self.adapter_identity.device_id);
             #[cfg(not(windows))]
             let room = None;
-            let tables = composite_pool_tables(room, u64::from(composite_table_len) * 4);
+            let tables = vram_pool_tables(room, u64::from(composite_table_len) * 4);
             let mut pool = Vec::new();
             for _ in 0..tables {
                 // Catches only memory running out everywhere; a spill into system memory passes.
@@ -4550,12 +4564,12 @@ mod tests {
         const GIB: u64 = 1 << 30;
         let table = 256 * 1024 * 1024;
         // 12 GB card with about 11 GiB of room: 8.6 GiB of tables, never the old 12 GB.
-        assert_eq!(composite_pool_tables(Some(11 * GIB), table), 34);
-        assert_eq!(composite_pool_tables(Some(7 * GIB), table), 20, "8 GB card");
-        assert_eq!(composite_pool_tables(Some(3 * GIB), table), 6, "4 GB card");
-        assert_eq!(composite_pool_tables(Some(GIB), table), 0, "no room: no pool, never system memory");
-        assert_eq!(composite_pool_tables(Some(40 * GIB), table), 48, "large cards keep the old ceiling");
-        assert_eq!(composite_pool_tables(None, table), 8, "no reading: the 4 GB-card bound");
+        assert_eq!(vram_pool_tables(Some(11 * GIB), table), 34);
+        assert_eq!(vram_pool_tables(Some(7 * GIB), table), 20, "8 GB card");
+        assert_eq!(vram_pool_tables(Some(3 * GIB), table), 6, "4 GB card");
+        assert_eq!(vram_pool_tables(Some(GIB), table), 0, "no room: no pool, never system memory");
+        assert_eq!(vram_pool_tables(Some(40 * GIB), table), 48, "large cards keep the old ceiling");
+        assert_eq!(vram_pool_tables(None, table), 8, "no reading: the 4 GB-card bound");
     }
 
     #[test]
@@ -4565,7 +4579,7 @@ mod tests {
         assert_ne!(texture, endurance);
         assert_eq!(
             texture,
-            "f2q-texhop-v13-r6/v13-stock-checked-field-concurrency-load-steps"
+            "f2q-texhop-v13-r7/v13-stock-checked-field-concurrency-load-steps"
         );
         assert_eq!(
             endurance,
