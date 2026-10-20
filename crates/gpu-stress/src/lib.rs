@@ -1653,26 +1653,33 @@ pub struct GpuCtx {
     dx12_device: Option<windows::Win32::Graphics::Direct3D12::ID3D12Device>,
 }
 
-/// A removed DX12 device logs its reason and last commands when its context goes away, also while
-/// a device-lost panic unwinds. Contexts on one wgpu adapter share the D3D12 device (the primary
-/// and the canary), so an identical report is logged once.
+/// A removed DX12 device logs its reason and last commands: at wgpu's first error on it, so the
+/// crash report written right then carries them (field report 2026-10-20), and when its context
+/// goes away, also while a device-lost panic unwinds. Contexts on one wgpu adapter share the D3D12
+/// device (the primary and the canary), so an identical report is logged once.
+#[cfg(windows)]
+fn log_dx12_removal(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
+    // This runs during unwinding: a second panic escaping here would abort the Core before its
+    // return to stock (safety audit 2026-10-19).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        let Some(report) = dred::removal_report(device) else { return };
+        if let Ok(mut last) = LAST.lock() {
+            if *last == report {
+                return;
+            }
+            last.clone_from(&report);
+        }
+        log::error!("{report}");
+    }));
+}
+
 #[cfg(windows)]
 impl Drop for GpuCtx {
     fn drop(&mut self) {
-        // This runs during unwinding: a second panic escaping here would abort the Core before its
-        // return to stock (safety audit 2026-10-19).
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-            let Some(device) = &self.dx12_device else { return };
-            let Some(report) = dred::removal_report(device) else { return };
-            if let Ok(mut last) = LAST.lock() {
-                if *last == report {
-                    return;
-                }
-                last.clone_from(&report);
-            }
-            log::error!("{report}");
-        }));
+        if let Some(device) = &self.dx12_device {
+            log_dx12_removal(device);
+        }
     }
 }
 
@@ -1742,15 +1749,6 @@ impl GpuCtx {
         ))
         .map_err(|e| format!("request_device failed: {e}"))?;
 
-        let crashed = Arc::new(AtomicBool::new(false));
-        {
-            let crashed = crashed.clone();
-            device.on_uncaptured_error(Box::new(move |e| {
-                // In core.log (the service has no console), so reports carry it.
-                log::error!("wgpu device error: {e}");
-                crashed.store(true, Ordering::SeqCst);
-            }));
-        }
         #[cfg(windows)]
         let dx12_device = if adapter_identity.backend == "dx12" {
             // SAFETY: the handle is only cloned (AddRef), never destroyed by us.
@@ -1765,6 +1763,21 @@ impl GpuCtx {
         } else {
             None
         };
+        let crashed = Arc::new(AtomicBool::new(false));
+        {
+            let crashed = crashed.clone();
+            #[cfg(windows)]
+            let removed = dx12_device.clone();
+            device.on_uncaptured_error(Box::new(move |e| {
+                // In core.log (the service has no console), so reports carry it.
+                log::error!("wgpu device error: {e}");
+                crashed.store(true, Ordering::SeqCst);
+                #[cfg(windows)]
+                if let Some(device) = &removed {
+                    log_dx12_removal(device);
+                }
+            }));
+        }
         // Once per backend per process: what each graphics API reports for this GPU.
         static LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         if LOGGED.lock().is_ok_and(|mut logged| {

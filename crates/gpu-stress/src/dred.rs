@@ -3,7 +3,7 @@
 //! commands each queue had started and finished, and the faulting address, so a report names the
 //! command that hung instead of only "device lost".
 
-use windows::core::Interface;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12GetDebugInterface, ID3D12Device, ID3D12DeviceRemovedExtendedData1,
     ID3D12DeviceRemovedExtendedDataSettings, D3D12_AUTO_BREADCRUMB_NODE1,
@@ -73,8 +73,8 @@ unsafe fn breadcrumbs(mut node: *const D3D12_AUTO_BREADCRUMB_NODE1) -> String {
             let ops: Vec<i32> = std::slice::from_raw_parts(crumb.pCommandHistory, total).iter().map(|op| op.0).collect();
             out += &format!(
                 "\n  queue {:?} list {:?}: {done} of {total} commands done: {}",
-                crumb.pCommandQueueDebugNameW.to_string().unwrap_or_default(),
-                crumb.pCommandListDebugNameW.to_string().unwrap_or_default(),
+                name(crumb.pCommandQueueDebugNameW),
+                name(crumb.pCommandListDebugNameW),
                 op_window(&ops, done)
             );
         }
@@ -90,14 +90,16 @@ unsafe fn allocations(mut node: *const D3D12_DRED_ALLOCATION_NODE1) -> String {
     let mut names = Vec::new();
     for _ in 0..16 {
         let Some(allocation) = node.as_ref() else { break };
-        names.push(format!(
-            "{}:{}",
-            allocation.AllocationType.0,
-            allocation.ObjectNameW.to_string().unwrap_or_default()
-        ));
+        names.push(format!("{}:{}", allocation.AllocationType.0, name(allocation.ObjectNameW)));
         node = allocation.pNext;
     }
     if names.is_empty() { "none".into() } else { names.join(", ") }
+}
+
+/// An unnamed queue, command list or allocation has a null name (wgpu names no queue): reading it
+/// as a string crashed the Core at the first DX12 hang it reported (field report 2026-10-20).
+unsafe fn name(text: PCWSTR) -> String {
+    if text.is_null() { String::new() } else { text.to_string().unwrap_or_default() }
 }
 
 /// The commands just before the first unfinished one (marked `>>`) and a few after it.
@@ -155,5 +157,28 @@ mod tests {
         assert_eq!(super::op_window(&ops, 0), ">>BeginCommandList ResourceBarrier DrawInstanced CopyBufferRegion");
         assert_eq!(super::op_window(&[99], 0), ">>op99");
         assert_eq!(super::reason_name(0x887A_0006), "GPU hung (a command ran too long)");
+    }
+
+    #[test]
+    fn unnamed_queues_lists_and_allocations_are_reported_without_reading_a_null_name() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_AUTO_BREADCRUMB_NODE1, D3D12_AUTO_BREADCRUMB_OP, D3D12_DRED_ALLOCATION_NODE1,
+        };
+        let history = [46, 6, 20].map(D3D12_AUTO_BREADCRUMB_OP);
+        let done = 1u32;
+        let crumb = D3D12_AUTO_BREADCRUMB_NODE1 {
+            BreadcrumbCount: 3,
+            pLastBreadcrumbValue: &done,
+            pCommandHistory: history.as_ptr(),
+            ..Default::default()
+        };
+        let allocation = D3D12_DRED_ALLOCATION_NODE1::default();
+        unsafe {
+            assert_eq!(
+                super::breadcrumbs(&crumb),
+                "\n  queue \"\" list \"\": 1 of 3 commands done: BeginCommandList >>Dispatch EndSubmission"
+            );
+            assert_eq!(super::allocations(&allocation), "0:");
+        }
     }
 }
