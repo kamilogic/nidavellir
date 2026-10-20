@@ -1588,6 +1588,8 @@ impl PowerSweepHandle {
         let stop = Arc::clone(&self.stop);
         let manual_stop = Arc::clone(&self.manual_stop);
         let running = Arc::clone(&self.running);
+        #[cfg(windows)]
+        crate::reports::forge_running(true);
         std::thread::spawn(move || {
             // The live forge button runs the F2 ANCHORED UNDERVOLT forge (the proven method for
             // power-bound cards F1 flatten-down cannot differentiate). The F1 sweep was removed in 0.6.0.
@@ -1666,6 +1668,8 @@ impl PowerSweepHandle {
             running.store(false, Ordering::SeqCst);
             FORGE_ACTIVE.store(false, Ordering::SeqCst);
             clear_active_forge_stop();
+            #[cfg(windows)]
+            crate::reports::forge_running(false);
         });
         Ok(())
     }
@@ -2121,15 +2125,18 @@ pub fn reconcile_interrupted_forge(store: &SafeLoopStore) -> bool {
         .map(|file| file.progress)
         .filter(|progress| progress.running);
     let clean_shutdown = store.is_clean_shutdown_present();
+    let worker_was_running = crate::reports::forge_was_running();
     let reconciled = reconcile_interrupted_forge_from_path(store, &path);
     // A run cut off by a blue screen, a power loss or a Core crash is reported at this boot; a
-    // Windows shutdown is the user's choice (user decision 2026-10-17).
-    if let Some(progress) = running.filter(|_| reconciled && !clean_shutdown) {
+    // Windows shutdown is the user's choice (user decision 2026-10-17). A run cut off before its
+    // first checkpoint has no saved progress, only the worker's mark.
+    let progress = running.filter(|_| reconciled);
+    if !clean_shutdown && (progress.is_some() || worker_was_running) {
         let message = store.load_record().pending_forge_incident.map_or_else(
             || "The previous Forge run ended without a terminal checkpoint".to_string(),
             |incident| incident.message,
         );
-        crate::reports::queue("error", "forge_lost", message, Some(progress));
+        crate::reports::queue("error", "forge_lost", message, progress);
     }
     reconciled
 }

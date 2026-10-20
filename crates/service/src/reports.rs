@@ -78,6 +78,28 @@ pub(crate) fn field_failure(kind: &str, target_mhz: u32, anchor_mv: u32) {
     queue("error", class, format!("{kind} while a forged profile was applied at {target_mhz} MHz @ {anchor_mv} mV"), None);
 }
 
+/// Present while a Forge worker runs. Found at the next start, it means the Core died during a run,
+/// also one cut off before its first checkpoint: on 2026-10-20 a Core crash in the stock checks of
+/// a Clean Run sent nothing.
+fn forge_mark() -> PathBuf {
+    data_dir().join("reports").join("forge_running")
+}
+
+pub(crate) fn forge_running(running: bool) {
+    let mark = forge_mark();
+    if running {
+        let _ = mark.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::write(&mark, b"");
+    } else {
+        let _ = std::fs::remove_file(&mark);
+    }
+}
+
+/// Whether the previous Core stopped with a Forge worker running; clears the mark.
+pub(crate) fn forge_was_running() -> bool {
+    std::fs::remove_file(forge_mark()).is_ok()
+}
+
 /// Builds and writes a report on its own thread: the Forge worker and the Sentinel never wait for
 /// log reads or event queries.
 pub(crate) fn queue(kind: &'static str, class: &'static str, message: String, prog: Option<PowerSweepProgress>) {
