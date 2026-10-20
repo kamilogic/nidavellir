@@ -369,8 +369,9 @@ fn gpu_family(name: &str) -> String {
 
 static USER_FOLDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)([\\/])users([\\/])[^\\/\s"']+"#).expect("static pattern"));
 static GPU_UUID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"GPU-[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}").expect("static pattern"));
-// Defense in depth: nothing logs these today.
-static IPV4: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("static pattern"));
+// Defense in depth: nothing logs these today. Longer dotted runs are versions: a VBIOS
+// "98.05.45.00.83" lost its first four parts to this (field report 2026-10-20).
+static IPV4: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{1,3}(?:\.\d{1,3})+\b").expect("static pattern"));
 static SID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bS-1-5-[0-9-]+").expect("static pattern"));
 static MAC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b").expect("static pattern"));
 
@@ -398,7 +399,10 @@ fn scrub(text: &str, computer: &str, users: &[String], gpu_ids: &[String]) -> St
     out = GPU_UUID.replace_all(&out, "<gpu-id>").into_owned();
     out = SID.replace_all(&out, "<sid>").into_owned();
     out = MAC.replace_all(&out, "<mac>").into_owned();
-    IPV4.replace_all(&out, "<ip>").into_owned()
+    IPV4.replace_all(&out, |found: &regex::Captures| {
+        if found[0].split('.').count() == 4 { "<ip>".to_owned() } else { found[0].to_owned() }
+    })
+    .into_owned()
 }
 
 /// Every local profile folder name under `C:\Users`, the built-in ones aside.
@@ -425,12 +429,13 @@ fn output_within(command: &mut std::process::Command, limit: std::time::Duration
         return String::new();
     };
     let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
+    let (sender, output) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(mut stdout) = stdout {
             let _ = stdout.read_to_end(&mut bytes);
         }
-        bytes
+        let _ = sender.send(bytes);
     });
     let deadline = std::time::Instant::now() + limit;
     loop {
@@ -438,13 +443,15 @@ fn output_within(command: &mut std::process::Command, limit: std::time::Duration
             Ok(Some(_)) => break,
             Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(100)),
             _ => {
+                // No wait after the kill: a command stuck inside the driver ends only when the
+                // driver lets it, and the report must not wait for that.
                 let _ = child.kill();
-                let _ = child.wait();
                 break;
             }
         }
     }
-    String::from_utf8_lossy(&reader.join().unwrap_or_default()).into_owned()
+    let output = output.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or_default();
+    String::from_utf8_lossy(&output).into_owned()
 }
 
 fn forge_facts(prog: &PowerSweepProgress) -> serde_json::Value {
@@ -522,7 +529,8 @@ fn system32(program: &str) -> PathBuf {
 
 /// The latest GPU driver and crash events from Windows with their data, since an nvlddmkm 153 has
 /// no message text: driver resets (nvlddmkm, Display), blue screens (BugCheck), unexpected restarts
-/// (Kernel-Power 41) and the kernel reports Windows wrote for them (LiveKernelEvent 141/117).
+/// (Kernel-Power 41), the kernel reports Windows wrote for them (LiveKernelEvent 141/117) and
+/// crashes of Nidavellir itself (Application Error 1000), which leave no line in core.log.
 fn driver_events() -> String {
     // Separate queries, so a run of unexpected restarts never crowds the driver resets out.
     let query = |log: &str, filter: &str, count: u32| {
@@ -543,6 +551,12 @@ fn driver_events() -> String {
             .into_iter()
             .filter(|line| line.contains("LiveKernelEvent") || line.contains("BlueScreen"))
             .take(6),
+    );
+    lines.extend(
+        query("Application", "*[System[Provider[@Name='Application Error'] and EventID=1000]]", 10)
+            .into_iter()
+            .filter(|line| line.to_ascii_lowercase().contains("nidavellir"))
+            .take(3),
     );
     lines.join("\n")
 }
@@ -664,13 +678,13 @@ mod tests {
 
         let ids = vec!["GPU-0a1b2c3d-1111-2222-3333-444455556666".to_string()];
         let users = vec!["leona".to_string(), "John Doe".to_string(), "dev".to_string()];
-        let text = r"C:\Users\Leona\AppData\x C:/users/fulano/y C:\Users\John Doe\z running as LEONA HKEY_USERS\S-1-5-21-1004336348-1177238915-682003330-1001 Computer: DESKTOP-ABC12 desktop-abc12 GPU-0a1b2c3d-1111-2222-3333-444455556666 GPU-ffffffff-1111-2222-3333-444455556666 at 192.168.0.12 mac 3C:7C:3F:1A:2B:4D device ready RTX 5070 576.80 Windows 26200.6584";
+        let text = r"C:\Users\Leona\AppData\x C:/users/fulano/y C:\Users\John Doe\z running as LEONA HKEY_USERS\S-1-5-21-1004336348-1177238915-682003330-1001 Computer: DESKTOP-ABC12 desktop-abc12 GPU-0a1b2c3d-1111-2222-3333-444455556666 GPU-ffffffff-1111-2222-3333-444455556666 at 192.168.0.12 mac 3C:7C:3F:1A:2B:4D device ready RTX 5070 576.80 Windows 26200.6584 VBIOS 98.05.45.00.83";
         let clean = scrub(text, "DESKTOP-ABC12", &users, &ids);
         for leak in ["leona", "fulano", "john", "doe", "desktop-abc12", "s-1-5-21", "192.168", "3c:7c", "gpu-0a1b2c3d", "gpu-ffffffff"] {
             assert!(!clean.to_lowercase().contains(leak), "{leak} leaked: {clean}");
         }
         assert!(clean.contains(r"C:\Users\<user>\AppData") && clean.contains("device ready"), "whole words only: {clean}");
-        assert!(clean.contains("RTX 5070 576.80") && clean.contains("26200.6584"), "versions stay: {clean}");
+        assert!(clean.contains("RTX 5070 576.80") && clean.contains("26200.6584") && clean.contains("VBIOS 98.05.45.00.83"), "versions stay: {clean}");
 
         assert!(valid_id("1791962702636-error-stock_crash.json"));
         assert!(!valid_id(r"..\..\Windows\win.ini") && !valid_id("a/b.json") && !valid_id("x.txt"));
