@@ -3024,9 +3024,13 @@ struct Measured {
     prehang_stall_detected: bool,
     /// Every NVML clock-limit reason in the retained samples (raw bitmask).
     throttle_bits_seen: u64,
-    /// The VF point at the voltage the GPU ran, read once under load past mid-dwell, as
-    /// (base MHz, base mV, effective MHz, effective mV): the GPU's own curve while hot.
-    vf_point_under_load: Option<(u32, u32, u32, u32)>,
+    /// Three times per dwell under load: the VF point at the highest voltage seen (the anchor) and
+    /// the one below it, as mV:base→effective MHz. The GPU's own curve while hot.
+    vf_points_under_load: Vec<String>,
+    /// The most common sampled clocks and voltages with their share: a GPU alternating between two
+    /// VF points shows two peaks.
+    clock_shares: String,
+    volt_shares: String,
 }
 
 impl Measured {
@@ -3065,7 +3069,9 @@ impl Measured {
             evidence_provenance: None,
             prehang_stall_detected: false,
             throttle_bits_seen: 0,
-            vf_point_under_load: None,
+            vf_points_under_load: Vec::new(),
+            clock_shares: "-".into(),
+            volt_shares: "-".into(),
         }
     }
 }
@@ -4343,8 +4349,8 @@ fn load_and_measure_for_with_phase_hook(
         prehang_stall.clone(),
     );
     let throttle_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let vf_point = Arc::new(OnceLock::new());
-    let (throttle_for_sampler, vf_point_for_sampler) = (throttle_seen.clone(), vf_point.clone());
+    let vf_points = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (throttle_for_sampler, vf_points_for_sampler) = (throttle_seen.clone(), vf_points.clone());
     let t0 = std::time::Instant::now();
     let sampler = std::thread::spawn(move || {
         // Resolve the anchor once. At most five diagnostic snapshots per lane, after timed
@@ -4356,6 +4362,7 @@ fn load_and_measure_for_with_phase_hook(
             _ => None,
         };
         let mut curve_snapshots = 0;
+        let mut highest_mv = 0;
         let mut last_voltage_attempt_ms = None;
         let power_characterization = matches!(purpose, RenderStressPurpose::PowerCharacterization);
         let mut saw_valid_sample = false;
@@ -4456,14 +4463,16 @@ fn load_and_measure_for_with_phase_hook(
                             g.push(mv);
                         }
                     }
-                    // Once per dwell, past its middle: the GPU's own (hot) curve at the voltage it
-                    // ran. An RTX 5070 ran ~50 MHz under every target (field report 2026-10-21).
-                    if voltage_started_ms >= u128::from(ms / 2) && (VOLT_SANE_MIN_MV..=VOLT_SANE_MAX_MV).contains(&mv) {
-                        vf_point_for_sampler.get_or_init(|| {
-                            VF_BASE_CURVE.get()
-                                .and_then(|curve| nidavellir_gpu_nvapi::nearest_vf_bin_at_or_above(curve, mv))
-                                .and_then(|(index, _)| nidavellir_gpu_nvapi::read_vf_point_snapshot(index))
-                        });
+                    // At 1/4, 1/2 and 3/4 of the dwell, under load: the GPU's own (hot) curve at the
+                    // highest voltage seen, the anchor, and at the point below it. An RTX 5070 ran
+                    // ~50 MHz under every target (field report 2026-10-21).
+                    if (VOLT_SANE_MIN_MV..=VOLT_SANE_MAX_MV).contains(&mv) {
+                        highest_mv = highest_mv.max(mv);
+                        if let Ok(mut points) = vf_points_for_sampler.lock() {
+                            if points.len() < 3 && voltage_started_ms >= u128::from(ms) * (points.len() as u128 + 1) / 4 {
+                                points.push(vf_points_text(voltage_started_ms, highest_mv));
+                            }
+                        }
                     }
                 }
             }
@@ -4715,8 +4724,42 @@ fn load_and_measure_for_with_phase_hook(
         evidence_provenance,
         prehang_stall_detected,
         throttle_bits_seen: throttle_seen.load(Ordering::SeqCst),
-        vf_point_under_load: vf_point.get().copied().flatten(),
+        vf_points_under_load: vf_points.lock().map(|points| points.clone()).unwrap_or_default(),
+        clock_shares: share_text(&clocks, 4),
+        volt_shares: share_text(&volt_samples, 3),
     }
+}
+
+/// "t=2.6s 1090:2857→2947 1085:2850→2850": the VF point at or above `mv` and the one below it, as
+/// mV:base→effective MHz, read from the GPU now (one GetStatus each).
+#[cfg(windows)]
+fn vf_points_text(at_ms: u128, mv: u32) -> String {
+    let curve = VF_BASE_CURVE.get().map(Vec::as_slice).unwrap_or_default();
+    let top = nidavellir_gpu_nvapi::nearest_vf_bin_at_or_above(curve, mv);
+    let below = top.and_then(|(_, top_mv)| curve.iter().filter(|p| p.1 < top_mv).max_by_key(|p| p.1).map(|p| p.0));
+    let points: Vec<String> = top
+        .map(|(index, _)| index)
+        .into_iter()
+        .chain(below)
+        .filter_map(|index| {
+            nidavellir_gpu_nvapi::read_vf_point_snapshot(index)
+                .map(|(base_mhz, base_mv, effective_mhz, _)| format!("{base_mv}:{base_mhz}→{effective_mhz}"))
+        })
+        .collect();
+    format!("t={:.1}s {}", at_ms as f64 / 1000.0, if points.is_empty() { "-".into() } else { points.join(" ") })
+}
+
+/// The most common values with their share, "2947:55% 2850:40%"; "-" without samples.
+fn share_text(values: &[u32], top: usize) -> String {
+    let mut counts = std::collections::BTreeMap::<u32, usize>::new();
+    for value in values {
+        *counts.entry(*value).or_default() += 1;
+    }
+    let mut ranked: Vec<(u32, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+    let parts: Vec<String> =
+        ranked.iter().take(top).map(|(value, count)| format!("{value}:{}%", count * 100 / values.len())).collect();
+    if parts.is_empty() { "-".into() } else { parts.join(" ") }
 }
 
 /// The sentinel latches a TDR within about a second of the Windows event. After a failed stock
@@ -4901,7 +4944,7 @@ fn run_f2_stock_preheat(
         };
         // The GPU's own drop under load at stock: its hot curve point against the clock it ran.
         prog.log.push(format!(
-            "Preheat stock {}/{}: p5 {} MHz, temperatura {}, {} amostras, tensão {}..{} mV, limites de clock {}, ponto VF sob carga [{}]{}{}.",
+            "Preheat stock {}/{}: p5 {} MHz, temperatura {}, {} amostras, tensão {}..{} mV, limites de clock {}, pontos VF sob carga [{}], clocks [{}], tensões [{}]{}{}.",
             index + 1,
             F2_PREHEAT_MAX_WINDOWS,
             window.p5_clock_mhz,
@@ -4910,7 +4953,9 @@ fn run_f2_stock_preheat(
             measured.volt_min_mv.unwrap_or(0),
             measured.volt_max_mv.unwrap_or(0),
             nidavellir_core::nvml_gpu::clock_limit_names(measured.throttle_bits_seen),
-            vf_point_text(measured.vf_point_under_load),
+            measured.vf_points_under_load.join("; "),
+            measured.clock_shares,
+            measured.volt_shares,
             if window.thermal_throttled {
                 ", thermal throttle"
             } else {
@@ -7225,7 +7270,9 @@ pub(crate) struct SingleDwell {
     pub evidence_provenance: Option<F2EvidenceProvenance>,
     pub prehang_stall_detected: bool,
     pub throttle_bits_seen: u64,
-    pub vf_point_under_load: Option<(u32, u32, u32, u32)>,
+    pub vf_points_under_load: Vec<String>,
+    pub clock_shares: String,
+    pub volt_shares: String,
 }
 
 /// Run ONE game-power load dwell via the validated [`load_and_measure`] path (fresh wgpu context,
@@ -7383,18 +7430,10 @@ fn single_dwell_from_measured(m: Measured) -> SingleDwell {
         evidence_provenance: m.evidence_provenance,
         prehang_stall_detected: m.prehang_stall_detected,
         throttle_bits_seen: m.throttle_bits_seen,
-        vf_point_under_load: m.vf_point_under_load,
+        vf_points_under_load: m.vf_points_under_load,
+        clock_shares: m.clock_shares,
+        volt_shares: m.volt_shares,
     }
-}
-
-/// "base 2977 MHz @ 1080 mV, effective 2925 MHz @ 1080 mV" for core.log; "-" when unread.
-pub(crate) fn vf_point_text(point: Option<(u32, u32, u32, u32)>) -> String {
-    point.map_or_else(
-        || "-".into(),
-        |(base_mhz, base_mv, effective_mhz, effective_mv)| {
-            format!("base {base_mhz} MHz @ {base_mv} mV, effective {effective_mhz} MHz @ {effective_mv} mV")
-        },
-    )
 }
 
 /// A no-hardware "unverified" probe result: tells `build_frontier` to stop this clock's
@@ -12533,11 +12572,9 @@ mod tests {
             "VF curve: 0 points, 0-0 mV (smallest step 0 mV), 0-0 MHz (smallest step 0 MHz), stock boost 0 MHz"
         );
         assert_eq!(vf_curve_points(&curve[..2]), "VF curve points (mV:MHz): 700:1500 706:1515");
-        assert_eq!(
-            vf_point_text(Some((2977, 1080, 2925, 1080))),
-            "base 2977 MHz @ 1080 mV, effective 2925 MHz @ 1080 mV"
-        );
-        assert_eq!(vf_point_text(None), "-");
+        // A GPU alternating between two VF points shows two peaks.
+        assert_eq!(share_text(&[2947, 2850, 2947, 2850, 2947, 2925], 2), "2947:50% 2850:33%");
+        assert_eq!(share_text(&[], 3), "-");
     }
 
     /// 2026-10-17 field report (RTX 5070): GPU work left blocked by a driver crash is left behind
@@ -13052,7 +13089,9 @@ mod tests {
             evidence_provenance: None,
             prehang_stall_detected: false,
             throttle_bits_seen: 0,
-            vf_point_under_load: None,
+            vf_points_under_load: Vec::new(),
+            clock_shares: "-".into(),
+            volt_shares: "-".into(),
         }
     }
 

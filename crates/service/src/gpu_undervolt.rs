@@ -2931,7 +2931,7 @@ impl F2Ops for RealF2Ops<'_> {
             "undervolt-probe dwell: {outcome:?} reason={inconclusive_reason:?} avg_clock={} MHz p5={} MHz p95={} MHz max={} MHz \
              power_avg={:.0} W power_p99={:?} W power_peak={:.0} W max_temp={:?} C \
              voltage={}..{} mV ({} samples) thermal_throttled={} silent_error={} \
-             clock_limits={} vf_point_under_load=[{}]",
+             clock_limits={} vf_points=[{}] clocks=[{}] volts=[{}]",
             s.avg_clock_mhz,
             s.p5_clock_mhz,
             s.p95_clock_mhz,
@@ -2946,7 +2946,9 @@ impl F2Ops for RealF2Ops<'_> {
             s.thermal_throttled,
             s.silent_error,
             nidavellir_core::nvml_gpu::clock_limit_names(s.throttle_bits_seen),
-            crate::gpu_power_sweep::vf_point_text(s.vf_point_under_load)
+            s.vf_points_under_load.join("; "),
+            s.clock_shares,
+            s.volt_shares
         );
         F2DwellResult {
             outcome,
@@ -4433,6 +4435,14 @@ fn plan_f2_power_calibration_candidate(
         reference_offset_mhz,
         limits,
     )
+    // Only the anchor is raised: a GPU that slips one voltage point lower runs that point's stock
+    // clock (field report 2026-10-21, RTX 5070).
+    .inspect(|plan| {
+        info!(
+            "F2 plan {target_mhz} MHz @ {apply_mv} mV: stock {} MHz at the anchor, offset +{} MHz, {} bins capped above, {} left at stock below",
+            plan.anchor.base_mhz, plan.anchor.offset_mhz, plan.capped_above_bins, plan.elastic_below_bins
+        )
+    })
 }
 
 
@@ -5593,7 +5603,9 @@ mod tests {
             evidence_provenance: None,
             prehang_stall_detected: false,
             throttle_bits_seen: 0,
-            vf_point_under_load: None,
+            vf_points_under_load: Vec::new(),
+            clock_shares: "-".into(),
+            volt_shares: "-".into(),
         };
         let rare_excursion = &mut base;
         rare_excursion.thermal_throttled = false;
@@ -6286,7 +6298,9 @@ mod tests {
             evidence_provenance: None,
             prehang_stall_detected: false,
             throttle_bits_seen: 0,
-            vf_point_under_load: None,
+            vf_points_under_load: Vec::new(),
+            clock_shares: "-".into(),
+            volt_shares: "-".into(),
         };
         stable_low_p5.max_power_w = 200.0;
         stable_low_p5.max_clock_mhz = 1815;
