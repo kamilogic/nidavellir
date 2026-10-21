@@ -95,6 +95,8 @@ pub struct PowerBoundHint {
 #[derive(Debug, Clone, Copy)]
 pub struct ClockDropHint {
     pub held_clock_mhz: u32,
+    /// The stock clock of that voltage's VF point: an undervolt pair must target above it.
+    pub stock_clock_mhz: u32,
 }
 
 /// The limiter settled at the measured voltage at a clock BELOW the target, and board power does
@@ -572,10 +574,15 @@ fn record_level(
         // voltage, once per run. That is a new hypothesis, not an inferred boundary. After a
         // ClockDrop it goes to the highest bin the GPU held there, since the bins in between
         // dropped too: an RTX 5070 held ~2910 MHz at 1085 mV under 2992, and one 7 MHz bin lower
-        // ended the run (field report 2026-10-21). Otherwise one bin.
+        // ended the run (field report 2026-10-21). Otherwise one bin. Either stays above the
+        // voltage's stock clock: 2880@1090 under a 2887 stock point was no undervolt and stopped
+        // the run as untestable (same report, 0.8.6).
         Outcome::Inconclusive => {
+            let floor = clock_hint.map_or(0, |hint| hint.stock_clock_mhz);
             let below = |limit: u32| {
-                clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz && *clock <= limit).max()
+                clock_bins.iter().copied()
+                    .filter(|clock| *clock < band.target_clock_mhz && *clock <= limit && *clock > floor)
+                    .max()
             };
             let lower_clock = clock_hint.and_then(|hint| below(hint.held_clock_mhz)).or_else(|| below(u32::MAX));
             match lower_clock {
@@ -1001,7 +1008,7 @@ mod tests {
         let fresh = || new(&[seed("performance"), seed("balanced"), seed("efficiency")], 30, 10_000);
         let dropped = |state: &mut ForgeDiscoverySearch, held: Option<u32>| {
             admit(state, 0, 0, 100).unwrap();
-            let hint = held.map(|held_clock_mhz| ClockDropHint { held_clock_mhz });
+            let hint = held.map(|held_clock_mhz| ClockDropHint { held_clock_mhz, stock_clock_mhz: 2872 });
             record(state, 0, Outcome::Inconclusive, &clocks, &volts, None, hint).unwrap();
             let top = &state.bands[0];
             (top.target_clock_mhz, top.clock_ceiling_mhz, top.voltage_mv)
@@ -1013,6 +1020,12 @@ mod tests {
         assert_eq!(state.stop_reason.as_deref(), Some("qualified_top_unavailable"), "once per run");
         assert_eq!(dropped(&mut fresh(), None).0, 2985, "without a measurement: one bin");
         assert_eq!(dropped(&mut fresh(), Some(2800)).0, 2985, "held below every bin: one bin");
+        // 0.8.6 at 1090 mV: the GPU held 2887, no more than that voltage's stock 2887 clock.
+        let mut stock_level = fresh();
+        admit(&mut stock_level, 0, 0, 100).unwrap();
+        let hint = Some(ClockDropHint { held_clock_mhz: 2887, stock_clock_mhz: 2887 });
+        record(&mut stock_level, 0, Outcome::Inconclusive, &clocks, &volts, None, hint).unwrap();
+        assert_eq!(stock_level.bands[0].target_clock_mhz, 2985, "never a pair at or under stock: one bin");
     }
     #[test]
     fn top_down_power_integrity_bracket_descends_without_retesting_failed_top() {

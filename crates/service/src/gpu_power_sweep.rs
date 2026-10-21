@@ -8512,6 +8512,7 @@ fn f2_clock_drop_hint(
     gpu_key: &str,
     target: u32,
     voltage: u32,
+    stock_curve: &[(usize, u32, u32)],
 ) -> Option<crate::qualified_search::ClockDropHint> {
     use nidavellir_core::f2_observation::{self as obs, F2EvidenceKind, F2ObsOutcome};
     let o = observation;
@@ -8528,7 +8529,8 @@ fn f2_clock_drop_hint(
         || o.measured_voltage_avg_mv.is_none_or(|mean| mean + 7 < voltage)
     { return None; }
     let held = o.sustained_clock_mhz.filter(|clock| *clock > 0 && *clock < target)?;
-    Some(crate::qualified_search::ClockDropHint { held_clock_mhz: held })
+    let stock = stock_curve.iter().find(|&&(_, mv, _)| mv == voltage).map(|&(_, _, mhz)| mhz)?;
+    Some(crate::qualified_search::ClockDropHint { held_clock_mhz: held, stock_clock_mhz: stock })
 }
 
 #[cfg(windows)]
@@ -9495,7 +9497,9 @@ fn measure_multiclock_undervolt_forge(
             if band.id == "performance" && !calibration.aborted && !calibration.retain_boot_flag {
                 let observations = obs_store.load_all_checked().map_err(|e| e.to_string())?;
                 power_hint = observations.last().and_then(|o| f2_power_bound_hint(o, &run_id, &gpu_key, target, mv, cap));
-                clock_hint = observations.last().and_then(|o| f2_clock_drop_hint(o, &run_id, &gpu_key, target, mv));
+                clock_hint = observations.last().and_then(|o| {
+                    f2_clock_drop_hint(o, &run_id, &gpu_key, target, mv, &f2_inputs.sane_base_curve)
+                });
             }
             if calibration.aborted || !calibration.confirmed || stop.load(Ordering::SeqCst) {
                 // Only discovery can retry a neutral excursion, after persisted clean recovery.
@@ -16137,8 +16141,13 @@ mod tests {
             measured_voltage_sample_count: 8,
             ..power_obs(2992, 1085, Some(245.0), true, Some(245), "gpu")
         };
-        let hint = |o: &F2Observation, target| f2_clock_drop_hint(o, "run", "gpu", target, 1085).map(|h| h.held_clock_mhz);
-        assert_eq!(hint(&dropped, 2992), Some(2910));
+        let curve = [(5, 1075, 2857), (6, 1085, 2872), (7, 1090, 2887)];
+        let hint = |o: &F2Observation, target| {
+            f2_clock_drop_hint(o, "run", "gpu", target, 1085, &curve).map(|h| (h.held_clock_mhz, h.stock_clock_mhz))
+        };
+        assert_eq!(hint(&dropped, 2992), Some((2910, 2872)), "held clock and that voltage's stock clock");
+        assert_eq!(f2_clock_drop_hint(&dropped, "run", "gpu", 2992, 1085, &curve[..1]).map(|h| h.held_clock_mhz), None,
+            "an anchor missing from the stock curve gives no hint");
         assert_eq!(hint(&F2Observation { thermal_throttled: true, ..dropped.clone() }, 2992), None, "throttled");
         assert_eq!(hint(&F2Observation { outcome: F2ObsOutcome::PowerBoundClockDrop, ..dropped.clone() }, 2992), None);
         assert_eq!(hint(&F2Observation { sample_count: Some(40), ..dropped.clone() }, 2992), None, "too short");
