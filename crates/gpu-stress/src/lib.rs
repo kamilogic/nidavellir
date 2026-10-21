@@ -3315,7 +3315,8 @@ impl GpuCtx {
                 result.frames,
                 frame_ms.map(|ms| format!(" ({ms} ms/frame)")).unwrap_or_default()
             );
-            if frame_ms.is_some_and(|ms| ms >= SLOW_FRAME_WARN_MS) {
+            // A crash's hang inflates the average; the warning is for frames that finished slowly.
+            if result.result != StabilityResult::Crash && frame_ms.is_some_and(|ms| ms >= SLOW_FRAME_WARN_MS) {
                 log::warn!(
                     "{backend} segment {}: frames average {} ms, near the 2 s Windows driver timeout on this GPU",
                     segment_index + 1,

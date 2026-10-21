@@ -399,8 +399,9 @@ fn scrub(text: &str, computer: &str, users: &[String], gpu_ids: &[String]) -> St
     out = GPU_UUID.replace_all(&out, "<gpu-id>").into_owned();
     out = SID.replace_all(&out, "<sid>").into_owned();
     out = MAC.replace_all(&out, "<mac>").into_owned();
+    // "0.8.4.0" is Nidavellir's own file version in Windows' crash events, not an address.
     IPV4.replace_all(&out, |found: &regex::Captures| {
-        if found[0].split('.').count() == 4 { "<ip>".to_owned() } else { found[0].to_owned() }
+        if found[0].split('.').count() == 4 && !found[0].starts_with("0.") { "<ip>".to_owned() } else { found[0].to_owned() }
     })
     .into_owned()
 }
@@ -678,13 +679,13 @@ mod tests {
 
         let ids = vec!["GPU-0a1b2c3d-1111-2222-3333-444455556666".to_string()];
         let users = vec!["leona".to_string(), "John Doe".to_string(), "dev".to_string()];
-        let text = r"C:\Users\Leona\AppData\x C:/users/fulano/y C:\Users\John Doe\z running as LEONA HKEY_USERS\S-1-5-21-1004336348-1177238915-682003330-1001 Computer: DESKTOP-ABC12 desktop-abc12 GPU-0a1b2c3d-1111-2222-3333-444455556666 GPU-ffffffff-1111-2222-3333-444455556666 at 192.168.0.12 mac 3C:7C:3F:1A:2B:4D device ready RTX 5070 576.80 Windows 26200.6584 VBIOS 98.05.45.00.83";
+        let text = r"C:\Users\Leona\AppData\x C:/users/fulano/y C:\Users\John Doe\z running as LEONA HKEY_USERS\S-1-5-21-1004336348-1177238915-682003330-1001 Computer: DESKTOP-ABC12 desktop-abc12 GPU-0a1b2c3d-1111-2222-3333-444455556666 GPU-ffffffff-1111-2222-3333-444455556666 at 192.168.0.12 mac 3C:7C:3F:1A:2B:4D device ready RTX 5070 576.80 Windows 26200.6584 VBIOS 98.05.45.00.83 nidavellir-service.exe | 0.8.4.0";
         let clean = scrub(text, "DESKTOP-ABC12", &users, &ids);
         for leak in ["leona", "fulano", "john", "doe", "desktop-abc12", "s-1-5-21", "192.168", "3c:7c", "gpu-0a1b2c3d", "gpu-ffffffff"] {
             assert!(!clean.to_lowercase().contains(leak), "{leak} leaked: {clean}");
         }
         assert!(clean.contains(r"C:\Users\<user>\AppData") && clean.contains("device ready"), "whole words only: {clean}");
-        assert!(clean.contains("RTX 5070 576.80") && clean.contains("26200.6584") && clean.contains("VBIOS 98.05.45.00.83"), "versions stay: {clean}");
+        assert!(clean.contains("RTX 5070 576.80") && clean.contains("26200.6584") && clean.contains("VBIOS 98.05.45.00.83") && clean.contains("| 0.8.4.0"), "versions stay: {clean}");
 
         assert!(valid_id("1791962702636-error-stock_crash.json"));
         assert!(!valid_id(r"..\..\Windows\win.ini") && !valid_id("a/b.json") && !valid_id("x.txt"));

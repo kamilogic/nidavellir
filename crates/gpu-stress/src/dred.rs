@@ -62,26 +62,33 @@ pub(crate) fn reason_name(code: u32) -> &'static str {
     }
 }
 
-/// Command lists the GPU did not finish, with the commands around the one it stopped at.
+/// Every command list DRED still holds (64 at most) and the queue it went to, numbered since wgpu
+/// names no queue: an unfinished one shows the commands around the one the GPU stopped at. The
+/// finished ones show what ran last (field report 2026-10-21: every unfinished list was at 0).
 unsafe fn breadcrumbs(mut node: *const D3D12_AUTO_BREADCRUMB_NODE1) -> String {
+    let mut queues: Vec<*mut std::ffi::c_void> = Vec::new();
     let mut out = String::new();
     for _ in 0..64 {
         let Some(crumb) = node.as_ref() else { break };
+        let queue = (*crumb.pCommandQueue).as_ref().map_or(std::ptr::null_mut(), Interface::as_raw);
+        let number = match queues.iter().position(|known| *known == queue) {
+            Some(index) => index + 1,
+            None => {
+                queues.push(queue);
+                queues.len()
+            }
+        };
         let total = crumb.BreadcrumbCount as usize;
-        let done = crumb.pLastBreadcrumbValue.as_ref().map_or(0, |value| *value as usize);
+        let done = crumb.pLastBreadcrumbValue.as_ref().map_or(0, |value| *value as usize).min(total);
+        out += &format!("\n  queue {number} list {:?}: {done} of {total} commands done", name(crumb.pCommandListDebugNameW));
         if done < total && !crumb.pCommandHistory.is_null() {
             let ops: Vec<i32> = std::slice::from_raw_parts(crumb.pCommandHistory, total).iter().map(|op| op.0).collect();
-            out += &format!(
-                "\n  queue {:?} list {:?}: {done} of {total} commands done: {}",
-                name(crumb.pCommandQueueDebugNameW),
-                name(crumb.pCommandListDebugNameW),
-                op_window(&ops, done)
-            );
+            out += &format!(": {}", op_window(&ops, done));
         }
         node = crumb.pNext;
     }
     if out.is_empty() {
-        out = "\n  no unfinished command list recorded".into();
+        out = "\n  no command list recorded".into();
     }
     out
 }
@@ -165,18 +172,26 @@ mod tests {
             D3D12_AUTO_BREADCRUMB_NODE1, D3D12_AUTO_BREADCRUMB_OP, D3D12_DRED_ALLOCATION_NODE1,
         };
         let history = [46, 6, 20].map(D3D12_AUTO_BREADCRUMB_OP);
-        let done = 1u32;
+        let (done, finished) = (1u32, 3u32);
+        let last = D3D12_AUTO_BREADCRUMB_NODE1 {
+            BreadcrumbCount: 3,
+            pLastBreadcrumbValue: &finished,
+            pCommandHistory: history.as_ptr(),
+            ..Default::default()
+        };
         let crumb = D3D12_AUTO_BREADCRUMB_NODE1 {
             BreadcrumbCount: 3,
             pLastBreadcrumbValue: &done,
             pCommandHistory: history.as_ptr(),
+            pNext: &last,
             ..Default::default()
         };
         let allocation = D3D12_DRED_ALLOCATION_NODE1::default();
         unsafe {
             assert_eq!(
                 super::breadcrumbs(&crumb),
-                "\n  queue \"\" list \"\": 1 of 3 commands done: BeginCommandList >>Dispatch EndSubmission"
+                "\n  queue 1 list \"\": 1 of 3 commands done: BeginCommandList >>Dispatch EndSubmission\
+                 \n  queue 1 list \"\": 3 of 3 commands done"
             );
             assert_eq!(super::allocations(&allocation), "0:");
         }
