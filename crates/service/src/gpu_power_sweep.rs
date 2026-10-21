@@ -4135,6 +4135,10 @@ pub(crate) fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
     })
 }
 
+/// A stock lane that failed only on frame time, twice: interference, not a driver problem.
+#[cfg(windows)]
+const STOCK_SLOWDOWN: &str = "ran far slower than its stock reference twice";
+
 #[cfg(windows)]
 pub(crate) fn validate_v27_api_matrix_stock(
     goldens: RenderGoldens,
@@ -4152,20 +4156,36 @@ pub(crate) fn validate_v27_api_matrix_stock(
             callback(index, lane);
         }
         info!("stock control lane {}: {api}, {duration_ms} ms", index + 1);
-        let ctx = nidavellir_gpu_stress::GpuCtx::new_for_backend(backend)
-            .map_err(|e| format!("{api} stock control init failed: {e}"))?;
-        let phase_state = AtomicU8::new(VfQualifierPhase::NONE_CODE);
-        let preflight = ctx.run_vf_qualifier_stress_with_phase_pattern_goldens_and_cancel(
-            duration_ms,
-            &phase_state,
-            VfQualifierPattern::V8Texture,
-            Some(api_goldens),
-            None,
-        );
+        let run = || -> Result<_, String> {
+            let ctx = nidavellir_gpu_stress::GpuCtx::new_for_backend(backend)
+                .map_err(|e| format!("{api} stock control init failed: {e}"))?;
+            let phase_state = AtomicU8::new(VfQualifierPhase::NONE_CODE);
+            Ok(ctx.run_vf_qualifier_stress_with_phase_pattern_goldens_and_cancel(
+                duration_ms,
+                &phase_state,
+                VfQualifierPattern::V8Texture,
+                Some(api_goldens),
+                None,
+            ))
+        };
+        let label = |result: &nidavellir_gpu_stress::RenderResult| {
+            result.failure_phase.map(VfQualifierPhase::label).unwrap_or("unknown phase")
+        };
+        let mut preflight = run()?;
+        // At stock, Unstable is only a frame-time gate (no wrong pixel, no crash): another program
+        // slowed the GPU, as when BoostEdge ran 8x slower (field report 2026-10-21). Once more decides.
+        let retried = preflight.result == StabilityResult::Unstable && preflight.inconclusive_reason.is_none();
+        if retried {
+            warn!("{api} stock control slowed down during {}; running the lane once more", label(&preflight));
+            preflight = run()?;
+        }
         if let Some(reason) = preflight.inconclusive_reason {
             return Err(format!(
                 "{api} stock control was inconclusive at the environment level: {reason}"
             ));
+        }
+        if retried && preflight.result == StabilityResult::Unstable {
+            return Err(format!("{api} stock control {STOCK_SLOWDOWN} during {}", label(&preflight)));
         }
         if preflight.result != StabilityResult::Stable {
             return Err(format!(
@@ -9038,6 +9058,12 @@ fn measure_multiclock_undervolt_forge(
                     task_tracker.finish(&mut prog);
                     // The retry happens after a Windows restart, so the pause must be on disk.
                     save_forge_state(&gpu_key, &prog);
+                } else if e.contains(STOCK_SLOWDOWN) {
+                    prog.phase = "incomplete".into();
+                    prog.note = Some(format!(
+                        "The Forge stopped before testing: a stock check ran far slower than its own stock result twice ({e}). Another program was probably using the GPU. Close games, videos and other programs that use the GPU, then start the Forge again. The GPU is at stock; nothing was applied."
+                    ));
+                    live_event(&mut prog, LogTone::Fail, "Stock baseline", "A stock check ran far slower than usual twice · close other programs that use the GPU and start again", Some(format!("{e}")));
                 } else {
                     prog.phase = "incomplete".into();
                     prog.note = Some(format!(
