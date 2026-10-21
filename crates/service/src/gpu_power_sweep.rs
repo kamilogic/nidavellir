@@ -4127,6 +4127,7 @@ pub(crate) fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
         boost_frame_reference_us: vulkan.boost_frame_reference_us,
         dx11,
         dx12,
+        vulkan_texrop: vulkan.texrop,
     })
 }
 

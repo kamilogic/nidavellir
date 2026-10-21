@@ -183,6 +183,9 @@ pub struct RenderGoldens {
     /// Stock goldens captured through an explicitly selected Direct3D 12 backend. The top-level
     /// fields remain the explicitly selected Vulkan reference used by the existing qualifier.
     pub dx12: WgpuRenderGoldens,
+    /// Stock Vulkan TextureRop checksum for the field-concurrency canary, which always runs on its
+    /// own Vulkan device, on a DX12 lane too: `for_dx12` keeps it.
+    pub vulkan_texrop: u32,
 }
 
 impl RenderGoldens {
@@ -449,7 +452,7 @@ pub fn vf_qualifier_workload_fingerprint(pattern: VfQualifierPattern) -> &'stati
         VfQualifierPattern::Fsgl3B => "f2q-texhop-v10-r1/fsgl3-b",
         VfQualifierPattern::V8HighFps => "f2q-texhop-v10-r1/v8-high-fps",
         VfQualifierPattern::V8Texture => {
-            "f2q-texhop-v13-r7/v13-stock-checked-field-concurrency-load-steps"
+            "f2q-texhop-v13-r8/v13-stock-checked-field-concurrency-load-steps"
         }
         VfQualifierPattern::V8Transitions => {
             "f2q-texhop-v10-r1/v8-transitions"
@@ -1724,6 +1727,25 @@ impl GpuCtx {
         Self::new_on_adapter(Arc::new(adapter))
     }
 
+    /// A Vulkan device on the GPU `info` describes (same vendor and device ID).
+    // ponytail: two identical GPUs match the first one; wgpu 0.20 does not expose the adapter LUID.
+    fn new_vulkan_like(info: &wgpu::AdapterInfo) -> Result<Self, String> {
+        keep_implicit_vulkan_layers_out();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..Default::default()
+        });
+        let adapter = instance
+            .enumerate_adapters(wgpu::Backends::VULKAN)
+            .into_iter()
+            .find(|adapter| {
+                let candidate = adapter.get_info();
+                candidate.vendor == info.vendor && candidate.device == info.device
+            })
+            .ok_or_else(|| format!("no Vulkan adapter for {} (device {:#06x})", info.name, info.device))?;
+        Self::new_on_adapter(Arc::new(adapter))
+    }
+
     fn new_on_adapter(adapter: Arc<wgpu::Adapter>) -> Result<Self, String> {
         let adapter_info = adapter.get_info();
         let adapter_name = adapter_info.name.clone();
@@ -2779,9 +2801,18 @@ impl GpuCtx {
             return report;
         }
 
-        // One independent queue remains resident for the phase. This keeps real multi-queue
-        // scheduling pressure without repeatedly allocating and tearing down whole wgpu devices.
-        let ctx = match Self::new_on_adapter(adapter) {
+        // One independent Vulkan device remains resident for the phase: a second program on the
+        // GPU, without repeatedly allocating and tearing down whole wgpu devices. A DX12 primary
+        // cannot host it, since a second device on its adapter is the same ID3D12Device with a
+        // second queue: that hung an RTX 5070 at stock before the queue's first command ran
+        // (field report 2026-10-21).
+        let info = adapter.get_info();
+        let created = if info.backend == wgpu::Backend::Vulkan {
+            Self::new_on_adapter(adapter)
+        } else {
+            Self::new_vulkan_like(&info)
+        };
+        let ctx = match created {
             Ok(ctx) => ctx,
             Err(error) => {
                 report.inconclusive_reason =
@@ -2811,7 +2842,7 @@ impl GpuCtx {
     }
 
     /// Field-derived v13 Texture Stack: a game-envelope render stays resident on this device while
-    /// one persistent secondary device on the same adapter/backend runs TextureRop against its
+    /// one persistent secondary Vulkan device on the same GPU runs TextureRop against its Vulkan
     /// stock reference. The deterministic render configuration is the same TextureRop workload
     /// used by capture_one_golden; never derive a reference from the active undervolt candidate.
     fn run_field_concurrency_profile(
@@ -2865,7 +2896,7 @@ impl GpuCtx {
             target_ms,
             VfQualifierPhase::CompositeGameLoad,
             integrity_goldens_for_workload(goldens, VfWorkload::CompositeGameLoad),
-            Some(goldens.texrop),
+            Some(goldens.vulkan_texrop),
             None,
         )
     }
@@ -3283,7 +3314,7 @@ impl GpuCtx {
                     segment.duration_ms,
                     segment.phase,
                     goldens.and_then(|g| integrity_goldens_for_workload(g, workload)),
-                    goldens.map(|g| g.texrop),
+                    goldens.map(|g| g.vulkan_texrop),
                     cancel,
                 ),
                 other => self.run_render_profile(
@@ -4598,6 +4629,7 @@ mod tests {
             boost_frame_reference_us: 8,
             dx11: Dx11Golden::default(),
             dx12: WgpuRenderGoldens::default(),
+            vulkan_texrop: 3,
         };
         assert_eq!(
             integrity_goldens_for_workload(goldens, VfWorkload::CompositeGameLoad),
@@ -4640,18 +4672,21 @@ mod tests {
             boost_frame_reference_us: 8,
             dx11,
             dx12,
+            vulkan_texrop: 3,
         }
         .for_dx12();
         assert_eq!(projected.power, 21);
         assert_eq!(projected.stream, 26);
         assert_eq!(projected.dx11, dx11);
         assert_eq!(projected.dx12, dx12);
+        assert_eq!(projected.vulkan_texrop, 3, "the canary stays on its Vulkan reference");
     }
 
     #[cfg(windows)]
     #[test]
     #[ignore = "stock-GPU API backend smoke; run explicitly on Windows hardware"]
     fn explicit_vulkan_and_dx12_backends_capture_stock_goldens() {
+        let mut vulkan_texrop = None;
         for (backend, expected) in [
             (WgpuBackend::Vulkan, "vulkan"),
             (WgpuBackend::Dx12, "dx12"),
@@ -4662,6 +4697,8 @@ mod tests {
                 .capture_one_golden(VfWorkload::TextureRop, 2_000)
                 .expect("deterministic API-specific golden");
             assert_ne!(golden, 0);
+            // The canary runs on its own Vulkan device behind either primary.
+            let golden = *vulkan_texrop.get_or_insert(golden);
             let cancel = RenderCancellation { external: None, field: None };
             let secondary = GpuCtx::run_field_canary_worker(
                 2_000, Arc::clone(&ctx.adapter), golden, cancel,
@@ -4698,7 +4735,7 @@ mod tests {
         assert_ne!(texture, endurance);
         assert_eq!(
             texture,
-            "f2q-texhop-v13-r7/v13-stock-checked-field-concurrency-load-steps"
+            "f2q-texhop-v13-r8/v13-stock-checked-field-concurrency-load-steps"
         );
         assert_eq!(
             endurance,

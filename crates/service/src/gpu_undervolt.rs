@@ -5621,6 +5621,7 @@ mod tests {
                         boost_frame_reference_us: 30,
                         dx11: dx11_golden(),
                         dx12: nidavellir_gpu_stress::WgpuRenderGoldens::default(),
+                        vulkan_texrop: 3,
                     },
                 ),
             ).0,
@@ -5651,6 +5652,7 @@ mod tests {
                         boost_frame_reference_us: 30,
                         dx11: dx11_golden(),
                         dx12: nidavellir_gpu_stress::WgpuRenderGoldens::default(),
+                        vulkan_texrop: 3,
                     },
                 ),
             ).0,
@@ -5691,6 +5693,7 @@ mod tests {
                         boost_frame_reference_us: 30,
                         dx11: dx11_golden(),
                         dx12: nidavellir_gpu_stress::WgpuRenderGoldens::default(),
+                        vulkan_texrop: 3,
                     },
                 ),
             ).0,
@@ -6308,6 +6311,7 @@ mod tests {
                         boost_frame_reference_us: 30,
                         dx11: dx11_golden(),
                         dx12: nidavellir_gpu_stress::WgpuRenderGoldens::default(),
+                        vulkan_texrop: 3,
                     },
                 )
             ).0,
@@ -6510,6 +6514,7 @@ mod tests {
             boost_frame_reference_us: 30,
             dx11: dx11_golden(),
             dx12: nidavellir_gpu_stress::WgpuRenderGoldens::default(),
+            vulkan_texrop: 33,
         };
         let purpose =
             F2StressPurpose::V8Qualification(F2QualificationPattern::Transitions, goldens);
