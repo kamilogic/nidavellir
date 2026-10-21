@@ -8449,6 +8449,34 @@ fn f2_discovery_control_retry_allowed(
         && !observation.tdr_or_crash && !observation.blacklisted
 }
 
+/// The clock the GPU held (p5) in a confirmed ClockDrop at this run's exact discovery pair, the
+/// voltage reached and no limiter at work. Throttling or any fault makes it no hint.
+#[cfg(windows)]
+fn f2_clock_drop_hint(
+    observation: &nidavellir_core::f2_observation::F2Observation,
+    run_id: &str,
+    gpu_key: &str,
+    target: u32,
+    voltage: u32,
+) -> Option<crate::qualified_search::ClockDropHint> {
+    use nidavellir_core::f2_observation::{self as obs, F2EvidenceKind, F2ObsOutcome};
+    let o = observation;
+    if o.run_id != run_id || o.gpu_key.as_deref() != Some(gpu_key)
+        || o.target_mhz != target || o.anchor_mv != voltage
+        || o.evidence_kind != F2EvidenceKind::Discovery
+        || o.discovery_contract_version != Some(obs::F2_DISCOVERY_CONTRACT_VERSION)
+        || o.verifier_result != obs::F2ObsVerifier::RaiseVerified || o.outcome != F2ObsOutcome::ClockDrop
+        || !o.reset_to_stock_attempted || !o.reset_to_stock_ok || !o.boot_flag_cleared
+        || o.thermal_throttled || o.silent_error || o.unstable || o.device_lost || o.tdr_or_crash || o.blacklisted
+        || o.sample_count.is_none_or(|count| count < 100)
+        // Reached: the mean voltage sits within one bin (5–6.25 mV) of the anchor.
+        || o.measured_voltage_sample_count < 3
+        || o.measured_voltage_avg_mv.is_none_or(|mean| mean + 7 < voltage)
+    { return None; }
+    let held = o.sustained_clock_mhz.filter(|clock| *clock > 0 && *clock < target)?;
+    Some(crate::qualified_search::ClockDropHint { held_clock_mhz: held })
+}
+
 #[cfg(windows)]
 fn f2_power_bound_hint(
     observation: &nidavellir_core::f2_observation::F2Observation,
@@ -9355,6 +9383,7 @@ fn measure_multiclock_undervolt_forge(
         let mut exact_gate = false;
         let mut failure_reason = String::new();
         let mut power_hint = None;
+        let mut clock_hint = None;
         let result = (|| -> Result<Outcome, String> {
             let observations = obs_store.load_all_checked().map_err(|e| e.to_string())?;
             let ledger = nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir());
@@ -9411,6 +9440,7 @@ fn measure_multiclock_undervolt_forge(
             if band.id == "performance" && !calibration.aborted && !calibration.retain_boot_flag {
                 let observations = obs_store.load_all_checked().map_err(|e| e.to_string())?;
                 power_hint = observations.last().and_then(|o| f2_power_bound_hint(o, &run_id, &gpu_key, target, mv, cap));
+                clock_hint = observations.last().and_then(|o| f2_clock_drop_hint(o, &run_id, &gpu_key, target, mv));
             }
             if calibration.aborted || !calibration.confirmed || stop.load(Ordering::SeqCst) {
                 // Only discovery can retry a neutral excursion, after persisted clean recovery.
@@ -9618,6 +9648,7 @@ fn measure_multiclock_undervolt_forge(
             &targets,
             &voltage_bins_ascending,
             power_hint,
+            clock_hint,
         ) {
             forge_aborted = true;
             prog.log
@@ -9810,16 +9841,19 @@ fn measure_multiclock_undervolt_forge(
         }
         if recorded == Outcome::Inconclusive && next.id == "performance" && next.status == "pending"
             && next.target_clock_mhz < target {
+            let held = clock_hint.map(|hint| hint.held_clock_mhz);
             prog.log.push(format!(
-                "Topo {target} MHz @ {mv} mV inconclusivo: sem prova e sem falha, o par não é aprovado nem condenado. Descida única desta run para {} MHz @ {} mV como nova hipótese de topo.",
-                next.target_clock_mhz, next.voltage_mv
+                "Topo {target} MHz @ {mv} mV inconclusivo: sem prova e sem falha, o par não é aprovado nem condenado. Descida única desta run para {} MHz @ {} mV como nova hipótese de topo{}.",
+                next.target_clock_mhz,
+                next.voltage_mv,
+                held.map(|clock| format!(" (maior bin até os {clock} MHz que a GPU sustentou nesse par)")).unwrap_or_default()
             ));
             live_event(
                 &mut prog,
                 LogTone::Attention,
                 live_phase,
                 format!("Top {target} MHz inconclusive · trying {} MHz at {} mV as the new top", next.target_clock_mhz, next.voltage_mv),
-                None,
+                held.map(|clock| format!("the GPU held {clock} MHz at {mv} mV")),
             );
         }
         prog.last_outcome = Some(
@@ -16021,6 +16055,33 @@ mod tests {
             confidence: None,
             notes: None,
         }
+    }
+
+    /// Field report 2026-10-21 (RTX 5070): 2992@1085 held p5 2910 below its 250 W cap at 74 °C.
+    #[cfg(windows)]
+    #[test]
+    fn a_confirmed_clock_drop_names_the_clock_the_gpu_held_and_nothing_else_does() {
+        use nidavellir_core::f2_observation::{F2ObsOutcome, F2_DISCOVERY_CONTRACT_VERSION};
+        let dropped = F2Observation {
+            run_id: "run".into(),
+            discovery_contract_version: Some(F2_DISCOVERY_CONTRACT_VERSION),
+            outcome: F2ObsOutcome::ClockDrop,
+            sustained_clock_mhz: Some(2910),
+            sample_count: Some(130),
+            measured_voltage_min_mv: Some(1080),
+            measured_voltage_avg_mv: Some(1083),
+            measured_voltage_max_mv: Some(1085),
+            measured_voltage_sample_count: 8,
+            ..power_obs(2992, 1085, Some(245.0), true, Some(245), "gpu")
+        };
+        let hint = |o: &F2Observation, target| f2_clock_drop_hint(o, "run", "gpu", target, 1085).map(|h| h.held_clock_mhz);
+        assert_eq!(hint(&dropped, 2992), Some(2910));
+        assert_eq!(hint(&F2Observation { thermal_throttled: true, ..dropped.clone() }, 2992), None, "throttled");
+        assert_eq!(hint(&F2Observation { outcome: F2ObsOutcome::PowerBoundClockDrop, ..dropped.clone() }, 2992), None);
+        assert_eq!(hint(&F2Observation { sample_count: Some(40), ..dropped.clone() }, 2992), None, "too short");
+        assert_eq!(hint(&F2Observation { measured_voltage_avg_mv: Some(1050), ..dropped.clone() }, 2992), None,
+            "the voltage stayed below the anchor");
+        assert_eq!(hint(&dropped, 2985), None, "another pair");
     }
 
     #[cfg(windows)]

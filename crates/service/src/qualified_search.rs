@@ -16,10 +16,12 @@
 //! 5. Hot-bin relief (user decision 2026-10-01): a pass whose critical phases held the target
 //!    mostly one bin below it keeps the descent going, but anchors the game margin one clock
 //!    bin's worth of voltage higher. It never turns a result inconclusive.
+//! 6. An unqualified top that dropped its clock at the requested voltage descends, once per run,
+//!    to the highest clock bin the GPU held there (user decision 2026-10-21).
 
 use nidavellir_core::ipc::{ForgeDiscoveryBand, ForgeDiscoverySearch};
 
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 /// Room for the distinct-profile clock retries; the time budget remains the hard cap.
 pub const STANDARD_ATTEMPTS: u32 = 30;
 pub const STANDARD_BUDGET_MS: u64 = 8 * 60 * 60 * 1_000;
@@ -86,6 +88,13 @@ pub struct Candidate {
 pub struct PowerBoundHint {
     /// Mean voltage where the GPU's own limiter settled while drawing the board cap.
     pub measured_voltage_mv: u32,
+}
+
+/// The sustained (p5) clock a confirmed ClockDrop held at the candidate's own voltage, recovered
+/// and validated by the caller. Never a pass.
+#[derive(Debug, Clone, Copy)]
+pub struct ClockDropHint {
+    pub held_clock_mhz: u32,
 }
 
 /// The limiter settled at the measured voltage at a clock BELOW the target, and board power does
@@ -346,6 +355,7 @@ pub fn record(
     clock_bins: &[u32],
     voltage_bins: &[u32],
     power_hint: Option<PowerBoundHint>,
+    clock_hint: Option<ClockDropHint>,
 ) -> Result<(), String> {
     if search.version != VERSION
         || search
@@ -368,7 +378,7 @@ pub fn record(
         _ if search.bands[index].id == "compensated" => {
             record_compensated(search, index, outcome, clock_bins, voltage_bins)
         }
-        _ => record_level(search, index, outcome, clock_bins, voltage_bins, power_hint),
+        _ => record_level(search, index, outcome, clock_bins, voltage_bins, power_hint, clock_hint),
     }
     finish_transition(search, clock_bins, voltage_bins);
     Ok(())
@@ -445,6 +455,7 @@ fn record_level(
     clock_bins: &[u32],
     voltage_bins: &[u32],
     power_hint: Option<PowerBoundHint>,
+    clock_hint: Option<ClockDropHint>,
 ) {
     let band = &search.bands[index];
     let descending = band.last_qualified_clock_mhz == Some(band.target_clock_mhz)
@@ -557,10 +568,16 @@ fn record_level(
         }
         // Missing proof closes only this band (user decision 2026-09-26); the pair is never
         // claimed. Without a qualified top the lower levels cannot start and the run ends with no
-        // profile (run f2-forge-1790544997509), so an unqualified top first descends one clock bin
-        // at the same voltage, once per run. That is a new hypothesis, not an inferred boundary.
+        // profile (run f2-forge-1790544997509), so an unqualified top first descends at the same
+        // voltage, once per run. That is a new hypothesis, not an inferred boundary. After a
+        // ClockDrop it goes to the highest bin the GPU held there, since the bins in between
+        // dropped too: an RTX 5070 held ~2910 MHz at 1085 mV under 2992, and one 7 MHz bin lower
+        // ended the run (field report 2026-10-21). Otherwise one bin.
         Outcome::Inconclusive => {
-            let lower_clock = clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max();
+            let below = |limit: u32| {
+                clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz && *clock <= limit).max()
+            };
+            let lower_clock = clock_hint.and_then(|hint| below(hint.held_clock_mhz)).or_else(|| below(u32::MAX));
             match lower_clock {
                 Some(clock) if band.id == "performance" && band.last_qualified_clock_mhz.is_none()
                     && !band.inconclusive_descent_used => {
@@ -702,7 +719,7 @@ mod tests {
     fn step(state: &mut ForgeDiscoverySearch, outcome: Outcome) -> usize {
         let index = next_band(state).unwrap();
         admit(state, index, 0, 100).unwrap();
-        record(state, index, outcome, CLOCKS, VOLTAGES, None).unwrap();
+        record(state, index, outcome, CLOCKS, VOLTAGES, None, None).unwrap();
         index
     }
     #[test]
@@ -731,7 +748,7 @@ mod tests {
     fn walk(state: &mut ForgeDiscoverySearch, clocks: &[u32], volts: &[u32], outcome: Outcome) -> (usize, u32, u32) {
         let index = next_band(state).unwrap();
         let pair = admit(state, index, 0, 100).map(|c| (index, c.target_clock_mhz, c.voltage_mv)).unwrap();
-        record(state, index, outcome, clocks, volts, None).unwrap();
+        record(state, index, outcome, clocks, volts, None, None).unwrap();
         pair
     }
     fn walk_all(state: &mut ForgeDiscoverySearch, clocks: &[u32], volts: &[u32], outcomes: &[Outcome]) -> Vec<(usize, u32, u32)> {
@@ -957,7 +974,7 @@ mod tests {
         let capped = |state: &mut ForgeDiscoverySearch, mean: u32| {
             admit(state, 0, 0, 100).unwrap();
             let hint = Some(PowerBoundHint { measured_voltage_mv: mean });
-            record(state, 0, Outcome::PowerBound, &[1905, 1920], &bins, hint).unwrap();
+            record(state, 0, Outcome::PowerBound, &[1905, 1920], &bins, hint, None).unwrap();
             state.bands[0].voltage_mv
         };
         assert_eq!(capped(&mut state, 934), 937, "one admission instead of 23");
@@ -971,8 +988,31 @@ mod tests {
         state.bands[0].integrity_floor_voltage_mv = Some(893);
         admit(&mut state, 0, 0, 100).unwrap();
         let hint = Some(PowerBoundHint { measured_voltage_mv: 880 });
-        record(&mut state, 0, Outcome::PowerBound, CLOCKS, VOLTAGES, hint).unwrap();
+        record(&mut state, 0, Outcome::PowerBound, CLOCKS, VOLTAGES, hint, None).unwrap();
         assert_eq!(state.bands[0].voltage_mv, 900);
+    }
+    #[test]
+    fn a_top_that_dropped_its_clock_descends_to_the_bin_it_held_once() {
+        // Field report 2026-10-21, RTX 5070 at 74 °C: 2992@1085 held p5 2910, and one 7 MHz bin
+        // lower (2985) dropped the same way.
+        let clocks = [2850, 2865, 2880, 2895, 2902, 2910, 2917, 2932, 2947, 2962, 2977, 2985, 2992];
+        let volts = [1070, 1075, 1080, 1085, 1090, 1095];
+        let seed = |id| Seed { id, target_clock_mhz: 2992, voltage_mv: 1085, clock_ceiling_mhz: 2992 };
+        let fresh = || new(&[seed("performance"), seed("balanced"), seed("efficiency")], 30, 10_000);
+        let dropped = |state: &mut ForgeDiscoverySearch, held: Option<u32>| {
+            admit(state, 0, 0, 100).unwrap();
+            let hint = held.map(|held_clock_mhz| ClockDropHint { held_clock_mhz });
+            record(state, 0, Outcome::Inconclusive, &clocks, &volts, None, hint).unwrap();
+            let top = &state.bands[0];
+            (top.target_clock_mhz, top.clock_ceiling_mhz, top.voltage_mv)
+        };
+        let mut state = fresh();
+        assert_eq!(dropped(&mut state, Some(2910)), (2910, 2910, 1085));
+        assert_eq!(state.bands[0].last_qualified_clock_mhz, None, "a new hypothesis, never a pass");
+        dropped(&mut state, Some(2830));
+        assert_eq!(state.stop_reason.as_deref(), Some("qualified_top_unavailable"), "once per run");
+        assert_eq!(dropped(&mut fresh(), None).0, 2985, "without a measurement: one bin");
+        assert_eq!(dropped(&mut fresh(), Some(2800)).0, 2985, "held below every bin: one bin");
     }
     #[test]
     fn top_down_power_integrity_bracket_descends_without_retesting_failed_top() {
