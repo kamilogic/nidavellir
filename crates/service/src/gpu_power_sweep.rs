@@ -3022,6 +3022,11 @@ struct Measured {
     qualification_coverage: Option<F2QualificationCoverage>,
     evidence_provenance: Option<F2EvidenceProvenance>,
     prehang_stall_detected: bool,
+    /// Every NVML clock-limit reason in the retained samples (raw bitmask).
+    throttle_bits_seen: u64,
+    /// The VF point at the voltage the GPU ran, read once under load past mid-dwell, as
+    /// (base MHz, base mV, effective MHz, effective mV): the GPU's own curve while hot.
+    vf_point_under_load: Option<(u32, u32, u32, u32)>,
 }
 
 impl Measured {
@@ -3059,6 +3064,8 @@ impl Measured {
             qualification_coverage: None,
             evidence_provenance: None,
             prehang_stall_detected: false,
+            throttle_bits_seen: 0,
+            vf_point_under_load: None,
         }
     }
 }
@@ -4242,6 +4249,11 @@ fn load_and_measure_for(
     .unwrap_or_else(|| Measured::degenerate(StabilityResult::Crash, 0))
 }
 
+/// The stock base VF table, static per GPU, read once per process before any load starts: its ~255
+/// NVAPI calls must never open a gap in a dwell's telemetry.
+#[cfg(windows)]
+static VF_BASE_CURVE: OnceLock<Vec<(usize, u32, u32)>> = OnceLock::new();
+
 #[cfg(windows)]
 fn load_and_measure_for_with_phase_hook(
     ms: u64,
@@ -4252,6 +4264,7 @@ fn load_and_measure_for_with_phase_hook(
 ) -> Measured {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicU32, AtomicU8};
+    VF_BASE_CURVE.get_or_init(nidavellir_gpu_nvapi::read_vf_base_curve_modern);
     // FRESH wgpu context per measurement. The FurMark-class render reliably runs
     // ONCE on a fresh device but TDRs (device lost, unrecoverable) if a SECOND
     // heavy render is issued on the SAME GpuCtx — so we create + drop a context per
@@ -4329,6 +4342,9 @@ fn load_and_measure_for_with_phase_hook(
         phase_state.clone(),
         prehang_stall.clone(),
     );
+    let throttle_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let vf_point = Arc::new(OnceLock::new());
+    let (throttle_for_sampler, vf_point_for_sampler) = (throttle_seen.clone(), vf_point.clone());
     let t0 = std::time::Instant::now();
     let sampler = std::thread::spawn(move || {
         // Resolve the anchor once. At most five diagnostic snapshots per lane, after timed
@@ -4394,6 +4410,7 @@ fn load_and_measure_for_with_phase_hook(
                 // Discovery discards ramp-up for steady-state power. Qualification keeps the
                 // opening/transition samples because the phase changes are the workload.
                 if retain_dwell_sample(sample_started_ms, power_characterization) {
+                    throttle_for_sampler.fetch_or(r.throttle_bits.unwrap_or(0), Ordering::SeqCst);
                     if let Ok(mut v) = smp.lock() {
                         v.push((
                             c,
@@ -4438,6 +4455,15 @@ fn load_and_measure_for_with_phase_hook(
                         if let Ok(mut g) = vsmp.lock() {
                             g.push(mv);
                         }
+                    }
+                    // Once per dwell, past its middle: the GPU's own (hot) curve at the voltage it
+                    // ran. An RTX 5070 ran ~50 MHz under every target (field report 2026-10-21).
+                    if voltage_started_ms >= u128::from(ms / 2) && (VOLT_SANE_MIN_MV..=VOLT_SANE_MAX_MV).contains(&mv) {
+                        vf_point_for_sampler.get_or_init(|| {
+                            VF_BASE_CURVE.get()
+                                .and_then(|curve| nidavellir_gpu_nvapi::nearest_vf_bin_at_or_above(curve, mv))
+                                .and_then(|(index, _)| nidavellir_gpu_nvapi::read_vf_point_snapshot(index))
+                        });
                     }
                 }
             }
@@ -4688,6 +4714,8 @@ fn load_and_measure_for_with_phase_hook(
         qualification_coverage,
         evidence_provenance,
         prehang_stall_detected,
+        throttle_bits_seen: throttle_seen.load(Ordering::SeqCst),
+        vf_point_under_load: vf_point.get().copied().flatten(),
     }
 }
 
@@ -4759,6 +4787,13 @@ fn gpu_work_with<T: Send + 'static>(
         Ok(value) => Some(value),
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+/// Every stock point as mV:MHz, once per run, to set a measured voltage against the clock its
+/// curve gives (field report 2026-10-21).
+fn vf_curve_points(curve: &[(usize, u32, u32)]) -> String {
+    let points: Vec<String> = curve.iter().map(|&(_, mv, mhz)| format!("{mv}:{mhz}")).collect();
+    format!("VF curve points (mV:MHz): {}", points.join(" "))
 }
 
 /// One core.log line per run: the curve the search walks differs by GPU family (point count,
@@ -4864,13 +4899,18 @@ fn run_f2_stock_preheat(
             (Some(start), Some(end)) => format!("{start:.1}→{end:.1} °C"),
             _ => "sensor indisponível".into(),
         };
+        // The GPU's own drop under load at stock: its hot curve point against the clock it ran.
         prog.log.push(format!(
-            "Preheat stock {}/{}: p5 {} MHz, temperatura {}, {} amostras{}{}.",
+            "Preheat stock {}/{}: p5 {} MHz, temperatura {}, {} amostras, tensão {}..{} mV, limites de clock {}, ponto VF sob carga [{}]{}{}.",
             index + 1,
             F2_PREHEAT_MAX_WINDOWS,
             window.p5_clock_mhz,
             temperature,
             window.sample_count,
+            measured.volt_min_mv.unwrap_or(0),
+            measured.volt_max_mv.unwrap_or(0),
+            nidavellir_core::nvml_gpu::clock_limit_names(measured.throttle_bits_seen),
+            vf_point_text(measured.vf_point_under_load),
             if window.thermal_throttled {
                 ", thermal throttle"
             } else {
@@ -7184,6 +7224,8 @@ pub(crate) struct SingleDwell {
     pub qualification_coverage: Option<F2QualificationCoverage>,
     pub evidence_provenance: Option<F2EvidenceProvenance>,
     pub prehang_stall_detected: bool,
+    pub throttle_bits_seen: u64,
+    pub vf_point_under_load: Option<(u32, u32, u32, u32)>,
 }
 
 /// Run ONE game-power load dwell via the validated [`load_and_measure`] path (fresh wgpu context,
@@ -7340,7 +7382,19 @@ fn single_dwell_from_measured(m: Measured) -> SingleDwell {
         qualification_coverage: m.qualification_coverage,
         evidence_provenance: m.evidence_provenance,
         prehang_stall_detected: m.prehang_stall_detected,
+        throttle_bits_seen: m.throttle_bits_seen,
+        vf_point_under_load: m.vf_point_under_load,
     }
+}
+
+/// "base 2977 MHz @ 1080 mV, effective 2925 MHz @ 1080 mV" for core.log; "-" when unread.
+pub(crate) fn vf_point_text(point: Option<(u32, u32, u32, u32)>) -> String {
+    point.map_or_else(
+        || "-".into(),
+        |(base_mhz, base_mv, effective_mhz, effective_mv)| {
+            format!("base {base_mhz} MHz @ {base_mv} mV, effective {effective_mhz} MHz @ {effective_mv} mV")
+        },
+    )
 }
 
 /// A no-hardware "unverified" probe result: tells `build_frontier` to stop this clock's
@@ -9036,6 +9090,7 @@ fn measure_multiclock_undervolt_forge(
         return;
     };
     info!("{}", vf_curve_summary(&f2_inputs.sane_base_curve, seed.stock_boost_max_mhz));
+    info!("{}", vf_curve_points(&f2_inputs.sane_base_curve));
 
     let qualification_needs_goldens =
         mode_policy.qualification_passes > 0 || mode_policy.final_gate_passes > 0;
@@ -12473,6 +12528,12 @@ mod tests {
             vf_curve_summary(&[], 0),
             "VF curve: 0 points, 0-0 mV (smallest step 0 mV), 0-0 MHz (smallest step 0 MHz), stock boost 0 MHz"
         );
+        assert_eq!(vf_curve_points(&curve[..2]), "VF curve points (mV:MHz): 700:1500 706:1515");
+        assert_eq!(
+            vf_point_text(Some((2977, 1080, 2925, 1080))),
+            "base 2977 MHz @ 1080 mV, effective 2925 MHz @ 1080 mV"
+        );
+        assert_eq!(vf_point_text(None), "-");
     }
 
     /// 2026-10-17 field report (RTX 5070): GPU work left blocked by a driver crash is left behind
@@ -12986,6 +13047,8 @@ mod tests {
             qualification_coverage: None,
             evidence_provenance: None,
             prehang_stall_detected: false,
+            throttle_bits_seen: 0,
+            vf_point_under_load: None,
         }
     }
 

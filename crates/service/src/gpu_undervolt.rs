@@ -2930,7 +2930,8 @@ impl F2Ops for RealF2Ops<'_> {
         info!(
             "undervolt-probe dwell: {outcome:?} reason={inconclusive_reason:?} avg_clock={} MHz p5={} MHz p95={} MHz max={} MHz \
              power_avg={:.0} W power_p99={:?} W power_peak={:.0} W max_temp={:?} C \
-             voltage={}..{} mV ({} samples) thermal_throttled={} silent_error={}",
+             voltage={}..{} mV ({} samples) thermal_throttled={} silent_error={} \
+             clock_limits={} vf_point_under_load=[{}]",
             s.avg_clock_mhz,
             s.p5_clock_mhz,
             s.p95_clock_mhz,
@@ -2943,7 +2944,9 @@ impl F2Ops for RealF2Ops<'_> {
             s.volt_max_mv.unwrap_or(0),
             s.volt_sample_count,
             s.thermal_throttled,
-            s.silent_error
+            s.silent_error,
+            nidavellir_core::nvml_gpu::clock_limit_names(s.throttle_bits_seen),
+            crate::gpu_power_sweep::vf_point_text(s.vf_point_under_load)
         );
         F2DwellResult {
             outcome,
@@ -5589,6 +5592,8 @@ mod tests {
             qualification_coverage: Some(pass_coverage()),
             evidence_provenance: None,
             prehang_stall_detected: false,
+            throttle_bits_seen: 0,
+            vf_point_under_load: None,
         };
         let rare_excursion = &mut base;
         rare_excursion.thermal_throttled = false;
@@ -6280,6 +6285,8 @@ mod tests {
             qualification_coverage: Some(pass_coverage()),
             evidence_provenance: None,
             prehang_stall_detected: false,
+            throttle_bits_seen: 0,
+            vf_point_under_load: None,
         };
         stable_low_p5.max_power_w = 200.0;
         stable_low_p5.max_clock_mhz = 1815;

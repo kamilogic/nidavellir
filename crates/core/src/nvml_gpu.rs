@@ -70,6 +70,19 @@ impl NvmlSample {
     }
 }
 
+/// NVML's clock-limit reasons in a raw bitmask by name, "none" when empty; unknown bits stay hex.
+pub fn clock_limit_names(bits: u64) -> String {
+    use nvml_wrapper::bitmasks::device::ThrottleReasons;
+    let known = ThrottleReasons::from_bits_truncate(bits);
+    let mut names: Vec<String> =
+        known.iter_names().filter(|(_, flag)| !flag.is_empty()).map(|(name, _)| name.to_owned()).collect();
+    let unknown = bits & !known.bits();
+    if unknown != 0 {
+        names.push(format!("{unknown:#x}"));
+    }
+    if names.is_empty() { "none".into() } else { names.join("|") }
+}
+
 /// A persistent NVML handle for high-rate polling. `Nvml::init()` is the expensive call, so it is
 /// paid ONCE here; each [`Self::sample`] only does cheap per-field reads. Windows game-trace tool.
 pub struct NvmlSampler {
@@ -308,5 +321,14 @@ mod tests {
         // One unsupported field is normal; the session stays.
         assert!(!session_looks_broken(&[reading(Some(45.0), None)]));
         assert!(!session_looks_broken(&[reading(None, Some(3.0)), reading(None, None)]));
+    }
+
+    #[test]
+    fn clock_limit_reasons_read_by_name() {
+        use nvml_wrapper::bitmasks::device::ThrottleReasons;
+        assert_eq!(clock_limit_names(0), "none");
+        let bits = (ThrottleReasons::SW_POWER_CAP | ThrottleReasons::SW_THERMAL_SLOWDOWN).bits();
+        assert_eq!(clock_limit_names(bits), "SW_POWER_CAP|SW_THERMAL_SLOWDOWN");
+        assert_eq!(clock_limit_names(1 << 40), "0x10000000000", "a reason newer than this NVML wrapper");
     }
 }
