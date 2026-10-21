@@ -446,6 +446,13 @@
         tone: "danger",
       };
     }
+    if (key.includes("voltagelimited")) {
+      return {
+        label: "Inconclusive · voltage limit",
+        detail: "The GPU stayed under the requested voltage. The next try keeps the clock at the voltage it settled at.",
+        tone: "caution",
+      };
+    }
     if (key.includes("powerbound")) {
       return {
         label: "Inconclusive · power limit",

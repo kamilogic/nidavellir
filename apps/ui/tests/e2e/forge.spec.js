@@ -458,6 +458,9 @@ test("Qualification: power limits and driver failures remain distinct from a ski
   });
   const lastDecision = page.getByRole("region", { name: "Forging your GPU" }).locator(".task-card.last");
   await expect(lastDecision).toContainText("Inconclusive · power limit");
+  await page.evaluate(() => { window.__forgeTest.power.last_outcome = "VoltageLimitedClockDrop"; });
+  await expect(lastDecision).toContainText("Inconclusive · voltage limit");
+  await expect(lastDecision).not.toContainText("low residency");
   await page.evaluate(() => { window.__forgeTest.power.last_outcome = "Inconclusive"; });
   await expect(lastDecision).toContainText("Evidence was insufficient");
   await expect(lastDecision).not.toContainText("low residency");

@@ -8563,13 +8563,49 @@ fn f2_clock_drop_hint(
         || !o.reset_to_stock_attempted || !o.reset_to_stock_ok || !o.boot_flag_cleared
         || o.thermal_throttled || o.silent_error || o.unstable || o.device_lost || o.tdr_or_crash || o.blacklisted
         || o.sample_count.is_none_or(|count| count < 100)
-        // Reached: the mean voltage sits within one bin (5–6.25 mV) of the anchor.
         || o.measured_voltage_sample_count < 3
-        || o.measured_voltage_avg_mv.is_none_or(|mean| mean + 7 < voltage)
+        || o.measured_voltage_avg_mv.is_none_or(|mean| !f2_reached_anchor(mean, voltage))
     { return None; }
     let held = o.sustained_clock_mhz.filter(|clock| *clock > 0 && *clock < target)?;
     let stock = stock_curve.iter().find(|&&(_, mv, _)| mv == voltage).map(|&(_, _, mhz)| mhz)?;
     Some(crate::qualified_search::ClockDropHint { held_clock_mhz: held, stock_clock_mhz: stock })
+}
+
+/// The GPU sat at its anchor: the mean measured voltage is within 2 mV of it. A limiter that kept
+/// it one 5 mV point lower for much of a dwell pulls the mean further down (RTX 5070, 2026-10-21);
+/// a pinned anchor reads exactly (RTX 30: 937/937/937 mV).
+fn f2_reached_anchor(mean_mv: u32, anchor_mv: u32) -> bool {
+    mean_mv + 2 >= anchor_mv
+}
+
+/// A confirmed ClockDrop at this run's exact discovery pair whose GPU sat under the anchor voltage
+/// below the power cap: the voltage it settled at, for the same voltage descent as the power limit.
+/// Throttling or any fault makes it no hint.
+#[cfg(windows)]
+fn f2_voltage_limited_hint(
+    observation: &nidavellir_core::f2_observation::F2Observation,
+    run_id: &str,
+    gpu_key: &str,
+    target: u32,
+    voltage: u32,
+) -> Option<crate::qualified_search::PowerBoundHint> {
+    use nidavellir_core::f2_observation::{self as obs, F2EvidenceKind, F2ObsOutcome};
+    let o = observation;
+    if o.run_id != run_id || o.gpu_key.as_deref() != Some(gpu_key)
+        || o.target_mhz != target || o.anchor_mv != voltage
+        || o.evidence_kind != F2EvidenceKind::Discovery
+        || o.discovery_contract_version != Some(obs::F2_DISCOVERY_CONTRACT_VERSION)
+        || o.verifier_result != obs::F2ObsVerifier::RaiseVerified || o.outcome != F2ObsOutcome::ClockDrop
+        || !o.reset_to_stock_attempted || !o.reset_to_stock_ok || !o.boot_flag_cleared
+        || o.thermal_throttled || o.silent_error || o.unstable || o.device_lost || o.tdr_or_crash || o.blacklisted
+        || o.sample_count.is_none_or(|count| count < 100)
+        || o.measured_voltage_sample_count < 3
+    { return None; }
+    let (min, mean, max) = (o.measured_voltage_min_mv?, o.measured_voltage_avg_mv?, o.measured_voltage_max_mv?);
+    if min < 500 || min > mean || mean > max || max > voltage || f2_reached_anchor(mean, voltage) {
+        return None;
+    }
+    Some(crate::qualified_search::PowerBoundHint { measured_voltage_mv: mean })
 }
 
 #[cfg(windows)]
@@ -9586,6 +9622,17 @@ fn measure_multiclock_undervolt_forge(
                 failure_reason = "PowerBoundClockDrop".into();
                 return Ok(Outcome::PowerBound);
             }
+            // A GPU limiter that NVML does not report held the GPU a voltage point under the
+            // anchor, below the power cap: an RTX 5070 sat at 1090 mV 87% of a 1095 mV dwell at
+            // 230 of 250 W (field report 2026-10-21). As with the power limit, the same target is
+            // tried next at the voltage the GPU settled at.
+            if band.id == "performance" {
+                if let Some(hint) = f2_voltage_limited_hint(latest, &run_id, &gpu_key, target, mv) {
+                    power_hint = Some(hint);
+                    failure_reason = "VoltageLimitedClockDrop".into();
+                    return Ok(Outcome::PowerBound);
+                }
+            }
             if latest.outcome != nidavellir_core::f2_observation::F2ObsOutcome::Validated {
                 return Ok(Outcome::Inconclusive);
             }
@@ -9753,12 +9800,17 @@ fn measure_multiclock_undervolt_forge(
                 .push(format!("Transição de busca recusada: {error}"));
             live_event(&mut prog, LogTone::Fail, "Search", "The search could not record this result", Some(error.to_string()));
         }
+        let voltage_limited = failure_reason == "VoltageLimitedClockDrop";
         if let Some(hint) = power_hint.filter(|_| recorded == Outcome::PowerBound) {
             let next = &discovery.bands[band_index];
             if next.status == "pending" && next.target_clock_mhz == target {
                 prog.log.push(format!(
-                    "Preparação guiada: {} mV solicitados, {} mV médios medidos sob power limit; próximo candidato {} MHz @ {} mV (menor bin acima do equilíbrio medido). Estimativa não aprova estabilidade.",
-                    mv, hint.measured_voltage_mv, target, next.voltage_mv
+                    "Preparação guiada: {} mV solicitados, {} mV médios medidos sob {}; próximo candidato {} MHz @ {} mV (menor bin acima do equilíbrio medido). Estimativa não aprova estabilidade.",
+                    mv,
+                    hint.measured_voltage_mv,
+                    if voltage_limited { "o limite de tensão da própria GPU" } else { "power limit" },
+                    target,
+                    next.voltage_mv
                 ));
             }
         }
@@ -9770,6 +9822,10 @@ fn measure_multiclock_undervolt_forge(
                     "qualified, mostly at the hot clock bin · the game margin is set {} mV higher",
                     crate::qualified_search::HOT_BIN_RELIEF_MV
                 ),
+            ),
+            Outcome::PowerBound if voltage_limited => (
+                LogTone::Attention,
+                "stayed under the requested voltage (the GPU's own limit), not at the clock".to_string(),
             ),
             Outcome::PowerBound => (LogTone::Attention, "held the power limit, not the clock".to_string()),
             Outcome::IntegrityError => (LogTone::Fail, "failed: integrity error".to_string()),
@@ -9957,6 +10013,7 @@ fn measure_multiclock_undervolt_forge(
         prog.last_outcome = Some(
             match outcome {
                 Outcome::Qualified | Outcome::QualifiedHotBin => "CandidateQualified",
+                Outcome::PowerBound if voltage_limited => "VoltageLimitedClockDrop",
                 Outcome::PowerBound => "PowerBoundClockDrop",
                 Outcome::IntegrityError => "BandClosedIntegrityError",
                 Outcome::DriverFailure => "CandidateCrash",
@@ -16192,7 +16249,40 @@ mod tests {
         assert_eq!(hint(&F2Observation { sample_count: Some(40), ..dropped.clone() }, 2992), None, "too short");
         assert_eq!(hint(&F2Observation { measured_voltage_avg_mv: Some(1050), ..dropped.clone() }, 2992), None,
             "the voltage stayed below the anchor");
+        assert_eq!(hint(&F2Observation { measured_voltage_avg_mv: Some(1082), ..dropped.clone() }, 2992), None,
+            "a mean 3 mV under the anchor is a voltage limit, not a clock drop at the anchor");
         assert_eq!(hint(&dropped, 2985), None, "another pair");
+    }
+
+    /// Field report 2026-10-21 (RTX 5070, 0.8.8): under a 2992@1095 anchor the GPU sat at 1090 mV
+    /// 87% of the dwell (1090/1090/1095 mV) at 231 of 250 W, NVML silent.
+    #[cfg(windows)]
+    #[test]
+    fn a_gpu_held_under_its_anchor_descends_the_voltage_and_a_pinned_one_does_not() {
+        use nidavellir_core::f2_observation::{F2ObsOutcome, F2_DISCOVERY_CONTRACT_VERSION};
+        let limited = F2Observation {
+            run_id: "run".into(),
+            discovery_contract_version: Some(F2_DISCOVERY_CONTRACT_VERSION),
+            outcome: F2ObsOutcome::ClockDrop,
+            sustained_clock_mhz: Some(2850),
+            sample_count: Some(130),
+            measured_voltage_min_mv: Some(1090),
+            measured_voltage_avg_mv: Some(1090),
+            measured_voltage_max_mv: Some(1095),
+            measured_voltage_sample_count: 8,
+            ..power_obs(2992, 1095, Some(231.0), true, Some(231), "gpu")
+        };
+        let hint = |o: &F2Observation| f2_voltage_limited_hint(o, "run", "gpu", 2992, 1095).map(|h| h.measured_voltage_mv);
+        assert_eq!(hint(&limited), Some(1090));
+        let pinned = F2Observation {
+            measured_voltage_min_mv: Some(1095), measured_voltage_avg_mv: Some(1095), ..limited.clone()
+        };
+        assert_eq!(hint(&pinned), None, "at the anchor it is a clock drop there, as on the RTX 30 (937/937/937)");
+        assert_eq!(hint(&F2Observation { thermal_throttled: true, ..limited.clone() }), None, "throttled");
+        assert_eq!(hint(&F2Observation { outcome: F2ObsOutcome::PowerBoundClockDrop, ..limited.clone() }), None,
+            "the power limit has its own hint");
+        assert_eq!(hint(&F2Observation { measured_voltage_sample_count: 2, ..limited.clone() }), None, "too few readings");
+        assert!(f2_reached_anchor(937, 937) && f2_reached_anchor(1083, 1085) && !f2_reached_anchor(1090, 1095));
     }
 
     #[cfg(windows)]
