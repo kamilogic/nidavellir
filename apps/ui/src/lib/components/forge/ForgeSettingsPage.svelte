@@ -282,7 +282,7 @@
         <Send size={23} strokeWidth={1.6} />
         <div>
           <h2 id="reports-setting-title">Error reports</h2>
-          <p>When a Forge fails or finishes, a report helps fix problems for everyone. It holds the GPU model, the driver and Windows versions and the run's logs, never your name, your PC's name or your files.</p>
+          <p>When a Forge fails, finishes or is paused, a report helps fix problems for everyone. It holds the GPU model, the driver and Windows versions and the run's logs, never your name, your PC's name or your files.</p>
         </div>
       </div>
 

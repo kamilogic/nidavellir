@@ -54,22 +54,29 @@ fn sent_dir() -> PathBuf {
 }
 
 /// After a Forge worker exits: a report when the run failed or needs a person, a summary when it
-/// finished. Expected stops (the user's pause, a staircase-edge crash) send nothing.
+/// finished or the user paused it. A staircase-edge crash sends nothing: the final summary has it.
 pub(crate) fn after_run(prog: &PowerSweepProgress, panicked: bool, expected_stop: bool) {
-    let (kind, class) = match (panicked, prog.phase.as_str()) {
+    let Some((kind, class)) = run_report(prog, panicked, expected_stop) else { return };
+    let message = prog.note.clone().unwrap_or_else(|| format!("Forge ended in phase {}", prog.phase));
+    queue(kind, class, message, Some(prog.clone()));
+}
+
+fn run_report(prog: &PowerSweepProgress, panicked: bool, expected_stop: bool) -> Option<(&'static str, &'static str)> {
+    Some(match (panicked, prog.phase.as_str()) {
         (true, _) => ("error", "worker_panic"),
         (false, "finished") => ("summary", "forge_complete"),
         (false, "provisional") => ("summary", "forge_preview"),
         (false, "paused") if prog.stock_crash_paused => ("error", "stock_crash"),
+        // What a run the user paused learned, which otherwise never leaves the PC (2026-10-21: an
+        // RTX 40 run stopped after 26 minutes sent nothing).
+        (false, "paused") => ("summary", "forge_paused"),
         (false, "interrupted") if !expected_stop => ("error", "interrupted"),
         (false, "incomplete") if prog.stock_crashes > 1 => ("error", "stock_crash_repeat"),
         (false, "incomplete") => ("error", "incomplete"),
         (false, "needs_attention") => ("error", "needs_attention"),
         (false, "field_rejected") => ("error", "field_rejected"),
-        _ => return,
-    };
-    let message = prog.note.clone().unwrap_or_else(|| format!("Forge ended in phase {}", prog.phase));
-    queue(kind, class, message, Some(prog.clone()));
+        _ => return None,
+    })
 }
 
 /// The Sentinel contained a driver crash or a failed GPU check while a forged profile was applied.
@@ -690,6 +697,18 @@ mod tests {
         assert!(valid_id("1791962702636-error-stock_crash.json"));
         assert!(!valid_id(r"..\..\Windows\win.ini") && !valid_id("a/b.json") && !valid_id("x.txt"));
         assert_eq!(head_and_tail("abcdef", 4), "ab\n…\nef");
+    }
+
+    #[test]
+    fn a_paused_run_sends_a_summary_and_a_stock_crash_pause_stays_an_error() {
+        let paused = PowerSweepProgress { phase: "paused".into(), ..Default::default() };
+        assert_eq!(run_report(&paused, false, true), Some(("summary", "forge_paused")));
+        assert_eq!(run_report(&paused, false, false), Some(("summary", "forge_paused")));
+        let crashed = PowerSweepProgress { stock_crash_paused: true, ..paused.clone() };
+        assert_eq!(run_report(&crashed, false, false), Some(("error", "stock_crash")));
+        let edge = PowerSweepProgress { phase: "interrupted".into(), ..Default::default() };
+        assert_eq!(run_report(&edge, false, true), None, "a staircase-edge crash sends nothing");
+        assert_eq!(run_report(&edge, true, true), Some(("error", "worker_panic")));
     }
 
     #[test]

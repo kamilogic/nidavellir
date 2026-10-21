@@ -114,7 +114,7 @@
     <div class="reports" role="group" aria-labelledby="preforge-reports-label">
       <span class="label" id="preforge-reports-label">Error reports</span>
       <p class="mode-note">
-        When a Forge fails or finishes, Nidavellir can send a report so problems get fixed for everyone: the GPU
+        When a Forge fails, finishes or is paused, Nidavellir can send a report so problems get fixed for everyone: the GPU
         model, the driver and Windows versions, and the run's logs. Never your name, your PC's name or your files.
         Reports go to the developer's private GitHub, sent in the background, even with the app closed. You can
         change this in Settings.

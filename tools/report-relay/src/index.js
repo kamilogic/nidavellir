@@ -74,7 +74,7 @@ async function signatureOf(report) {
 }
 
 function titleOf(report) {
-  const what = report.kind === "summary" ? "Forge finished" : report.class.replaceAll("_", " ");
+  const what = report.class === "forge_complete" ? "Forge finished" : report.class.replaceAll("_", " ");
   return `[${report.gpu_family}] ${what}: ${String(report.message ?? "").slice(0, 80)}`.slice(0, 200);
 }
 
