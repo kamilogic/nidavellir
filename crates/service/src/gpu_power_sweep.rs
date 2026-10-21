@@ -2595,7 +2595,7 @@ pub(crate) fn forge_log_text(prog: &PowerSweepProgress) -> Result<ForgeLogText, 
         observations.len()
     ));
     out.push_str(
-        "timestamp | kind | target@anchor | outcome | avg/p5/p95 MHz | avg/p99/peak W | temp | pattern/verdict/fail | flags | reason\n",
+        "timestamp | kind | target@anchor | outcome | avg/p5/p95 MHz | min/avg/max mV | avg/p99/peak W | temp | pattern/verdict/fail | flags | reason\n",
     );
     let s = |v: Option<u32>| v.map(|x| x.to_string()).unwrap_or_else(|| "-".into());
     for o in &observations {
@@ -2627,7 +2627,7 @@ pub(crate) fn forge_log_text(prog: &PowerSweepProgress) -> Result<ForgeLogText, 
             flags.push("blacklisted");
         }
         out.push_str(&format!(
-            "{} | {:?} | {}@{} | {:?} | {}/{}/{} | {}/{}/{} | {} | {}/{}/{} | {} | {}\n",
+            "{} | {:?} | {}@{} | {:?} | {}/{}/{} | {}/{}/{} | {}/{}/{} | {} | {}/{}/{} | {} | {}\n",
             o.timestamp,
             o.evidence_kind,
             o.target_mhz,
@@ -2636,6 +2636,10 @@ pub(crate) fn forge_log_text(prog: &PowerSweepProgress) -> Result<ForgeLogText, 
             s(o.avg_clock_mhz),
             s(o.sustained_clock_mhz),
             s(o.sustained_upper_clock_mhz),
+            // Where the GPU's voltage really sat: under a limiter it stays below the anchor.
+            s(o.measured_voltage_min_mv),
+            s(o.measured_voltage_avg_mv),
+            s(o.measured_voltage_max_mv),
             o.watts.map(|w| w.to_string()).unwrap_or_else(|| "-".into()),
             o.power_p99_w
                 .map(|w| format!("{w:.0}"))
