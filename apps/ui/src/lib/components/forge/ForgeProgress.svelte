@@ -380,6 +380,7 @@
       published: "Its publication pair, a game margin above the lowest passing voltage, passed its own matrix.",
       publication_unproven: "Its publication pair could not be proven, so this level publishes no profile.",
       no_distinct_profile: "Even two clock bins lower, this level never passed below the voltage it started at, so it publishes no profile of its own.",
+      publication_at_stock: "Its lowest passing voltage plus the game margin is no lower than what stock already uses at this clock, so this level publishes no profile.",
       invalid_search_plan: "The candidate search plan is incomplete or invalid. A new compatible run is required.",
       incompatible_search_version: "This saved search uses a different discovery version. Start a new run.",
     };

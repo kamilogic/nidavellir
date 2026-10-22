@@ -18,10 +18,15 @@
 //!    bin's worth of voltage higher. It never turns a result inconclusive.
 //! 6. An unqualified top that dropped its clock at the requested voltage descends, once per run,
 //!    to the highest clock bin the GPU held there (user decision 2026-10-21).
+//! 7. Every planned pair stays below the stock curve (user decision 2026-10-22). A lower clock
+//!    at the voltage passed above can sit at or over the stock clock there; then the stock curve
+//!    already runs it with less voltage, and the plan refuses it. The compensated top publishes at
+//!    the highest voltage that is power-free AND still below stock at its clock, and a lower level
+//!    starts no higher than that.
 
 use nidavellir_core::ipc::{ForgeDiscoveryBand, ForgeDiscoverySearch};
 
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 /// Room for the distinct-profile clock retries; the time budget remains the hard cap.
 pub const STANDARD_ATTEMPTS: u32 = 30;
 pub const STANDARD_BUDGET_MS: u64 = 8 * 60 * 60 * 1_000;
@@ -60,6 +65,33 @@ fn bin_at_or_above(bins: &[u32], mv: u32) -> Option<u32> {
 
 fn bin_at_or_below(bins: &[u32], mv: u32) -> Option<u32> {
     bins.iter().copied().filter(|bin| *bin <= mv).max()
+}
+
+/// The F2 plan raises its anchor, so the stock clock at the pair's voltage must stay below the
+/// pair's clock. Field report 2026-10-22: an RTX 4070 SUPER reached its curve's 1100 mV limit at
+/// ~200 of 220 W, and v12 published the compensated top 2685@1100 over a 2715 MHz stock point.
+fn undervolts(stock: &[(usize, u32, u32)], clock: u32, mv: u32) -> bool {
+    crate::gpu_undervolt::select_exact_apply_anchor_bin(stock, clock, mv).is_some()
+}
+
+/// The highest voltage bin at or below `limit` that still undervolts `clock`.
+fn undervolt_bin(voltage_bins: &[u32], stock: &[(usize, u32, u32)], clock: u32, limit: u32) -> Option<u32> {
+    voltage_bins.iter().copied().filter(|mv| *mv <= limit && undervolts(stock, clock, *mv)).max()
+}
+
+/// The compensated top's margin pair: the game margin below its publication voltage, the highest
+/// one that is power-free and still undervolts the clock. It follows the clock down.
+fn compensated_margin(voltage_bins: &[u32], stock: &[(usize, u32, u32)], power_free: u32, clock: u32) -> Option<u32> {
+    let publication = undervolt_bin(voltage_bins, stock, clock, power_free)?;
+    bin_at_or_below(voltage_bins, publication.saturating_sub(GAME_MARGIN_MV))
+}
+
+/// A lower level whose start moved under the voltage the level above passed, to stay below the
+/// stock curve: that first pair is a new test, not a dominated one, and it hands no pass down.
+pub fn moved_below_stock(band: &ForgeDiscoveryBand) -> bool {
+    band.clock_retries_used == 0
+        && band.last_qualified_clock_mhz.is_none()
+        && band.level_start_voltage_mv.is_some_and(|start| band.voltage_mv < start)
 }
 
 /// The `n`-th value strictly below `from` (n >= 1), or the lowest one when fewer exist.
@@ -269,8 +301,14 @@ pub fn close_all(search: &mut ForgeDiscoverySearch, reason: &str) {
 /// Starts the next level once the one above closes. The compensated top follows the top; the
 /// -5%/-10% levels follow the compensated top, relative to its clock, and start at the lowest
 /// voltage the level above passed. That start is dominated (lower clock, same voltage), so it must
-/// pass; it still gets its own matrix. Nothing here is a predeclared profile result.
-fn start_next_level(search: &mut ForgeDiscoverySearch, clock_bins: &[u32], voltage_bins: &[u32]) {
+/// pass; it still gets its own matrix. When that voltage would not undervolt the lower clock, the
+/// level starts at the highest one that does. Nothing here is a predeclared profile result.
+fn start_next_level(
+    search: &mut ForgeDiscoverySearch,
+    clock_bins: &[u32],
+    voltage_bins: &[u32],
+    stock: &[(usize, u32, u32)],
+) {
     let Some(mut previous) = search.bands.iter().position(|b| b.id == "performance") else { return };
     let top = &search.bands[previous];
     if top.status != "closed" {
@@ -285,12 +323,12 @@ fn start_next_level(search: &mut ForgeDiscoverySearch, clock_bins: &[u32], volta
     if let Some(comp) = search.bands.iter().position(|b| b.id == "compensated") {
         if search.bands[comp].status == "waiting_for_top" {
             let publication = bin_at_or_above(voltage_bins, top_lowest + top_relief + GAME_MARGIN_MV);
-            let margin = bin_at_or_below(voltage_bins, power_free.saturating_sub(GAME_MARGIN_MV));
             // Predict how far the clock must drop for the margin to fit under the power-free voltage.
             let clock = publication.filter(|mv| *mv > power_free).and_then(|mv| {
                 let bins_down = (mv - power_free).div_ceil(COMPENSATION_MV_PER_CLOCK_BIN).max(1);
                 nth_below(clock_bins, top_clock, bins_down as usize)
             });
+            let margin = clock.and_then(|clock| compensated_margin(voltage_bins, stock, power_free, clock));
             let band = &mut search.bands[comp];
             band.clock_ceiling_mhz = top_clock;
             match (clock, margin) {
@@ -326,7 +364,9 @@ fn start_next_level(search: &mut ForgeDiscoverySearch, clock_bins: &[u32], volta
         match band.status.as_str() {
             "closed" => {
                 prev_clock = band.last_qualified_clock_mhz.unwrap_or(band.target_clock_mhz);
-                prev_voltage = band.last_qualified_voltage_mv.unwrap_or(band.voltage_mv);
+                prev_voltage = band.last_qualified_voltage_mv
+                    .or(band.level_start_voltage_mv.filter(|_| moved_below_stock(band)))
+                    .unwrap_or(band.voltage_mv);
                 continue;
             }
             "waiting_for_top" => {}
@@ -336,11 +376,12 @@ fn start_next_level(search: &mut ForgeDiscoverySearch, clock_bins: &[u32], volta
             .filter(|c| *c <= level_top && u64::from(*c) * 100 >= u64::from(level_top) * percent)
             .min()
             .filter(|c| *c < prev_clock);
-        band.voltage_mv = prev_voltage;
+        let start = clock.and_then(|clock| undervolt_bin(voltage_bins, stock, clock, prev_voltage));
+        band.voltage_mv = start.unwrap_or(prev_voltage);
         band.level_start_voltage_mv = Some(prev_voltage);
         band.target_clock_mhz = clock.unwrap_or(prev_clock);
         band.clock_ceiling_mhz = band.target_clock_mhz;
-        if clock.is_some() {
+        if start.is_some() {
             band.status = "pending".into();
             return;
         }
@@ -350,12 +391,15 @@ fn start_next_level(search: &mut ForgeDiscoverySearch, clock_bins: &[u32], volta
 }
 
 /// Pure result transition. No propagated blacklist or physical stability inference is produced.
+/// `stock` is the run's stock VF curve as the F2 plan reads it: (index, mV, MHz).
+#[allow(clippy::too_many_arguments)]
 pub fn record(
     search: &mut ForgeDiscoverySearch,
     index: usize,
     outcome: Outcome,
     clock_bins: &[u32],
     voltage_bins: &[u32],
+    stock: &[(usize, u32, u32)],
     power_hint: Option<PowerBoundHint>,
     clock_hint: Option<ClockDropHint>,
 ) -> Result<(), String> {
@@ -378,11 +422,11 @@ pub fn record(
         }
         _ if search.bands[index].publishing => record_publication(search, index, outcome),
         _ if search.bands[index].id == "compensated" => {
-            record_compensated(search, index, outcome, clock_bins, voltage_bins)
+            record_compensated(search, index, outcome, clock_bins, voltage_bins, stock)
         }
-        _ => record_level(search, index, outcome, clock_bins, voltage_bins, power_hint, clock_hint),
+        _ => record_level(search, index, outcome, clock_bins, voltage_bins, stock, power_hint, clock_hint),
     }
-    finish_transition(search, clock_bins, voltage_bins);
+    finish_transition(search, clock_bins, voltage_bins, stock);
     Ok(())
 }
 
@@ -402,15 +446,17 @@ fn record_publication(search: &mut ForgeDiscoverySearch, index: usize, outcome: 
 }
 
 /// The compensated top. Its margin pair must pass at the predicted clock before its publication
-/// pair (the margin pair plus the game margin, at most the top's power-free voltage) is qualified.
-/// A failure means the prediction was too high: one clock bin lower, a bounded number of times. A
-/// TDR here pauses like a level edge, and Resume retries the lower clock.
+/// pair (the margin pair plus the game margin, at most the top's power-free voltage and below the
+/// stock curve) is qualified. A failure means the prediction was too high: one clock bin lower,
+/// with its own margin pair, a bounded number of times. A TDR here pauses like a level edge, and
+/// Resume retries the lower clock.
 fn record_compensated(
     search: &mut ForgeDiscoverySearch,
     index: usize,
     outcome: Outcome,
     clock_bins: &[u32],
     voltage_bins: &[u32],
+    stock: &[(usize, u32, u32)],
 ) {
     let top = search.bands.iter().find(|band| band.id == "performance");
     let power_free = top.and_then(|band| band.first_qualified_voltage_mv);
@@ -418,8 +464,9 @@ fn record_compensated(
     let band = &mut search.bands[index];
     if matches!(outcome, Outcome::Qualified | Outcome::QualifiedHotBin) {
         let hot_bin = outcome == Outcome::QualifiedHotBin;
+        let clock = band.target_clock_mhz;
         let publication = bin_at_or_above(voltage_bins, band.voltage_mv + relief_mv(hot_bin) + GAME_MARGIN_MV)
-            .filter(|mv| power_free.is_none_or(|limit| *mv <= limit));
+            .filter(|mv| power_free.is_none_or(|limit| *mv <= limit) && undervolts(stock, clock, *mv));
         if let Some(publication) = publication {
             band.first_qualified_voltage_mv = Some(band.voltage_mv);
             band.last_qualified_clock_mhz = Some(band.target_clock_mhz);
@@ -430,12 +477,17 @@ fn record_compensated(
             band.status = "pending".into();
             return;
         }
-        // Only the hot bin can push the publication over the power-free voltage: the margin pair
-        // held one clock bin lower, so the prediction steps down like a failed margin pair.
+        // Only the hot bin can push the publication over that limit: the margin pair held one
+        // clock bin lower, so the prediction steps down like a failed margin pair.
     }
-    match clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max() {
-        Some(clock) if band.attempts <= COMPENSATION_RETRIES => {
+    let lower = clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max();
+    let retry = lower.zip(power_free).and_then(|(clock, power_free)| {
+        compensated_margin(voltage_bins, stock, power_free, clock).map(|margin| (clock, margin))
+    });
+    match retry {
+        Some((clock, margin)) if band.attempts <= COMPENSATION_RETRIES => {
             band.target_clock_mhz = clock;
+            band.voltage_mv = margin;
             band.status = "pending".into();
         }
         _ => {
@@ -450,26 +502,30 @@ fn record_compensated(
 
 /// The top and the lower levels. A level first qualifies its clock, then descends until its
 /// first failure: the expected staircase edge, which does not spend the integrity budget.
+#[allow(clippy::too_many_arguments)]
 fn record_level(
     search: &mut ForgeDiscoverySearch,
     index: usize,
     outcome: Outcome,
     clock_bins: &[u32],
     voltage_bins: &[u32],
+    stock: &[(usize, u32, u32)],
     power_hint: Option<PowerBoundHint>,
     clock_hint: Option<ClockDropHint>,
 ) {
     let band = &search.bands[index];
     let descending = band.last_qualified_clock_mhz == Some(band.target_clock_mhz)
         && band.last_qualified_voltage_mv.is_some_and(|mv| band.voltage_mv < mv);
-    // A lower level's first pair repeats a voltage the level above passed, so it must pass.
-    let dominated_start = band.id != "performance" && band.last_qualified_clock_mhz.is_none();
+    // A lower level's first pair repeats a voltage the level above passed, so it must pass,
+    // unless it moved under that voltage to stay below the stock curve.
+    let dominated_start = band.id != "performance" && band.last_qualified_clock_mhz.is_none()
+        && !moved_below_stock(band);
     let step = if band.id == "performance" { 1 } else { LEVEL_STEP_BINS };
     match outcome {
         // The boot is dirty after a TDR (2026-07-22), so the caller stops this session. The
         // search stays open: after reboot and acknowledgement, Resume continues.
         Outcome::DriverFailure if descending => {
-            return finish_level(search, index, "tdr_edge", clock_bins, voltage_bins)
+            return finish_level(search, index, "tdr_edge", clock_bins, voltage_bins, stock)
         }
         Outcome::DriverFailure => return close_all(search, "driver_failure_recovery_required"),
         Outcome::IntegrityError if dominated_start => {
@@ -477,11 +533,11 @@ fn record_level(
             return close_all(search, "dominated_pair_failed");
         }
         Outcome::IntegrityError if descending => {
-            return finish_level(search, index, "integrity_edge", clock_bins, voltage_bins)
+            return finish_level(search, index, "integrity_edge", clock_bins, voltage_bins, stock)
         }
         // Missing proof ends only this level's descent; the pair is never claimed.
         Outcome::Inconclusive if descending => {
-            return finish_level(search, index, "evidence_boundary", clock_bins, voltage_bins)
+            return finish_level(search, index, "evidence_boundary", clock_bins, voltage_bins, stock)
         }
         _ => {}
     }
@@ -514,7 +570,7 @@ fn record_level(
                     band.voltage_mv = voltage;
                     band.status = "pending".into();
                 }
-                None => finish_level(search, index, "voltage_floor_reached", clock_bins, voltage_bins),
+                None => finish_level(search, index, "voltage_floor_reached", clock_bins, voltage_bins, stock),
             }
         }
         Outcome::PowerBound if band.id == "performance"
@@ -605,14 +661,16 @@ fn record_level(
 /// A level's first failure or voltage floor. Its publication pair sits the game margin above the
 /// lowest pass. A lower level short of two steps below its start would repeat (almost) the level
 /// above's voltage with less clock, so it first retries one clock bin lower from its lowest pass
-/// (dominated there); one that never went below its start publishes nothing. When the descent did
-/// not test the publication pair, the level qualifies it next; otherwise the level closes.
+/// (dominated there, and only while that still undervolts the lower clock); one that never went
+/// below its start publishes nothing. When the descent did not test the publication pair, the
+/// level qualifies it next, unless it would not undervolt; otherwise the level closes.
 fn finish_level(
     search: &mut ForgeDiscoverySearch,
     index: usize,
     reason: &str,
     clock_bins: &[u32],
     voltage_bins: &[u32],
+    stock: &[(usize, u32, u32)],
 ) {
     let band = &mut search.bands[index];
     let lowest = band.last_qualified_voltage_mv;
@@ -622,7 +680,8 @@ fn finish_level(
             nth_below(voltage_bins, start, DISTINCT_LEVEL_STEPS * LEVEL_STEP_BINS)
                 .is_some_and(|limit| lowest <= limit)
         });
-        let lower_clock = clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max();
+        let lower_clock = clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max()
+            .filter(|clock| lowest.is_some_and(|mv| undervolts(stock, *clock, mv)));
         if !distinct && band.clock_retries_used < LEVEL_CLOCK_RETRIES {
             if let (Some(clock), Some(mv)) = (lower_clock, lowest) {
                 band.clock_retries_used += 1;
@@ -648,6 +707,8 @@ fn finish_level(
             band.id != "performance" && band.first_qualified_voltage_mv.is_some_and(|start| *mv > start)
         });
     match publication {
+        // The stock curve already runs this clock below the game margin: no profile here.
+        Some(mv) if !undervolts(stock, band.target_clock_mhz, mv) => close_band(band, "publication_at_stock"),
         Some(mv) => {
             band.voltage_mv = mv;
             band.publishing = true;
@@ -657,11 +718,16 @@ fn finish_level(
     }
 }
 
-fn finish_transition(search: &mut ForgeDiscoverySearch, clock_bins: &[u32], voltage_bins: &[u32]) {
+fn finish_transition(
+    search: &mut ForgeDiscoverySearch,
+    clock_bins: &[u32],
+    voltage_bins: &[u32],
+    stock: &[(usize, u32, u32)],
+) {
     if search.stop_reason.is_some() {
         return;
     }
-    start_next_level(search, clock_bins, voltage_bins);
+    start_next_level(search, clock_bins, voltage_bins, stock);
     if search.integrity_errors >= 2 {
         close_all(search, "integrity_error_budget_exhausted");
     } else if search.stop_reason.is_none() {
@@ -726,7 +792,7 @@ mod tests {
     fn step(state: &mut ForgeDiscoverySearch, outcome: Outcome) -> usize {
         let index = next_band(state).unwrap();
         admit(state, index, 0, 100).unwrap();
-        record(state, index, outcome, CLOCKS, VOLTAGES, None, None).unwrap();
+        record(state, index, outcome, CLOCKS, VOLTAGES, &low_stock(VOLTAGES), None, None).unwrap();
         index
     }
     #[test]
@@ -752,10 +818,18 @@ mod tests {
     fn staircase() -> (ForgeDiscoverySearch, Vec<u32>, Vec<u32>) {
         staircase_at(937)
     }
+    /// A stock curve far below every target: every pair undervolts.
+    fn low_stock(volts: &[u32]) -> Vec<(usize, u32, u32)> {
+        volts.iter().enumerate().map(|(index, mv)| (index, *mv, 0)).collect()
+    }
     fn walk(state: &mut ForgeDiscoverySearch, clocks: &[u32], volts: &[u32], outcome: Outcome) -> (usize, u32, u32) {
+        walk_on(state, clocks, volts, &low_stock(volts), outcome)
+    }
+    fn walk_on(state: &mut ForgeDiscoverySearch, clocks: &[u32], volts: &[u32], stock: &[(usize, u32, u32)],
+        outcome: Outcome) -> (usize, u32, u32) {
         let index = next_band(state).unwrap();
         let pair = admit(state, index, 0, 100).map(|c| (index, c.target_clock_mhz, c.voltage_mv)).unwrap();
-        record(state, index, outcome, clocks, volts, None, None).unwrap();
+        record(state, index, outcome, clocks, volts, stock, None, None).unwrap();
         pair
     }
     fn walk_all(state: &mut ForgeDiscoverySearch, clocks: &[u32], volts: &[u32], outcomes: &[Outcome]) -> Vec<(usize, u32, u32)> {
@@ -981,7 +1055,7 @@ mod tests {
         let capped = |state: &mut ForgeDiscoverySearch, mean: u32| {
             admit(state, 0, 0, 100).unwrap();
             let hint = Some(PowerBoundHint { measured_voltage_mv: mean });
-            record(state, 0, Outcome::PowerBound, &[1905, 1920], &bins, hint, None).unwrap();
+            record(state, 0, Outcome::PowerBound, &[1905, 1920], &bins, &low_stock(&bins), hint, None).unwrap();
             state.bands[0].voltage_mv
         };
         assert_eq!(capped(&mut state, 934), 937, "one admission instead of 23");
@@ -995,7 +1069,7 @@ mod tests {
         state.bands[0].integrity_floor_voltage_mv = Some(893);
         admit(&mut state, 0, 0, 100).unwrap();
         let hint = Some(PowerBoundHint { measured_voltage_mv: 880 });
-        record(&mut state, 0, Outcome::PowerBound, CLOCKS, VOLTAGES, hint, None).unwrap();
+        record(&mut state, 0, Outcome::PowerBound, CLOCKS, VOLTAGES, &low_stock(VOLTAGES), hint, None).unwrap();
         assert_eq!(state.bands[0].voltage_mv, 900);
     }
     #[test]
@@ -1009,7 +1083,7 @@ mod tests {
         let dropped = |state: &mut ForgeDiscoverySearch, held: Option<u32>| {
             admit(state, 0, 0, 100).unwrap();
             let hint = held.map(|held_clock_mhz| ClockDropHint { held_clock_mhz, stock_clock_mhz: 2872 });
-            record(state, 0, Outcome::Inconclusive, &clocks, &volts, None, hint).unwrap();
+            record(state, 0, Outcome::Inconclusive, &clocks, &volts, &low_stock(&volts), None, hint).unwrap();
             let top = &state.bands[0];
             (top.target_clock_mhz, top.clock_ceiling_mhz, top.voltage_mv)
         };
@@ -1024,8 +1098,54 @@ mod tests {
         let mut stock_level = fresh();
         admit(&mut stock_level, 0, 0, 100).unwrap();
         let hint = Some(ClockDropHint { held_clock_mhz: 2887, stock_clock_mhz: 2887 });
-        record(&mut stock_level, 0, Outcome::Inconclusive, &clocks, &volts, None, hint).unwrap();
+        record(&mut stock_level, 0, Outcome::Inconclusive, &clocks, &volts, &low_stock(&volts), None, hint).unwrap();
         assert_eq!(stock_level.bands[0].target_clock_mhz, 2985, "never a pair at or under stock: one bin");
+    }
+    #[test]
+    fn every_pair_stays_below_the_stock_curve_of_a_gpu_at_its_voltage_limit() {
+        use Outcome::*;
+        // Field report 2026-10-22, RTX 4070 SUPER at 220 W: its top reached the curve's own 1100 mV
+        // limit at ~200 W, where stock runs 2715 MHz, and v12 published the compensated top at
+        // 2685@1100, which the plan refused. Stock: 15 MHz per 10 mV under 2715@1100, 2760 at most.
+        let clocks: Vec<u32> = (2400..=2760).step_by(15).collect();
+        let volts: Vec<u32> = (850..=1150).step_by(5).collect();
+        let stock_clock = |mv: u32| if mv <= 1100 {
+            2715 - 15 * (1100 - mv).div_ceil(10)
+        } else {
+            (2715 + 15 * ((mv - 1100) / 10)).min(2760)
+        };
+        let stock: Vec<_> = volts.iter().enumerate().map(|(index, &mv)| (index, mv, stock_clock(mv))).collect();
+        let seed = |id| Seed { id, target_clock_mhz: 2760, voltage_mv: 1100, clock_ceiling_mhz: 2760 };
+        let mut state = new(&[seed("performance"), seed("balanced"), seed("efficiency")], 30, 10_000);
+        let go = |state: &mut ForgeDiscoverySearch, outcomes: &[Outcome]| {
+            outcomes.iter().map(|outcome| walk_on(state, &clocks, &volts, &stock, *outcome)).collect::<Vec<_>>()
+        };
+        assert_eq!(go(&mut state, &[Inconclusive, Qualified, Qualified, Inconclusive]),
+            [(0, 2760, 1100), (0, 2745, 1100), (0, 2745, 1095), (0, 2745, 1090)]);
+        // 1095 + 36 mV needs four clock bins (2685). Stock reaches 2685 at 1080, so its publication
+        // is 1075 and its margin pair 1035, not 1060 under the power-free 1100.
+        let mut retried = state.clone();
+        assert_eq!(go(&mut state, &[Qualified, Qualified]), [(1, 2685, 1035), (1, 2685, 1075)]);
+        assert_eq!(state.bands[1].stop_reason.as_deref(), Some("published"));
+        // A failed margin pair steps one clock bin down with its own margin: 1065 - 36 mV.
+        go(&mut retried, &[IntegrityError]);
+        assert_eq!((retried.bands[1].target_clock_mhz, retried.bands[1].voltage_mv), (2670, 1025));
+        // -5% (2565) at 1035 would sit over its 2610 MHz stock point: it starts at 995 (2550).
+        let balanced = &state.bands[2];
+        assert_eq!((balanced.target_clock_mhz, balanced.voltage_mv, balanced.level_start_voltage_mv),
+            (2565, 995, Some(1035)));
+        // That moved start is a new test, not a dominated pair: failing it closes only this level.
+        let mut failed = state.clone();
+        go(&mut failed, &[IntegrityError]);
+        assert_eq!((failed.stop_reason.as_deref(), failed.bands[2].stop_reason.as_deref()),
+            (None, Some("integrity_error_region_closed")));
+        let efficiency = &failed.bands[3];
+        assert_eq!((efficiency.target_clock_mhz, efficiency.voltage_mv, efficiency.level_start_voltage_mv),
+            (2430, 905, Some(1035)), "the next level starts from the voltage that passed above");
+        // Its edge one step lower leaves 995 + 36 mV = 1035 over the stock curve again: no profile.
+        go(&mut state, &[Qualified, IntegrityError]);
+        assert_eq!(state.bands[2].stop_reason.as_deref(), Some("publication_at_stock"));
+        assert_eq!((state.bands[3].target_clock_mhz, state.bands[3].voltage_mv), (2430, 905));
     }
     #[test]
     fn top_down_power_integrity_bracket_descends_without_retesting_failed_top() {

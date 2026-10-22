@@ -421,7 +421,7 @@ fn select_anchor_bin(
 /// Resolve a persisted F2 apply anchor against the live static table. Apply/reapply must use the
 /// exact validated VF-table voltage; silently falling to a lower bin would deepen the undervolt
 /// beyond the forged point. If the table changed and the exact anchor is unavailable, fail closed.
-fn select_exact_apply_anchor_bin(
+pub(crate) fn select_exact_apply_anchor_bin(
     static_base_curve: &[(usize, u32, u32)],
     target_mhz: u32,
     anchor_mv: u32,

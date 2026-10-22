@@ -9792,6 +9792,7 @@ fn measure_multiclock_undervolt_forge(
             recorded,
             &targets,
             &voltage_bins_ascending,
+            &f2_inputs.sane_base_curve,
             power_hint,
             clock_hint,
         ) {
@@ -9921,6 +9922,9 @@ fn measure_multiclock_undervolt_forge(
                     "Degrau {target} MHz não desceu abaixo do início ({} mV) nem com os bins de clock extras; sem perfil próprio neste nível.",
                     next.level_start_voltage_mv.unwrap_or(mv)
                 )),
+                "publication_at_stock" => prog.log.push(format!(
+                    "Degrau {target} MHz: menor tensão aprovada {lowest}, mas ela + {margin} mV já fica na curva stock deste clock (o stock roda {target} MHz com essa tensão ou menos); sem perfil neste nível."
+                )),
                 _ => {}
             }
             match reason {
@@ -9950,6 +9954,13 @@ fn measure_multiclock_undervolt_forge(
                     LogTone::Attention,
                     live_phase,
                     format!("{target} MHz could not go below its start · no separate profile at this level"),
+                    None,
+                ),
+                "publication_at_stock" => live_event(
+                    &mut prog,
+                    LogTone::Attention,
+                    live_phase,
+                    format!("{target} MHz with the game margin would not be below stock · no profile at this level"),
                     None,
                 ),
                 _ => {}
@@ -9982,8 +9993,13 @@ fn measure_multiclock_undervolt_forge(
                 );
                 prog.log.push(if level.id == "compensated" {
                     format!(
-                        "Topo compensado pela margem de jogo: {} MHz; primeiro o par de margem {} mV (tensão de potência − {margin} mV), depois o par publicado.",
+                        "Topo compensado pela margem de jogo: {} MHz; primeiro o par de margem {} mV ({margin} mV abaixo da publicação, que fica sob a tensão de potência e abaixo da curva stock), depois o par publicado.",
                         level.target_clock_mhz, level.voltage_mv
+                    )
+                } else if crate::qualified_search::moved_below_stock(level) {
+                    format!(
+                        "Próximo degrau: {} MHz @ {} mV, abaixo dos {} mV aprovados no degrau anterior, que já ficariam na curva stock deste clock.",
+                        level.target_clock_mhz, level.voltage_mv, level.level_start_voltage_mv.unwrap_or(level.voltage_mv)
                     )
                 } else {
                     format!(
