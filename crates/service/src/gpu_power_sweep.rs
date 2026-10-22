@@ -9611,6 +9611,20 @@ fn measure_multiclock_undervolt_forge(
                 clock_hint = observations.last().and_then(|o| {
                     f2_clock_drop_hint(o, &run_id, &gpu_key, target, mv, &f2_inputs.sane_base_curve)
                 });
+                // A GPU limiter that NVML does not report held the GPU a voltage point under the
+                // anchor, below the power cap: an RTX 5070 sat at 1090 mV 87% of a 1095 mV dwell
+                // at 230 of 250 W (field report 2026-10-21). As with the power limit, the same
+                // target is tried next at the voltage the GPU settled at. A ClockDrop never
+                // confirms the calibration, so this is decided before that check; 0.8.9 decided it
+                // after and never ran (2977@1090 sat at 1085 mV, field report 2026-10-22).
+                if let Some(hint) = observations.last()
+                    .and_then(|o| f2_voltage_limited_hint(o, &run_id, &gpu_key, target, mv))
+                    .filter(|_| !stop.load(Ordering::SeqCst))
+                {
+                    power_hint = Some(hint);
+                    failure_reason = "VoltageLimitedClockDrop".into();
+                    return Ok(Outcome::PowerBound);
+                }
             }
             if calibration.aborted || !calibration.confirmed || stop.load(Ordering::SeqCst) {
                 // Only discovery can retry a neutral excursion, after persisted clean recovery.
@@ -9657,17 +9671,6 @@ fn measure_multiclock_undervolt_forge(
             {
                 failure_reason = "PowerBoundClockDrop".into();
                 return Ok(Outcome::PowerBound);
-            }
-            // A GPU limiter that NVML does not report held the GPU a voltage point under the
-            // anchor, below the power cap: an RTX 5070 sat at 1090 mV 87% of a 1095 mV dwell at
-            // 230 of 250 W (field report 2026-10-21). As with the power limit, the same target is
-            // tried next at the voltage the GPU settled at.
-            if band.id == "performance" {
-                if let Some(hint) = f2_voltage_limited_hint(latest, &run_id, &gpu_key, target, mv) {
-                    power_hint = Some(hint);
-                    failure_reason = "VoltageLimitedClockDrop".into();
-                    return Ok(Outcome::PowerBound);
-                }
             }
             if latest.outcome != nidavellir_core::f2_observation::F2ObsOutcome::Validated {
                 return Ok(Outcome::Inconclusive);
