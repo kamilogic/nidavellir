@@ -870,6 +870,7 @@ fn run_candidate_matrix_v27(
                 VfQualifierPattern::V8Texture,
                 goldens,
                 Some(cancel),
+                None,
             ),
             MatrixV27Lane::Dx11 => crate::gpu_power_sweep::single_dx11_qualifier_dwell_with_cancel(
                 lane.duration_ms(),
@@ -882,6 +883,7 @@ fn run_candidate_matrix_v27(
                 target_mhz,
                 goldens.for_dx12(),
                 Some(cancel),
+                None,
             ),
             MatrixV27Lane::Endurance => crate::gpu_power_sweep::single_qualifier_dwell_with_cancel(
                 lane.duration_ms(),
@@ -889,6 +891,7 @@ fn run_candidate_matrix_v27(
                 VfQualifierPattern::Endurance,
                 goldens,
                 Some(cancel),
+                None,
             ),
         };
 

@@ -175,6 +175,7 @@ pub(super) fn coverage(
     evidence: &Evidence,
     target: u32,
     anchor: u32,
+    live_anchor_mhz: Option<u32>,
 ) -> F2ActiveTargetCoverage {
     let mut active_us = 0;
     let mut target_us = 0;
@@ -230,11 +231,13 @@ pub(super) fn coverage(
                 curve: sample.curve,
             });
         }
-        // Target exposure includes the GPU's one hot bin below the target (2026-09-28);
+        // Target exposure includes the GPU's one hot bin below the target (2026-09-28), measured
+        // from the anchor point the GPU set live when its curve shifted with heat (2026-10-22);
         // `one_below` reports that share of it.
-        let in_band = nidavellir_core::f2_observation::f2_clock_held(sample.clock_mhz, target);
+        let in_band = nidavellir_core::f2_observation::f2_clock_held(sample.clock_mhz, target, live_anchor_mhz);
         let limited = !in_band && sample.clock_mhz < target && sample.power_limited;
-        let one_below = in_band && sample.clock_mhz < target;
+        let one_below = in_band
+            && sample.clock_mhz < nidavellir_core::f2_observation::f2_held_reference_mhz(target, live_anchor_mhz);
         if credit > 0 && sample.voltage_mv.is_some_and(|mv| (500..=anchor).contains(&mv)) {
             phase.observed_active_us += credit;
             if in_band { phase.target_active_us += credit; }
@@ -335,13 +338,13 @@ mod tests {
             if (40_000_000..42_000_000).contains(&t) || t >= 160_000_000 { s.clock_mhz = 1920; }
             s
         }).collect();
-        let held = coverage(&reads, &evidence, 1920, 900);
+        let held = coverage(&reads, &evidence, 1920, 900, None);
         assert!(held.proves_target(), "{held:?}");
         assert!(held.light_target_active_ms >= 30_000);
         let duty = &held.diagnostics.as_ref().unwrap().phases[2];
         assert!(duty.target_active_us < 3_000_000 && duty.power_limited_active_us > 70_000_000);
         for s in &mut reads { s.power_limited = false; }
-        let refused = coverage(&reads, &evidence, 1920, 900);
+        let refused = coverage(&reads, &evidence, 1920, 900, None);
         assert!(!refused.proves_target());
         assert!(refused.diagnostics.unwrap().reasons.iter().any(|r| r == "heavy_clock_not_sustained"));
     }
@@ -357,7 +360,7 @@ mod tests {
         variable.curve = Some(F2ClockCurveSnapshot { captured_at_ms: 255, base_mhz: 1680,
             base_mv: 900, effective_mhz: 1830, effective_mv: 900, offset_khz: Some(150_000) });
         let c = coverage(&[heavy, sample(150_000, 2100), sample(199_500, 2200), variable],
-            &evidence, 1800, 900);
+            &evidence, 1800, 900, None);
         assert!(c.upper_clock_exceeded);
         assert_eq!(c.target_active_ms, 0);
         let d = c.diagnostics.unwrap();
@@ -401,7 +404,7 @@ mod tests {
             sample(250_000, 1770),
             sample(350_000, 1800),
         ];
-        let c = coverage(&reads, &evidence, 1800, 900);
+        let c = coverage(&reads, &evidence, 1800, 900, None);
         assert_eq!(c.sample_count, 1);
         assert_eq!(c.target_active_ms, 0);
         assert_eq!(c.observed_active_ms, 30);
@@ -431,6 +434,7 @@ mod tests {
             &evidence,
             1800,
             900,
+            None,
         );
         assert_eq!(c.target_active_ms, 60);
         assert_eq!(c.observed_active_ms, 60);
@@ -477,15 +481,15 @@ mod tests {
             Work { start_us: 160_000_000, end_us: 200_000_000, exposure: true, phase_index: 4 },
         ]};
         let mut reads: Vec<_> = (0..200_000_000).step_by(30_000).map(|t| sample(t,1740)).collect();
-        assert!(coverage(&reads,&evidence,1740,900).proves_target());
+        assert!(coverage(&reads,&evidence,1740,900, None).proves_target());
         for (i,s) in reads.iter_mut().enumerate() { if i % 2 == 0 { s.clock_mhz=1755; } }
-        let envelope = coverage(&reads,&evidence,1740,900);
+        let envelope = coverage(&reads,&evidence,1740,900, None);
         assert!(envelope.proves_target(), "nominal/+15 mixture must credit actual heavy work");
         assert!(!envelope.upper_clock_exceeded);
         // Heavy sustain holds one bin below target, never two: 1740/1755 cannot qualify 1770.
-        assert!(!coverage(&reads,&evidence,1770,900).proves_target(), "peaks cannot qualify a clock two bins up");
+        assert!(!coverage(&reads,&evidence,1770,900, None).proves_target(), "peaks cannot qualify a clock two bins up");
         for s in &mut reads { if s.start_us < 40_000_000 { s.clock_mhz=1680; } }
-        let refused=coverage(&reads,&evidence,1740,900);
+        let refused=coverage(&reads,&evidence,1740,900, None);
         assert!(!refused.proves_target());
         assert_eq!(refusal(&refused),Some("heavy_clock_not_sustained"));
         assert!(refused.target_active_ms >= 30_000);
@@ -508,7 +512,7 @@ mod tests {
             .step_by(30_000)
             .map(|t| sample(t, 1800))
             .collect();
-        let accepted = coverage(&active, &evidence, 1800, 900);
+        let accepted = coverage(&active, &evidence, 1800, 900, None);
         assert!(!accepted.proves_target(), "middle-only exposure must not prove heavy load: {accepted:?}");
         assert_eq!(refusal(&accepted), Some("heavy_clock_not_sustained"));
         assert!(
@@ -526,16 +530,16 @@ mod tests {
                 ..*s
             })
             .collect();
-        let refused = coverage(&idle_only, &evidence, 1800, 900);
+        let refused = coverage(&idle_only, &evidence, 1800, 900, None);
         assert_eq!(refused.target_active_ms, 0);
         assert_eq!(refusal(&refused), Some("dx11_target_unexercised"));
         let mut excursion = active;
         excursion[1].clock_mhz = 1815;
-        let within_band = coverage(&excursion, &evidence, 1800, 900);
+        let within_band = coverage(&excursion, &evidence, 1800, 900, None);
         assert!(!within_band.upper_clock_exceeded);
         assert_eq!(refusal(&within_band), Some("heavy_clock_not_sustained"));
         excursion[1].clock_mhz = 1830;
-        let refused = coverage(&excursion, &evidence, 1800, 900);
+        let refused = coverage(&excursion, &evidence, 1800, 900, None);
         assert_eq!(refusal(&refused), Some("dx11_upper_clock_exceeded"));
     }
 
@@ -549,7 +553,7 @@ mod tests {
         let evidence = Evidence { completed: 6, work: work.collect() };
         let busy_ms: u64 = contiguous(&evidence.work).iter().map(|w| w.end_us - w.start_us).sum::<u64>() / 1000;
         let reads: Vec<_> = (0..120_000_000).step_by(30_500).map(|t| sample(t, 1920)).collect();
-        let light = coverage(&reads, &evidence, 1920, 900).light_target_active_ms;
+        let light = coverage(&reads, &evidence, 1920, 900, None).light_target_active_ms;
         assert!((45_000..=busy_ms).contains(&light), "light {light} ms of {busy_ms} ms load");
 
         let w = |start_us, end_us, phase_index| Work { start_us, end_us, exposure: true, phase_index };

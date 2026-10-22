@@ -59,8 +59,23 @@ pub fn f2_clock_ceiling_mhz(target: u32) -> u32 {
 /// discovery, residency, DX11 exposure and the Endurance hot target. A drop of two bins still
 /// fails. The published nominal clock never moves.
 pub const F2_HELD_BIN_BELOW_MHZ: u32 = 15;
-pub fn f2_clock_held(clock: u32, target: u32) -> bool {
-    (target.saturating_sub(F2_HELD_BIN_BELOW_MHZ)..=f2_clock_ceiling_mhz(target)).contains(&clock)
+/// GPU Boost also moves a raised anchor point down with its base curve as the GPU heats, in
+/// ~15 MHz steps: an RTX 5070's 2977@1090 read 2947 at 72 °C (field report 2026-10-22). Up to
+/// one bin, the held bin above already covers that shift, and the game margin was calibrated
+/// with it (RTX 30). Beyond it, the held floor follows the live point, at most this far below the
+/// target. A larger gap is no thermal shift, so the target stays the floor.
+pub const F2_MAX_THERMAL_SHIFT_MHZ: u32 = 45;
+/// The clock a pair must hold from below: its target, or the anchor point as the GPU set it live
+/// when that sits lower by more than the held bin, within a thermal shift. The ceiling always
+/// stays on the target.
+pub fn f2_held_reference_mhz(target: u32, live_anchor_mhz: Option<u32>) -> u32 {
+    live_anchor_mhz
+        .filter(|live| live + F2_HELD_BIN_BELOW_MHZ < target && live + F2_MAX_THERMAL_SHIFT_MHZ >= target)
+        .unwrap_or(target)
+}
+pub fn f2_clock_held(clock: u32, target: u32, live_anchor_mhz: Option<u32>) -> bool {
+    let floor = f2_held_reference_mhz(target, live_anchor_mhz).saturating_sub(F2_HELD_BIN_BELOW_MHZ);
+    (floor..=f2_clock_ceiling_mhz(target)).contains(&clock)
 }
 /// Current FailureSeekingGameLoop qualification contract.
 ///
@@ -402,6 +417,10 @@ pub struct F2QualificationCoverage {
     pub reason: Option<String>,
     #[serde(default)]
     pub phase_metrics: Vec<F2QualificationPhaseMetric>,
+    /// The anchor point's clock as the GPU set it live, the lowest of the lane's readings. The held
+    /// floor follows it within a thermal shift (`f2_held_reference_mhz`). Absent before 0.8.11.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_anchor_mhz: Option<u32>,
 }
 
 /// Native DX11 lane phases: heavy, 75/50/25% duty heavy bursts, continuous light, heavy.
@@ -940,15 +959,21 @@ pub const F2_HOT_BIN_RELIEF_SHARE: f32 = 0.5;
 const F2_CRITICAL_PHASES: [&str; 2] = ["field-concurrency", "load-step"];
 const F2_HOT_BIN_RELIEF_MIN_SAMPLES: u32 = 20;
 
-/// One lane's share of critical-phase samples at the hot bin (target − 15 MHz) versus at or above
-/// the target. None when the lane has too few critical samples to judge.
-pub fn f2_critical_hot_bin_share(metrics: &[F2QualificationPhaseMetric], target_mhz: u32) -> Option<f32> {
+/// One lane's share of critical-phase samples at the hot bin (15 MHz under the held reference: the
+/// target, or the live anchor point a thermal shift lower) versus at or above that reference. None
+/// when the lane has too few critical samples to judge.
+pub fn f2_critical_hot_bin_share(
+    metrics: &[F2QualificationPhaseMetric],
+    target_mhz: u32,
+    live_anchor_mhz: Option<u32>,
+) -> Option<f32> {
+    let reference = f2_held_reference_mhz(target_mhz, live_anchor_mhz);
     let (mut hot, mut held) = (0u32, 0u32);
     for metric in metrics.iter().filter(|m| F2_CRITICAL_PHASES.contains(&m.phase_name.as_str())) {
         for &[clock, _, samples, _] in &metric.clock_temp {
-            if clock >= target_mhz {
+            if clock >= reference {
                 held += samples;
-            } else if clock + F2_HELD_BIN_BELOW_MHZ >= target_mhz {
+            } else if clock + F2_HELD_BIN_BELOW_MHZ >= reference {
                 hot += samples;
             }
         }
@@ -973,7 +998,10 @@ pub fn f2_pair_has_hot_bin_relief(
                 && o.anchor_mv == anchor_mv
                 && is_current_apply_qualification_pass(o)
         })
-        .filter_map(|o| f2_critical_hot_bin_share(&o.qualification_coverage.as_ref()?.phase_metrics, target_mhz))
+        .filter_map(|o| {
+            let coverage = o.qualification_coverage.as_ref()?;
+            f2_critical_hot_bin_share(&coverage.phase_metrics, target_mhz, coverage.live_anchor_mhz)
+        })
         .any(|share| share > F2_HOT_BIN_RELIEF_SHARE)
 }
 
@@ -1662,14 +1690,34 @@ mod tests {
             metric("texture-rop", &[(1800, 327), (1815, 905)]),
             metric("field-concurrency", &[(1800, 1394), (1815, 624)]),
         ];
-        let share = f2_critical_hot_bin_share(&dx12, 1815).unwrap();
+        let share = f2_critical_hot_bin_share(&dx12, 1815, None).unwrap();
         assert!((share - 0.69).abs() < 0.01 && share > F2_HOT_BIN_RELIEF_SHARE);
         // Its Texture lane held 1815 exactly; a two-bin drop is not the hot bin; DX11 has no
         // critical phase; too few samples prove nothing.
-        assert_eq!(f2_critical_hot_bin_share(&[metric("field-concurrency", &[(1815, 1978)])], 1815), Some(0.0));
-        assert_eq!(f2_critical_hot_bin_share(&[metric("load-step", &[(1785, 50), (1815, 50)])], 1815), Some(0.0));
-        assert_eq!(f2_critical_hot_bin_share(&[metric("dx11-game", &[(1800, 500)])], 1815), None);
-        assert_eq!(f2_critical_hot_bin_share(&[metric("load-step", &[(1800, 19)])], 1815), None);
+        assert_eq!(f2_critical_hot_bin_share(&[metric("field-concurrency", &[(1815, 1978)])], 1815, None), Some(0.0));
+        assert_eq!(f2_critical_hot_bin_share(&[metric("load-step", &[(1785, 50), (1815, 50)])], 1815, None), Some(0.0));
+        assert_eq!(f2_critical_hot_bin_share(&[metric("dx11-game", &[(1800, 500)])], 1815, None), None);
+        assert_eq!(f2_critical_hot_bin_share(&[metric("load-step", &[(1800, 19)])], 1815, None), None);
+        // Thermal shift (field report 2026-10-22): an anchor the GPU set 30 MHz lower is held at
+        // that live point and hot one bin under it.
+        let shifted = [metric("field-concurrency", &[(2947, 60), (2932, 40)])];
+        assert_eq!(f2_critical_hot_bin_share(&shifted, 2977, Some(2947)), Some(0.4));
+        assert_eq!(f2_critical_hot_bin_share(&shifted, 2977, None), None, "nominally a drop, not the hot bin");
+    }
+
+    /// RTX 5070, 2977@1090: the GPU lowered the raised point to 2947 at 72 °C (field report
+    /// 2026-10-22). The floor follows a plausible live point; the ceiling never moves.
+    #[test]
+    fn the_held_floor_follows_the_live_anchor_within_a_thermal_shift() {
+        assert!(f2_clock_held(2932, 2977, Some(2947)) && !f2_clock_held(2931, 2977, Some(2947)));
+        assert!(!f2_clock_held(2932, 2977, None), "without a reading the target is the floor");
+        assert!(f2_clock_held(2992, 2977, Some(2947)) && !f2_clock_held(2993, 2977, Some(2947)));
+        assert_eq!(f2_held_reference_mhz(2977, Some(2932)), 2932, "45 MHz is still a thermal shift");
+        assert_eq!(f2_held_reference_mhz(2977, Some(2931)), 2977, "a larger gap is not");
+        assert_eq!(f2_held_reference_mhz(2977, Some(2990)), 2977, "a live point above the target");
+        // One bin is the held bin the RTX 30's game margin was calibrated with: nothing changes.
+        assert_eq!(f2_held_reference_mhz(1920, Some(1905)), 1920);
+        assert!(!f2_clock_held(1889, 1920, Some(1905)), "two bins under the target still fail");
     }
 
     fn reproducible_provenance() -> F2EvidenceProvenance {
@@ -1791,6 +1839,7 @@ mod tests {
             retry_count: 0,
             reason: None,
             phase_metrics: Vec::new(),
+            live_anchor_mhz: None,
         });
         o
     }

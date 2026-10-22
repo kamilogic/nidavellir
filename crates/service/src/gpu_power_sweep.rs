@@ -2659,7 +2659,7 @@ pub(crate) fn forge_log_text(prog: &PowerSweepProgress) -> Result<ForgeLogText, 
         #[cfg(windows)]
         if let Some(detail) = cov.filter(|_| reason == Some("heavy_clock_not_sustained")).and_then(|coverage| {
             let phases = coverage.phase_metrics.iter().map(|m| (m.phase_name.as_str(), m.clock_temp.as_slice()));
-            f2_sustain_detail(phases, o.target_mhz)
+            f2_sustain_detail(phases, o.target_mhz, coverage.live_anchor_mhz)
         }) {
             out.push_str(&format!("  -> {detail}\n"));
         }
@@ -3038,6 +3038,8 @@ struct Measured {
     /// VF points shows two peaks.
     clock_shares: String,
     volt_shares: String,
+    /// The applied anchor's live clock, the lowest of those snapshots: the held floor's reference.
+    live_anchor_mhz: Option<u32>,
 }
 
 impl Measured {
@@ -3079,6 +3081,7 @@ impl Measured {
             vf_points_under_load: Vec::new(),
             clock_shares: "-".into(),
             volt_shares: "-".into(),
+            live_anchor_mhz: None,
         }
     }
 }
@@ -3609,12 +3612,17 @@ const F2_SUSTAIN_PHASES: [VfQualifierPhase; 7] = [
 const F2_SUSTAIN_MIN_SAMPLES: u32 = 20;
 
 /// The sustain phase that held its target least, from persisted (phase, clock × temperature cells),
-/// counted as the check counts: on target, or held back by the power cap. Off-target cells at the
-/// lane's hottest temperature point to thermal drift; cooler ones to a ramp or a dip. Both refusals
-/// that stopped an RTX 4070 SUPER (field report 2026-10-22) kept p5 at the target.
+/// counted as the check counts: held (from the live anchor within a thermal shift), or held back by
+/// the power cap. Off-target cells at the lane's hottest temperature point to thermal drift; cooler
+/// ones to a ramp or a dip. Both refusals that stopped an RTX 4070 SUPER (field report 2026-10-22)
+/// kept p5 at the target.
 #[cfg(windows)]
-fn f2_sustain_detail<'a>(phases: impl Iterator<Item = (&'a str, &'a [[u32; 4]])>, target: u32) -> Option<String> {
-    let held = |clock: u32| nidavellir_core::f2_observation::f2_clock_held(clock, target);
+fn f2_sustain_detail<'a>(
+    phases: impl Iterator<Item = (&'a str, &'a [[u32; 4]])>,
+    target: u32,
+    live_anchor_mhz: Option<u32>,
+) -> Option<String> {
+    let held = |clock: u32| nidavellir_core::f2_observation::f2_clock_held(clock, target, live_anchor_mhz);
     let (phase, inside, total, cells) = phases
         .filter(|(name, _)| F2_SUSTAIN_PHASES.iter().any(|phase| phase.label() == *name))
         .map(|(name, cells)| {
@@ -3631,6 +3639,7 @@ fn f2_sustain_detail<'a>(phases: impl Iterator<Item = (&'a str, &'a [[u32; 4]])>
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn qualification_coverage_from_run(
     result: StabilityResult,
     phase_reports: &[nidavellir_gpu_stress::VfPhaseReport],
@@ -3639,6 +3648,7 @@ fn qualification_coverage_from_run(
     pattern: VfQualifierPattern,
     power_limit_w: Option<f32>,
     inconclusive_reason: Option<&str>,
+    live_anchor_mhz: Option<u32>,
 ) -> F2QualificationCoverage {
     qualification_coverage_from_run_with_context(
         result,
@@ -3649,6 +3659,7 @@ fn qualification_coverage_from_run(
         QualifierCoverageContext::Strict,
         power_limit_w,
         inconclusive_reason,
+        live_anchor_mhz,
     )
 }
 
@@ -3663,6 +3674,8 @@ fn qualification_coverage_from_run_with_context(
     coverage_context: QualifierCoverageContext,
     power_limit_w: Option<f32>,
     inconclusive_reason: Option<&str>,
+    // The anchor point as the GPU set it live: held floors follow it within a thermal shift.
+    live_anchor_mhz: Option<u32>,
 ) -> F2QualificationCoverage {
     // Coverage denominator is pattern-specific: legacy FSGL plans exercise 8 phases, the
     // current v8 plans exercise 9 (FrameCadence). A fixed count would mark legacy runs
@@ -3691,7 +3704,8 @@ fn qualification_coverage_from_run_with_context(
         .count() as u32;
     let target_tolerance_mhz = coverage_context.target_tolerance_mhz(pattern);
     let target_residency_frac = target_mhz.and_then(|target| {
-        let target_floor = target.saturating_sub(target_tolerance_mhz);
+        let target_floor = nidavellir_core::f2_observation::f2_held_reference_mhz(target, live_anchor_mhz)
+            .saturating_sub(target_tolerance_mhz);
         let mut total = 0u32;
         let mut resident = 0u32;
         for sample in samples {
@@ -3744,7 +3758,8 @@ fn qualification_coverage_from_run_with_context(
             let temperatures: Vec<f32> =
                 phase_samples.iter().filter_map(|sample| sample.3).collect();
             let target_residency_pct = target_mhz.and_then(|target| {
-                let target_floor = target.saturating_sub(target_tolerance_mhz);
+                let target_floor = nidavellir_core::f2_observation::f2_held_reference_mhz(target, live_anchor_mhz)
+                    .saturating_sub(target_tolerance_mhz);
                 (!phase_samples.is_empty()).then(|| {
                     let resident = phase_samples
                         .iter()
@@ -3804,7 +3819,7 @@ fn qualification_coverage_from_run_with_context(
                 let phase: Vec<_> = samples.iter().filter(|s| s.4 == report.phase.code()).collect();
                 if phase.len() < F2_SUSTAIN_MIN_SAMPLES as usize { return None; }
                 evaluated = true;
-                let held = phase.iter().filter(|s| nidavellir_core::f2_observation::f2_clock_held(s.0, target)
+                let held = phase.iter().filter(|s| nidavellir_core::f2_observation::f2_clock_held(s.0, target, live_anchor_mhz)
                     || f2_power_limited_sample(s.2, s.5)).count();
                 (held as f64 / (phase.len() as f64) < 0.95).then_some("heavy_clock_not_sustained")
             });
@@ -3817,7 +3832,7 @@ fn qualification_coverage_from_run_with_context(
         .map(|target| {
             let lane = || samples.iter().filter(|s| VfQualifierPhase::from_code(s.4).is_some());
             let lane_max = lane().filter_map(|s| s.3).fold(f32::MIN, f32::max);
-            lane().filter(|s| nidavellir_core::f2_observation::f2_clock_held(s.0, target)
+            lane().filter(|s| nidavellir_core::f2_observation::f2_clock_held(s.0, target, live_anchor_mhz)
                 && s.3.is_some_and(|temp| temp >= lane_max - F2_ENDURANCE_HOT_BAND_C)).count()
         });
     let (verdict, reason) = if let Some(reason) = inconclusive_reason {
@@ -3893,6 +3908,7 @@ fn qualification_coverage_from_run_with_context(
         retry_count: 0,
         reason,
         phase_metrics,
+        live_anchor_mhz,
     }
 }
 
@@ -3902,6 +3918,7 @@ fn dx11_qualification_coverage_from_run(
     report: Option<&nidavellir_gpu_stress::Dx11QualificationResult>,
     samples: &[PhaseSample],
     target_mhz: Option<u32>,
+    live_anchor_mhz: Option<u32>,
 ) -> F2QualificationCoverage {
     let phase_samples: Vec<_> = samples
         .iter()
@@ -3912,7 +3929,8 @@ fn dx11_qualification_coverage_from_run(
     let powers: Vec<f32> = phase_samples.iter().map(|sample| sample.1).collect();
     let temperatures: Vec<f32> = phase_samples.iter().filter_map(|sample| sample.3).collect();
     let target_residency_frac = target_mhz.and_then(|target| {
-        let floor = target.saturating_sub(F2_QUALIFIER_TARGET_TOL_MHZ);
+        let floor = nidavellir_core::f2_observation::f2_held_reference_mhz(target, live_anchor_mhz)
+            .saturating_sub(F2_QUALIFIER_TARGET_TOL_MHZ);
         (!clocks.is_empty()).then(|| {
             clocks.iter().filter(|clock| **clock >= floor).count() as f32 / clocks.len() as f32
         })
@@ -4002,6 +4020,7 @@ fn dx11_qualification_coverage_from_run(
             coverage_status: coverage_status.into(),
             clock_temp: f2_clock_temp_cells(&phase_samples),
         }],
+        live_anchor_mhz,
     }
 }
 
@@ -4032,12 +4051,13 @@ fn api_inconclusive_coverage(
         retry_count: 0,
         reason: Some(reason),
         phase_metrics: Vec::new(),
+        live_anchor_mhz: None,
     }
 }
 
 #[cfg(windows)]
 fn load_and_measure(ms: u64) -> Measured {
-    load_and_measure_for(ms, RenderStressPurpose::PowerCharacterization, None, None)
+    load_and_measure_for(ms, RenderStressPurpose::PowerCharacterization, None, None, None)
 }
 
 
@@ -4282,11 +4302,12 @@ fn load_and_measure_for(
     ms: u64,
     purpose: RenderStressPurpose,
     target_mhz: Option<u32>,
+    anchor_mv: Option<u32>,
     cancel: Option<&AtomicBool>,
 ) -> Measured {
     // A dwell left blocked by a driver crash ends like one that lost its device (2026-10-17).
     gpu_work(cancel, move |cancel| {
-        load_and_measure_for_with_phase_hook(ms, purpose, target_mhz, cancel.as_deref(), None)
+        load_and_measure_for_with_phase_hook(ms, purpose, target_mhz, anchor_mv, cancel.as_deref(), None)
     })
     .unwrap_or_else(|| Measured::degenerate(StabilityResult::Crash, 0))
 }
@@ -4301,6 +4322,8 @@ fn load_and_measure_for_with_phase_hook(
     ms: u64,
     purpose: RenderStressPurpose,
     target_mhz: Option<u32>,
+    // The applied anchor's voltage: its live point sets the held floor (field report 2026-10-22).
+    anchor_mv: Option<u32>,
     cancel: Option<&AtomicBool>,
     mut phase_hook: Option<&mut dyn FnMut(usize, VfQualifierPhase, u64)>,
 ) -> Measured {
@@ -4387,6 +4410,13 @@ fn load_and_measure_for_with_phase_hook(
     let throttle_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let vf_points = Arc::new(Mutex::new(Vec::<String>::new()));
     let (throttle_for_sampler, vf_points_for_sampler) = (throttle_seen.clone(), vf_points.clone());
+    // The anchor point as the GPU sets it live, read with the curve snapshots: its base curve
+    // shifts with heat and the raise rides on it. The lowest reading is the lane's.
+    let live_anchor_index = anchor_mv.and_then(|anchor| {
+        VF_BASE_CURVE.get()?.iter().find(|point| point.1 == anchor).map(|point| point.0)
+    });
+    let live_anchor = Arc::new(AtomicU32::new(u32::MAX));
+    let live_anchor_for_sampler = live_anchor.clone();
     let t0 = std::time::Instant::now();
     let sampler = std::thread::spawn(move || {
         // Resolve the anchor once. At most five diagnostic snapshots per lane, after timed
@@ -4507,6 +4537,11 @@ fn load_and_measure_for_with_phase_hook(
                         if let Ok(mut points) = vf_points_for_sampler.lock() {
                             if points.len() < 3 && voltage_started_ms >= u128::from(ms) * (points.len() as u128 + 1) / 4 {
                                 points.push(vf_points_text(voltage_started_ms, highest_mv));
+                                if let Some((_, _, effective_mhz, _)) =
+                                    live_anchor_index.and_then(nidavellir_gpu_nvapi::read_vf_point_snapshot)
+                                {
+                                    live_anchor_for_sampler.fetch_min(effective_mhz, Ordering::SeqCst);
+                                }
                             }
                         }
                     }
@@ -4618,6 +4653,7 @@ fn load_and_measure_for_with_phase_hook(
     let cancelled = cancel.is_some_and(|token| token.load(Ordering::SeqCst));
     sampler_stop.store(true, Ordering::SeqCst);
     let _ = sampler.join();
+    let live_anchor_mhz = Some(live_anchor.load(Ordering::SeqCst)).filter(|clock| *clock != u32::MAX);
 
     let volt_mv = volt.load(Ordering::SeqCst);
     let prehang_stall_detected = prehang_stall.load(Ordering::SeqCst);
@@ -4635,6 +4671,7 @@ fn load_and_measure_for_with_phase_hook(
                     coverage_context,
                     qualification_power_limit_w,
                     inconclusive_reason.as_deref(),
+                    live_anchor_mhz,
                 ))
             }
             RenderStressPurpose::Dx12Qualification(pattern, _) => {
@@ -4646,15 +4683,16 @@ fn load_and_measure_for_with_phase_hook(
                     pattern,
                     qualification_power_limit_w,
                     inconclusive_reason.as_deref(),
+                    live_anchor_mhz,
                 );
                 coverage.pattern = Some(F2QualificationPattern::Dx12Game);
                 Some(coverage)
             }
             RenderStressPurpose::Dx11Qualification(_, anchor) => {
-                let mut coverage = dx11_qualification_coverage_from_run(res, dx11_report.as_ref(), &v, target_mhz);
+                let mut coverage = dx11_qualification_coverage_from_run(res, dx11_report.as_ref(), &v, target_mhz, live_anchor_mhz);
                 if let (Some(target), Some(anchor)) = (target_mhz, anchor) {
                     let reads = dx11_samples.lock().map(|g| g.clone()).unwrap_or_default();
-                    let active = dx11_residency::coverage(&reads, &dx11_activity, target, anchor);
+                    let active = dx11_residency::coverage(&reads, &dx11_activity, target, anchor, live_anchor_mhz);
                     // Replace only the old global-residency decision; preserve integrity/environment failures.
                     if coverage.verdict == F2QualificationVerdict::Pass || coverage.reason.as_deref() == Some("target_residency_low") {
                         coverage.reason = dx11_residency::refusal(&active).map(str::to_owned);
@@ -4763,6 +4801,7 @@ fn load_and_measure_for_with_phase_hook(
         vf_points_under_load: vf_points.lock().map(|points| points.clone()).unwrap_or_default(),
         clock_shares: share_text(&clocks, 4),
         volt_shares: share_text(&volt_samples, 3),
+        live_anchor_mhz,
     }
 }
 
@@ -4967,6 +5006,7 @@ fn run_f2_stock_preheat(
         let measured = load_and_measure_for(
             F2_PREHEAT_WINDOW_MS,
             RenderStressPurpose::PowerCharacterization,
+            None,
             None,
             Some(stop),
         );
@@ -5525,7 +5565,7 @@ fn synthesize_forge_profiles_capped(
     let sustained = |p: &PowerSweepPoint| {
         let p5 = p.p5_clock_mhz.unwrap_or(p.clock_mhz);
         match p.target_clock_mhz.filter(|_| p.boundary_voltage_mv.is_some()) {
-            Some(target) if nidavellir_core::f2_observation::f2_clock_held(p5, target) => target,
+            Some(target) if nidavellir_core::f2_observation::f2_clock_held(p5, target, None) => target,
             _ => p5,
         }
     };
@@ -7309,6 +7349,7 @@ pub(crate) struct SingleDwell {
     pub vf_points_under_load: Vec<String>,
     pub clock_shares: String,
     pub volt_shares: String,
+    pub live_anchor_mhz: Option<u32>,
 }
 
 /// Run ONE game-power load dwell via the validated [`load_and_measure`] path (fresh wgpu context,
@@ -7319,11 +7360,13 @@ pub(crate) struct SingleDwell {
 pub(crate) fn single_load_dwell_with_cancel(
     dwell_ms: u64,
     cancel: Option<&AtomicBool>,
+    anchor_mv: Option<u32>,
 ) -> SingleDwell {
     let m = load_and_measure_for(
         dwell_ms,
         RenderStressPurpose::PowerCharacterization,
         None,
+        anchor_mv,
         cancel,
     );
     single_dwell_from_measured(m)
@@ -7339,11 +7382,13 @@ pub(crate) fn single_qualifier_dwell_with_cancel(
     pattern: VfQualifierPattern,
     goldens: RenderGoldens,
     cancel: Option<&AtomicBool>,
+    anchor_mv: Option<u32>,
 ) -> SingleDwell {
     let m = load_and_measure_for(
         dwell_ms,
         RenderStressPurpose::VfQualification(pattern, goldens, QualifierCoverageContext::Strict),
         Some(target_mhz),
+        anchor_mv,
         cancel,
     );
     single_dwell_from_measured(m)
@@ -7357,6 +7402,7 @@ pub(crate) fn single_frontier_texture_qualifier_dwell_with_cancel(
     target_mhz: u32,
     goldens: RenderGoldens,
     cancel: Option<&AtomicBool>,
+    anchor_mv: Option<u32>,
 ) -> SingleDwell {
     let m = load_and_measure_for(
         dwell_ms,
@@ -7366,6 +7412,7 @@ pub(crate) fn single_frontier_texture_qualifier_dwell_with_cancel(
             QualifierCoverageContext::FrontierTexture,
         ),
         Some(target_mhz),
+        anchor_mv,
         cancel,
     );
     single_dwell_from_measured(m)
@@ -7387,6 +7434,7 @@ pub(crate) fn single_qualifier_dwell_with_cancel_and_phase_hook(
         dwell_ms,
         RenderStressPurpose::VfQualification(pattern, goldens, QualifierCoverageContext::Strict),
         Some(target_mhz),
+        None,
         cancel,
         Some(phase_hook),
     );
@@ -7415,6 +7463,7 @@ pub(crate) fn single_dx11_qualifier_dwell_at_anchor(
         dwell_ms,
         RenderStressPurpose::Dx11Qualification(golden, anchor_mv),
         Some(target_mhz),
+        anchor_mv,
         cancel,
     );
     single_dwell_from_measured(m)
@@ -7426,11 +7475,13 @@ pub(crate) fn single_dx12_qualifier_dwell_with_cancel(
     target_mhz: u32,
     goldens: RenderGoldens,
     cancel: Option<&AtomicBool>,
+    anchor_mv: Option<u32>,
 ) -> SingleDwell {
     let m = load_and_measure_for(
         dwell_ms,
         RenderStressPurpose::Dx12Qualification(VfQualifierPattern::V8Texture, goldens),
         Some(target_mhz),
+        anchor_mv,
         cancel,
     );
     single_dwell_from_measured(m)
@@ -7469,6 +7520,7 @@ fn single_dwell_from_measured(m: Measured) -> SingleDwell {
         vf_points_under_load: m.vf_points_under_load,
         clock_shares: m.clock_shares,
         volt_shares: m.volt_shares,
+        live_anchor_mhz: m.live_anchor_mhz,
     }
 }
 
@@ -10628,7 +10680,7 @@ mod tests {
             _ => (1800, 160.0, false, Some(target_temp), phase.code(), false),
         })).collect::<Vec<_>>();
         let endurance = |samples: &[PhaseSample]| qualification_coverage_from_run(StabilityResult::Stable,
-            &reports, samples, Some(1800), VfQualifierPattern::Endurance, Some(200.0), None);
+            &reports, samples, Some(1800), VfQualifierPattern::Endurance, Some(200.0), None, None);
         let pass = endurance(&run(78.0));
         assert_eq!(pass.verdict, F2QualificationVerdict::Pass);
         let rop = pass.phase_metrics.iter()
@@ -11951,6 +12003,7 @@ mod tests {
             VfQualifierPattern::Fsgl3A,
             Some(200.0),
             None,
+            None,
         );
         assert_eq!(pass.verdict, F2QualificationVerdict::Pass);
         assert_eq!(pass.strength, F2QualificationStrength::Fsgl3);
@@ -11968,6 +12021,7 @@ mod tests {
             Some(1800),
             VfQualifierPattern::V8Texture,
             Some(200.0),
+            None,
             None,
         );
         assert_eq!(texture_pass.verdict, F2QualificationVerdict::Pass);
@@ -11990,6 +12044,7 @@ mod tests {
             VfQualifierPattern::V8Texture,
             Some(200.0),
             None,
+            None,
         );
         assert_eq!(adjacent_lower_bin.target_residency_frac, Some(1.0));
         let frontier_adjacent_lower_bin = qualification_coverage_from_run_with_context(
@@ -12000,6 +12055,7 @@ mod tests {
             VfQualifierPattern::V8Texture,
             QualifierCoverageContext::FrontierTexture,
             Some(200.0),
+            None,
             None,
         );
         assert_eq!(frontier_adjacent_lower_bin.target_residency_frac, Some(1.0));
@@ -12018,6 +12074,7 @@ mod tests {
             QualifierCoverageContext::FrontierTexture,
             Some(200.0),
             None,
+            None,
         );
         assert_eq!(
             frontier_two_bins_lower.verdict,
@@ -12028,6 +12085,15 @@ mod tests {
             Some("heavy_clock_not_sustained")
         );
         assert_eq!(frontier_two_bins_lower.target_residency_frac, Some(0.0));
+        // Unless the GPU set the raised anchor there itself as it heated (RTX 5070, field report
+        // 2026-10-22): the strict lane then holds that live point, and records it.
+        let shifted = |live| qualification_coverage_from_run(StabilityResult::Stable, &reports,
+            &two_bins_lower_samples, Some(1800), VfQualifierPattern::V8Texture, Some(200.0), None, live);
+        let held_live = shifted(Some(1770));
+        assert_eq!((held_live.verdict, held_live.target_residency_frac, held_live.live_anchor_mhz),
+            (F2QualificationVerdict::Pass, Some(1.0), Some(1770)));
+        assert_eq!(shifted(Some(1740)).reason.as_deref(), Some("heavy_clock_not_sustained"),
+            "the live point moved 60 MHz: no thermal shift, so the target stays the floor");
 
         // Representative-load contract: a two-bin droop NVML attributes to the SW power cap is held
         // whatever the 1 s-averaged power reads (these samples read <=180 W); the same droop without
@@ -12037,7 +12103,7 @@ mod tests {
             (clock, sample.1, capped, sample.3, sample.4, hw_thermal)
         }).collect::<Vec<_>>();
         let texture = |samples: &[PhaseSample]| qualification_coverage_from_run(StabilityResult::Stable,
-            &reports, samples, Some(1800), VfQualifierPattern::V8Texture, Some(200.0), None);
+            &reports, samples, Some(1800), VfQualifierPattern::V8Texture, Some(200.0), None, None);
         assert_eq!(texture(&droop(true, false)).verdict, F2QualificationVerdict::Pass);
         for (capped, thermal) in [(false, false), (true, true)] {
             let refused = texture(&droop(capped, thermal));
@@ -12059,6 +12125,7 @@ mod tests {
             VfQualifierPattern::V8Texture,
             Some(200.0),
             Some("field_secondary_init_failed: test"),
+            None,
         );
         assert_eq!(
             environment_inconclusive.verdict,
@@ -12084,6 +12151,7 @@ mod tests {
             VfQualifierPattern::V8Texture,
             Some(200.0),
             None,
+            None,
         );
         assert_eq!(numeric_pass.verdict, F2QualificationVerdict::Pass);
 
@@ -12107,6 +12175,7 @@ mod tests {
             VfQualifierPattern::V8Texture,
             Some(200.0),
             None,
+            None,
         );
         assert_eq!(low_telemetry.verdict, F2QualificationVerdict::Inconclusive);
         assert_eq!(
@@ -12129,6 +12198,7 @@ mod tests {
             VfQualifierPattern::V8Texture,
             Some(200.0),
             None,
+            None,
         );
         assert_eq!(power_bound.verdict, F2QualificationVerdict::Inconclusive);
         assert_eq!(
@@ -12145,6 +12215,7 @@ mod tests {
             VfQualifierPattern::V8Texture,
             Some(200.0),
             None,
+            None,
         );
         assert_eq!(
             missing_cadence.verdict,
@@ -12159,6 +12230,7 @@ mod tests {
             VfQualifierPattern::Fsgl3B,
             Some(200.0),
             None,
+            None,
         );
         assert_eq!(failed.verdict, F2QualificationVerdict::Fail);
         assert_eq!(failed.strength, F2QualificationStrength::Fsgl3);
@@ -12170,6 +12242,7 @@ mod tests {
             Some(1800),
             VfQualifierPattern::Fsgl1,
             Some(200.0),
+            None,
             None,
         );
         assert_eq!(missing_phase.verdict, F2QualificationVerdict::Inconclusive);
@@ -12187,9 +12260,9 @@ mod tests {
         let idle = [[210, 50, 40, 0]];
         let phases = [("field-concurrency", &composite[..]), ("texture-rop", &texture[..]),
             ("power-opening", &opening[..]), ("idle-pulse", &idle[..])];
-        assert_eq!(f2_sustain_detail(phases.into_iter(), 2745).as_deref(), Some(
+        assert_eq!(f2_sustain_detail(phases.into_iter(), 2745, None).as_deref(), Some(
             "texture-rop: 40/46 samples held 2745 MHz; off target: 2715 MHz@69C x4, 2700 MHz@69C x2"));
-        assert_eq!(f2_sustain_detail(phases[2..].iter().copied(), 2745), None, "no phase was judged");
+        assert_eq!(f2_sustain_detail(phases[2..].iter().copied(), 2745, None), None, "no phase was judged");
     }
 
     #[cfg(windows)]
@@ -12221,6 +12294,7 @@ mod tests {
             Some(&report),
             &samples,
             Some(1800),
+            None,
         );
         assert_eq!(pass.verdict, F2QualificationVerdict::Pass);
         assert_eq!(pass.pattern, Some(F2QualificationPattern::Dx11Game));
@@ -12234,6 +12308,7 @@ mod tests {
         excursion[50].0 = 1815;
         let excursion_coverage = dx11_qualification_coverage_from_run(
             StabilityResult::Stable, Some(&report), &excursion, Some(1800),
+            None,
         );
         assert_eq!(excursion_coverage.phase_metrics[0].clock_p95, Some(1800));
         assert_eq!(excursion_coverage.phase_metrics[0].clock_max, Some(1815));
@@ -12247,6 +12322,7 @@ mod tests {
                 Some(&no_compute),
                 &samples,
                 Some(1800),
+                None,
             )
             .verdict,
             F2QualificationVerdict::Inconclusive
@@ -12257,6 +12333,7 @@ mod tests {
             Some(&report),
             &[],
             Some(1800),
+            None,
         );
         assert_eq!(no_telemetry.verdict, F2QualificationVerdict::Inconclusive);
 
@@ -12265,6 +12342,7 @@ mod tests {
             Some(&report),
             &samples,
             Some(1800),
+            None,
         );
         assert_eq!(wrong_result.verdict, F2QualificationVerdict::Fail);
 
@@ -12275,6 +12353,7 @@ mod tests {
             Some(&wrong_adapter),
             &samples,
             Some(1800),
+            None,
         );
         assert_eq!(wrong_adapter.verdict, F2QualificationVerdict::Inconclusive);
     }
@@ -13220,6 +13299,7 @@ mod tests {
             vf_points_under_load: Vec::new(),
             clock_shares: "-".into(),
             volt_shares: "-".into(),
+            live_anchor_mhz: None,
         }
     }
 
@@ -16397,6 +16477,7 @@ mod tests {
             retry_count: 0,
             reason: None,
             phase_metrics: Vec::new(),
+            live_anchor_mhz: None,
         });
         observation.evidence_provenance = Some(F2EvidenceProvenance {
             build_version: Some("0.1.0".into()),
@@ -16457,6 +16538,7 @@ mod tests {
             retry_count,
             reason: Some("target_residency_low".into()),
             phase_metrics: Vec::new(),
+            live_anchor_mhz: None,
         });
         observation.evidence_provenance = Some(F2EvidenceProvenance {
             build_version: Some("0.1.0".into()),

@@ -2724,7 +2724,8 @@ fn classify_f2_stress_dwell(
             .and_then(|coverage| coverage.reason.as_deref())
             .unwrap_or("qualification_coverage_missing"))
     } else if purpose == F2StressPurpose::PowerDiscovery
-        && s.p5_clock_mhz + F2_CLOCK_DROP_TOL_MHZ < target_mhz
+        && s.p5_clock_mhz + F2_CLOCK_DROP_TOL_MHZ
+            < nidavellir_core::f2_observation::f2_held_reference_mhz(target_mhz, s.live_anchor_mhz)
     {
         (F2DwellOutcome::ClockDrop, None)
     } else {
@@ -2867,7 +2868,11 @@ impl F2Ops for RealF2Ops<'_> {
     fn dwell(&mut self) -> F2DwellResult {
         let s = match self.stress_purpose {
             F2StressPurpose::PowerDiscovery => {
-                crate::gpu_power_sweep::single_load_dwell_with_cancel(self.dwell_ms, self.cancel)
+                crate::gpu_power_sweep::single_load_dwell_with_cancel(
+                    self.dwell_ms,
+                    self.cancel,
+                    Some(self.candidate.voltage_mv),
+                )
             }
             F2StressPurpose::V8Qualification(F2QualificationPattern::Dx11Game, goldens)
             | F2StressPurpose::ApplyQualification(F2QualificationPattern::Dx11Game, goldens) => {
@@ -2886,6 +2891,7 @@ impl F2Ops for RealF2Ops<'_> {
                     self.target_mhz,
                     goldens.for_dx12(),
                     self.cancel,
+                    Some(self.candidate.voltage_mv),
                 )
             }
             F2StressPurpose::V8Qualification(F2QualificationPattern::Texture, goldens) => {
@@ -2894,6 +2900,7 @@ impl F2Ops for RealF2Ops<'_> {
                     self.target_mhz,
                     goldens,
                     self.cancel,
+                    Some(self.candidate.voltage_mv),
                 )
             }
             purpose => crate::gpu_power_sweep::single_qualifier_dwell_with_cancel(
@@ -2906,6 +2913,7 @@ impl F2Ops for RealF2Ops<'_> {
                     .render_goldens()
                     .expect("qualification purpose has stock goldens"),
                 self.cancel,
+                Some(self.candidate.voltage_mv),
             ),
         };
         // Mixed qualification telemetry is intentionally excluded from ClockDrop classification:
@@ -2931,7 +2939,7 @@ impl F2Ops for RealF2Ops<'_> {
             "undervolt-probe dwell: {outcome:?} reason={inconclusive_reason:?} avg_clock={} MHz p5={} MHz p95={} MHz max={} MHz \
              power_avg={:.0} W power_p99={:?} W power_peak={:.0} W max_temp={:?} C \
              voltage={}..{} mV ({} samples) thermal_throttled={} silent_error={} \
-             clock_limits={} vf_points=[{}] clocks=[{}] volts=[{}]",
+             clock_limits={} vf_points=[{}] clocks=[{}] volts=[{}] live_anchor={:?} MHz",
             s.avg_clock_mhz,
             s.p5_clock_mhz,
             s.p95_clock_mhz,
@@ -2948,7 +2956,8 @@ impl F2Ops for RealF2Ops<'_> {
             nidavellir_core::nvml_gpu::clock_limit_names(s.throttle_bits_seen),
             s.vf_points_under_load.join("; "),
             s.clock_shares,
-            s.volt_shares
+            s.volt_shares,
+            s.live_anchor_mhz
         );
         F2DwellResult {
             outcome,
@@ -5606,6 +5615,7 @@ mod tests {
             vf_points_under_load: Vec::new(),
             clock_shares: "-".into(),
             volt_shares: "-".into(),
+            live_anchor_mhz: None,
         };
         let rare_excursion = &mut base;
         rare_excursion.thermal_throttled = false;
@@ -5777,6 +5787,7 @@ mod tests {
             retry_count: 0,
             reason: None,
             phase_metrics: Vec::new(),
+            live_anchor_mhz: None,
         }
     }
 
@@ -6165,6 +6176,7 @@ mod tests {
             retry_count,
             reason: Some("target_residency_low".into()),
             phase_metrics: Vec::new(),
+            live_anchor_mhz: None,
         });
         report.evidence_provenance = Some(F2EvidenceProvenance {
             build_version: Some("0.1.0".into()),
@@ -6301,6 +6313,7 @@ mod tests {
             vf_points_under_load: Vec::new(),
             clock_shares: "-".into(),
             volt_shares: "-".into(),
+            live_anchor_mhz: None,
         };
         stable_low_p5.max_power_w = 200.0;
         stable_low_p5.max_clock_mhz = 1815;
@@ -6315,6 +6328,23 @@ mod tests {
             classify_f2_stress_dwell(&stable_low_p5, 1800, F2StressPurpose::PowerDiscovery).0,
             F2DwellOutcome::ClockDrop
         );
+        // Thermal shift (RTX 5070, field report 2026-10-22): the GPU set the raised anchor 30 MHz
+        // lower; holding that live point within one bin is held, a larger gap still drops.
+        let discovery = |s: &crate::gpu_power_sweep::SingleDwell| {
+            classify_f2_stress_dwell(s, 1800, F2StressPurpose::PowerDiscovery).0
+        };
+        stable_low_p5.p5_clock_mhz = 1755;
+        assert_eq!(discovery(&stable_low_p5), F2DwellOutcome::ClockDrop);
+        stable_low_p5.live_anchor_mhz = Some(1770);
+        assert_eq!(discovery(&stable_low_p5), F2DwellOutcome::Stable);
+        stable_low_p5.p5_clock_mhz = 1754;
+        assert_eq!(discovery(&stable_low_p5), F2DwellOutcome::ClockDrop);
+        stable_low_p5.live_anchor_mhz = Some(1700);
+        stable_low_p5.p5_clock_mhz = 1760;
+        assert_eq!(discovery(&stable_low_p5), F2DwellOutcome::ClockDrop,
+            "a live point 100 MHz down is no thermal shift: the target stays the floor");
+        stable_low_p5.p5_clock_mhz = 1200;
+        stable_low_p5.live_anchor_mhz = None;
         assert_eq!(
             classify_f2_stress_dwell(
                 &stable_low_p5,
