@@ -2626,6 +2626,8 @@ pub(crate) fn forge_log_text(prog: &PowerSweepProgress) -> Result<ForgeLogText, 
         if o.blacklisted {
             flags.push("blacklisted");
         }
+        let reason = o.inconclusive_reason.as_deref()
+            .or_else(|| cov.and_then(|coverage| coverage.reason.as_deref()));
         out.push_str(&format!(
             "{} | {:?} | {}@{} | {:?} | {}/{}/{} | {}/{}/{} | {}/{}/{} | {} | {}/{}/{} | {} | {}\n",
             o.timestamp,
@@ -2652,10 +2654,15 @@ pub(crate) fn forge_log_text(prog: &PowerSweepProgress) -> Result<ForgeLogText, 
             verdict,
             fail,
             flags.join(","),
-            o.inconclusive_reason.as_deref()
-                .or_else(|| cov.and_then(|coverage| coverage.reason.as_deref()))
-                .unwrap_or("-"),
+            reason.unwrap_or("-"),
         ));
+        #[cfg(windows)]
+        if let Some(detail) = cov.filter(|_| reason == Some("heavy_clock_not_sustained")).and_then(|coverage| {
+            let phases = coverage.phase_metrics.iter().map(|m| (m.phase_name.as_str(), m.clock_temp.as_slice()));
+            f2_sustain_detail(phases, o.target_mhz)
+        }) {
+            out.push_str(&format!("  -> {detail}\n"));
+        }
     }
 
     Ok(ForgeLogText { text: out, generated, observations, run_ids, incident_count: incidents.len() })
@@ -3588,6 +3595,41 @@ fn f2_clock_temp_cells(samples: &[PhaseSample]) -> Vec<[u32; 4]> {
     cells.into_iter().map(|((clock, temp), [n, capped])| [clock, temp, n, capped]).collect()
 }
 
+/// Phases that must hold the target, at least 95% of their samples. LoadStep is deliberately
+/// absent: its drained idle gaps are the stimulus, not missing sustain.
+#[cfg(windows)]
+const F2_SUSTAIN_PHASES: [VfQualifierPhase; 7] = [
+    VfQualifierPhase::CompositeGameLoad, VfQualifierPhase::MixedGame, VfQualifierPhase::TextureRop,
+    VfQualifierPhase::VramPressure, VfQualifierPhase::HeavySpike, VfQualifierPhase::PowerOpening,
+    VfQualifierPhase::PowerClosing,
+];
+/// The 30 s screening's ~390 ms opening/closing phases hold ~13 samples: too few to prove sustain
+/// either way, so they are skipped instead of refusing every short screening.
+#[cfg(windows)]
+const F2_SUSTAIN_MIN_SAMPLES: u32 = 20;
+
+/// The sustain phase that held its target least, from persisted (phase, clock × temperature cells),
+/// counted as the check counts: on target, or held back by the power cap. Off-target cells at the
+/// lane's hottest temperature point to thermal drift; cooler ones to a ramp or a dip. Both refusals
+/// that stopped an RTX 4070 SUPER (field report 2026-10-22) kept p5 at the target.
+#[cfg(windows)]
+fn f2_sustain_detail<'a>(phases: impl Iterator<Item = (&'a str, &'a [[u32; 4]])>, target: u32) -> Option<String> {
+    let held = |clock: u32| nidavellir_core::f2_observation::f2_clock_held(clock, target);
+    let (phase, inside, total, cells) = phases
+        .filter(|(name, _)| F2_SUSTAIN_PHASES.iter().any(|phase| phase.label() == *name))
+        .map(|(name, cells)| {
+            let total: u32 = cells.iter().map(|c| c[2]).sum();
+            let inside: u32 = cells.iter().map(|c| if held(c[0]) { c[2] } else { c[3] }).sum();
+            (name, inside, total, cells)
+        })
+        .filter(|(_, _, total, _)| *total >= F2_SUSTAIN_MIN_SAMPLES)
+        .min_by(|a, b| (u64::from(a.1) * u64::from(b.2)).cmp(&(u64::from(b.1) * u64::from(a.2))))?;
+    let mut off: Vec<_> = cells.iter().filter(|c| !held(c[0]) && c[2] > c[3]).collect();
+    off.sort_by_key(|c| std::cmp::Reverse(c[2] - c[3]));
+    let off: Vec<_> = off.iter().take(6).map(|c| format!("{} MHz@{}C x{}", c[0], c[1], c[2] - c[3])).collect();
+    Some(format!("{phase}: {inside}/{total} samples held {target} MHz; off target: {}", off.join(", ")))
+}
+
 #[cfg(windows)]
 fn qualification_coverage_from_run(
     result: StabilityResult,
@@ -3755,18 +3797,12 @@ fn qualification_coverage_from_run_with_context(
         })
         .collect::<Vec<_>>();
 
-    // LoadStep is deliberately absent: its drained idle gaps are the stimulus, not missing sustain.
     let heavy_refusal = target_mhz.and_then(|target| {
         let mut evaluated = false;
-        let refusal = phase_reports.iter().filter(|report| matches!(report.phase,
-            VfQualifierPhase::CompositeGameLoad | VfQualifierPhase::MixedGame |
-            VfQualifierPhase::TextureRop | VfQualifierPhase::VramPressure |
-            VfQualifierPhase::HeavySpike | VfQualifierPhase::PowerOpening |
-            VfQualifierPhase::PowerClosing)).find_map(|report| {
+        let refusal = phase_reports.iter().filter(|report| F2_SUSTAIN_PHASES.contains(&report.phase))
+            .find_map(|report| {
                 let phase: Vec<_> = samples.iter().filter(|s| s.4 == report.phase.code()).collect();
-                // The 30 s screening's ~390 ms opening/closing phases hold ~13 samples: too few to
-                // prove sustain either way. Skip them instead of refusing every short screening.
-                if phase.len() < 20 { return None; }
+                if phase.len() < F2_SUSTAIN_MIN_SAMPLES as usize { return None; }
                 evaluated = true;
                 let held = phase.iter().filter(|s| nidavellir_core::f2_observation::f2_clock_held(s.0, target)
                     || f2_power_limited_sample(s.2, s.5)).count();
@@ -12135,6 +12171,22 @@ mod tests {
         );
         assert_eq!(missing_phase.verdict, F2QualificationVerdict::Inconclusive);
         assert_eq!(missing_phase.strength, F2QualificationStrength::Fsgl1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_sustain_names_the_phase_that_held_least_and_where_it_dropped() {
+        // Cells: [clock MHz, °C, samples, SW power-cap samples]. Capped samples count as held, a
+        // phase under 20 samples and a phase outside the sustain check are not judged.
+        let texture = [[2745, 68, 40, 0], [2715, 69, 4, 0], [2700, 69, 2, 0]];
+        let composite = [[2745, 69, 98, 0], [2730, 69, 2, 0], [2700, 70, 3, 3]];
+        let opening = [[2400, 60, 13, 0]];
+        let idle = [[210, 50, 40, 0]];
+        let phases = [("field-concurrency", &composite[..]), ("texture-rop", &texture[..]),
+            ("power-opening", &opening[..]), ("idle-pulse", &idle[..])];
+        assert_eq!(f2_sustain_detail(phases.into_iter(), 2745).as_deref(), Some(
+            "texture-rop: 40/46 samples held 2745 MHz; off target: 2715 MHz@69C x4, 2700 MHz@69C x2"));
+        assert_eq!(f2_sustain_detail(phases[2..].iter().copied(), 2745), None, "no phase was judged");
     }
 
     #[cfg(windows)]
