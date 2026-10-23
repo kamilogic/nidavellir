@@ -5589,17 +5589,22 @@ fn synthesize_forge_profiles_capped(
         }
     };
 
-    // Godforge = highest sustainable clock (ties → the lowest power that holds it).
-    let godforge = pool
+    // Godforge = highest sustainable clock; among those, the lowest power that holds it. Readings
+    // within 1% of that one, or all on the board limit, are the limiter's set point, not the pair's:
+    // an RTX 3060 Ti's 1890 pairs at 937 and 950 mV read 199 and 195.7 of 200 W (field report
+    // 2026-10-23). Then the lowest voltage takes it: the same clock with less heat.
+    let top_clock = pool.iter().map(|(p, _)| sustained(p)).max().unwrap();
+    let at_top: Vec<_> = pool.iter().copied().filter(|(p, _)| sustained(p) == top_clock).collect();
+    let least_power = at_top.iter().map(|(p, _)| profile_power(p)).fold(f32::INFINITY, f32::min);
+    let on_limit = |power: f32| power_limit_w > 0.0 && power >= power_limit_w * 0.97;
+    let godforge = at_top
         .iter()
         .copied()
-        .max_by(|a, b| {
-            sustained(&a.0).cmp(&sustained(&b.0)).then(
-                profile_power(&b.0)
-                    .partial_cmp(&profile_power(&a.0))
-                    .unwrap_or(Ord::Equal),
-            )
+        .filter(|(p, _)| {
+            let power = profile_power(p);
+            power <= least_power * 1.01 || (on_limit(least_power) && on_limit(power))
         })
+        .min_by_key(|(p, _)| p.vf_table_voltage_mv.unwrap_or(u32::MAX))
         .unwrap();
     let gc = sustained(&godforge.0) as f64;
     let gp = profile_power(&godforge.0) as f64;
@@ -12441,6 +12446,24 @@ mod tests {
             vf_table_voltage_mv: None,
             ..Default::default()
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn godforge_takes_the_lowest_voltage_when_power_readings_sit_on_the_board_limit() {
+        // Field report 2026-10-23 (RTX 3060 Ti, 200 W): 1890 pairs held the target with the limiter
+        // at its set point, so their power readings rank nothing.
+        let pair = |mv: u32, power: f32| (PowerSweepPoint {
+            target_clock_mhz: Some(1890), p5_clock_mhz: Some(1875), boundary_voltage_mv: Some(893),
+            vf_table_voltage_mv: Some(mv), power_p99_w: Some(power), ..fp(1890, power)
+        }, 0.99);
+        let godforge = |points: &[(PowerSweepPoint, f64)]| {
+            synthesize_forge_profiles_capped(points, &ForgePolicy::balanced(), 200.0)
+                .godforge.and_then(|point| point.vf_table_voltage_mv)
+        };
+        assert_eq!(godforge(&[pair(950, 195.7), pair(937, 199.0)]), Some(937));
+        assert_eq!(godforge(&[pair(950, 168.0), pair(937, 169.5)]), Some(937), "within 1%: a tie");
+        assert_eq!(godforge(&[pair(950, 160.0), pair(937, 170.0)]), Some(950), "off the limit, power decides");
     }
 
     #[cfg(windows)]
