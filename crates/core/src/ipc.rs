@@ -423,6 +423,10 @@ pub struct ForgeDiscoveryBand {
     /// the game margin is anchored 10 mV above it.
     #[serde(default)]
     pub lowest_hot_bin: bool,
+    /// Search 14: the level is testing the bin its 10 mV step skipped above its first failure; the
+    /// value is that failure's edge reason, kept if the bin passes. None otherwise.
+    #[serde(default)]
+    pub refining_edge: Option<String>,
     pub last_qualified_clock_mhz: Option<u32>,
     pub last_qualified_voltage_mv: Option<u32>,
     /// Performance exploration alternates one lower voltage bin and one higher clock bin.

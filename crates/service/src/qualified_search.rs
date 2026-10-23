@@ -8,8 +8,8 @@
 //!    must pass its margin pair (power-free voltage minus the margin) before its publication pair
 //!    (the power-free voltage) is qualified.
 //! 3. The -5% and -10% levels of the compensated top start at the lowest voltage the level above
-//!    passed and descend in two-bin steps until the first failure. A publication pair above the
-//!    tested range gets its own admission.
+//!    passed and descend in two-bin steps until the first failure. A publication pair the descent
+//!    did not test, above its range or between two of its steps, gets its own admission.
 //! 4. Three distinct profiles (user decision 2026-09-30): a lower level must end two steps below
 //!    its start, else it retries one clock bin lower (at most two); one that never went below its
 //!    start publishes nothing.
@@ -23,37 +23,49 @@
 //!    already runs it with less voltage, and the plan refuses it. The compensated top publishes at
 //!    the highest voltage that is power-free AND still below stock at its clock, and a lower level
 //!    starts no higher than that.
+//! 8. Steps are physical (user decision 2026-10-23): clocks move by GPU Boost's 15 MHz step and
+//!    voltages by mV, whatever the spacing of a series' curve points. A lower level's edge is one
+//!    bin exact: the bin its 10 mV step skipped above the first failure is tested on its own, and
+//!    a crash there is an edge like any other.
 
 use nidavellir_core::ipc::{ForgeDiscoveryBand, ForgeDiscoverySearch};
 
-pub const VERSION: u32 = 13;
-/// Room for the distinct-profile clock retries; the time budget remains the hard cap.
-pub const STANDARD_ATTEMPTS: u32 = 30;
+pub const VERSION: u32 = 14;
+/// Room for the distinct-profile clock retries, each level's edge refinement and a publication pair
+/// the descent skipped; the time budget remains the hard cap.
+pub const STANDARD_ATTEMPTS: u32 = 36;
 pub const STANDARD_BUDGET_MS: u64 = 8 * 60 * 60 * 1_000;
-/// Games need about this much more voltage than the matrix approves (user decision 2026-09-29).
-/// 1830@856 passed the matrix, yet 1815@875 crashes Overwatch within 30 min and 1800@875 is the
-/// user's daily undervolt. Godforge 1920@925, two bins above its failure, TDR'd in Overwatch after
-/// ~23 min. 36 mV is six 6.25 mV bins after integer-mV truncation (37-38 mV), never five (31 mV).
-pub const GAME_MARGIN_MV: u32 = 36;
+/// Games need about this much more voltage than the matrix approves (user decisions 2026-09-29 and
+/// 2026-10-23). 1830@856 passed the matrix, yet 1815@875 crashes Overwatch within 30 min and 1800@875
+/// is the user's daily undervolt. Godforge 1920@925, two bins above its failure, TDR'd in Overwatch
+/// after ~23 min. Two clean runs then put the 1800 MHz edge between 825 (failed) and 831 (passed):
+/// six bins over 831 published 868, as close to that edge as the 1815@875 crash, while 875 is seven.
+/// 43 mV is seven 6.25 mV bins after integer-mV truncation (43-44 mV), never six (37-38 mV). It is
+/// a voltage, so 5 mV curves (RTX 40/50) get the same margin, 45 mV up.
+pub const GAME_MARGIN_MV: u32 = 43;
+/// GPU Boost moves clocks in 15 MHz steps on every series, even where curve points sit closer (an
+/// RTX 5070's are ~7.5 MHz apart), so the search moves a clock by at least this much.
+const BOOST_STEP_MHZ: u32 = 15;
 /// Test-edge slope used only to predict the compensated top clock. On the test 3060 Ti the edge
-/// fell 918 → 856 mV over 1920 → 1830 MHz, ~10 mV per 15 MHz bin. The margin pair verifies it.
-const COMPENSATION_MV_PER_CLOCK_BIN: u32 = 10;
-/// A hot-bin pass is evidence one clock bin lower, worth this much voltage at the target by the
+/// fell 918 → 856 mV over 1920 → 1830 MHz, ~10 mV per boost step. The margin pair verifies it.
+const COMPENSATION_MV_PER_BOOST_STEP: u32 = 10;
+/// A hot-bin pass is evidence one boost step lower, worth this much voltage at the target by the
 /// same test-edge slope. Profile synthesis applies the identical anchor rule.
-pub const HOT_BIN_RELIEF_MV: u32 = COMPENSATION_MV_PER_CLOCK_BIN;
+pub const HOT_BIN_RELIEF_MV: u32 = COMPENSATION_MV_PER_BOOST_STEP;
 
 fn relief_mv(hot_bin: bool) -> u32 {
     if hot_bin { HOT_BIN_RELIEF_MV } else { 0 }
 }
-/// A compensated top whose margin pair fails steps one clock bin down, at most this often.
+/// A compensated top whose margin pair fails steps one boost step down, at most this often.
 const COMPENSATION_RETRIES: u32 = 2;
-/// Lower levels descend two bins per admission: their descent from the dominated start spans ~10
-/// bins, and the game margin absorbs a one-bin coarser edge.
-const LEVEL_STEP_BINS: usize = 2;
-/// A lower level is a distinct profile only this many steps below its start: with the game margin
-/// its publication then sits ~25 mV (~8 W on the test 3060 Ti) under the level above's.
-const DISTINCT_LEVEL_STEPS: usize = 2;
-/// A level that is not distinct retries one clock bin lower, at most this often. Keep the profile
+/// Lower levels descend about this much per admission, two bins on 6.25 mV and 5 mV curves alike:
+/// their descent from the dominated start spans ~10 bins. The bin a step skips above the first
+/// failure is then tested on its own, so the edge is one bin exact (user decision 2026-10-23).
+const LEVEL_STEP_MV: u32 = 10;
+/// A lower level is a distinct profile only this far below its start: with the game margin its
+/// publication then sits ~25 mV (~8 W on the test 3060 Ti) under the level above's.
+const DISTINCT_LEVEL_MV: u32 = 25;
+/// A level that is not distinct retries one boost step lower, at most this often. Keep the profile
 /// clock floors (Brokkr's 92%, Deep Calm 87% of Godforge) below the lowest retry.
 const LEVEL_CLOCK_RETRIES: u32 = 2;
 /// Lower clock levels after the (compensated) top, as (band id, percent of that top's clock).
@@ -65,6 +77,11 @@ fn bin_at_or_above(bins: &[u32], mv: u32) -> Option<u32> {
 
 fn bin_at_or_below(bins: &[u32], mv: u32) -> Option<u32> {
     bins.iter().copied().filter(|bin| *bin <= mv).max()
+}
+
+/// The highest clock bin at least one boost step under `clock`.
+fn step_below(clock_bins: &[u32], clock: u32) -> Option<u32> {
+    clock_bins.iter().copied().filter(|bin| bin + BOOST_STEP_MHZ <= clock).max()
 }
 
 /// The F2 plan raises its anchor, so the stock clock at the pair's voltage must stay below the
@@ -92,6 +109,18 @@ pub fn moved_below_stock(band: &ForgeDiscoveryBand) -> bool {
     band.clock_retries_used == 0
         && band.last_qualified_clock_mhz.is_none()
         && band.level_start_voltage_mv.is_some_and(|start| band.voltage_mv < start)
+}
+
+/// Whether a lower level's descent qualified `mv` at its current clock. Its 10 mV steps from the
+/// first pass skip every other bin, so seven bins over a lowest pass on a step land between two
+/// steps. ponytail: rebuilt from the step rule, not stored; a power jump mid-descent (rare) costs
+/// at worst one dominated admission, or a profile at the next tested voltage above.
+fn descent_tested(band: &ForgeDiscoveryBand, voltage_bins: &[u32], mv: u32) -> bool {
+    let mut step = band.first_qualified_voltage_mv;
+    while let Some(voltage) = step.filter(|voltage| *voltage > mv) {
+        step = bin_at_or_below(voltage_bins, voltage.saturating_sub(LEVEL_STEP_MV));
+    }
+    step == Some(mv)
 }
 
 /// The `n`-th value strictly below `from` (n >= 1), or the lowest one when fewer exist.
@@ -325,8 +354,8 @@ fn start_next_level(
             let publication = bin_at_or_above(voltage_bins, top_lowest + top_relief + GAME_MARGIN_MV);
             // Predict how far the clock must drop for the margin to fit under the power-free voltage.
             let clock = publication.filter(|mv| *mv > power_free).and_then(|mv| {
-                let bins_down = (mv - power_free).div_ceil(COMPENSATION_MV_PER_CLOCK_BIN).max(1);
-                nth_below(clock_bins, top_clock, bins_down as usize)
+                let drop_mhz = (mv - power_free).div_ceil(COMPENSATION_MV_PER_BOOST_STEP).max(1) * BOOST_STEP_MHZ;
+                clock_bins.iter().copied().filter(|clock| clock + drop_mhz <= top_clock).max()
             });
             let margin = clock.and_then(|clock| compensated_margin(voltage_bins, stock, power_free, clock));
             let band = &mut search.bands[comp];
@@ -480,7 +509,7 @@ fn record_compensated(
         // Only the hot bin can push the publication over that limit: the margin pair held one
         // clock bin lower, so the prediction steps down like a failed margin pair.
     }
-    let lower = clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max();
+    let lower = step_below(clock_bins, band.target_clock_mhz);
     let retry = lower.zip(power_free).and_then(|(clock, power_free)| {
         compensated_margin(voltage_bins, stock, power_free, clock).map(|margin| (clock, margin))
     });
@@ -513,6 +542,21 @@ fn record_level(
     power_hint: Option<PowerBoundHint>,
     clock_hint: Option<ClockDropHint>,
 ) {
+    // An edge refinement settles its level's edge with any result; nothing descends past it.
+    if let Some(edge) = search.bands[index].refining_edge.take() {
+        let band = &mut search.bands[index];
+        let reason = match outcome {
+            Outcome::Qualified | Outcome::QualifiedHotBin => {
+                band.last_qualified_voltage_mv = Some(band.voltage_mv);
+                band.lowest_hot_bin = outcome == Outcome::QualifiedHotBin;
+                edge
+            }
+            Outcome::DriverFailure => "tdr_edge".into(),
+            Outcome::IntegrityError => "integrity_edge".into(),
+            _ => "evidence_boundary".into(),
+        };
+        return finish_level(search, index, &reason, clock_bins, voltage_bins, stock);
+    }
     let band = &search.bands[index];
     let descending = band.last_qualified_clock_mhz == Some(band.target_clock_mhz)
         && band.last_qualified_voltage_mv.is_some_and(|mv| band.voltage_mv < mv);
@@ -520,7 +564,6 @@ fn record_level(
     // unless it moved under that voltage to stay below the stock curve.
     let dominated_start = band.id != "performance" && band.last_qualified_clock_mhz.is_none()
         && !moved_below_stock(band);
-    let step = if band.id == "performance" { 1 } else { LEVEL_STEP_BINS };
     match outcome {
         // The boot is dirty after a TDR (2026-07-22), so the caller stops this session. The
         // search stays open: after reboot and acknowledgement, Resume continues.
@@ -564,8 +607,14 @@ fn record_level(
                 band.status = "pending".into();
                 return;
             }
-            // Staircase: keep descending this clock until its first failure.
-            match nth_below(voltage_bins, band.voltage_mv, step) {
+            // Staircase: keep descending this clock until its first failure, one bin at the top
+            // and a 10 mV step on the lower levels.
+            let next = if band.id == "performance" {
+                nth_below(voltage_bins, band.voltage_mv, 1)
+            } else {
+                bin_at_or_below(voltage_bins, band.voltage_mv.saturating_sub(LEVEL_STEP_MV))
+            };
+            match next {
                 Some(voltage) => {
                     band.voltage_mv = voltage;
                     band.status = "pending".into();
@@ -583,8 +632,8 @@ fn record_level(
             band.status = "pending".into();
         }
         Outcome::PowerBound => {
-            // At the voltage floor, explore the next physical clock without inventing a pass.
-            let lower_clock = clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max();
+            // At the voltage floor, explore the next boost step without inventing a pass.
+            let lower_clock = step_below(clock_bins, band.target_clock_mhz);
             if band.id == "performance" && band.last_qualified_clock_mhz.is_none() && lower_clock.is_some() {
                 band.target_clock_mhz = lower_clock.unwrap();
                 band.clock_ceiling_mhz = band.target_clock_mhz;
@@ -601,7 +650,7 @@ fn record_level(
             // Only an attributed computation fault may justify more voltage, never missing
             // residency. Do not return into a voltage already rejected by the power envelope.
             let higher_voltage = voltage_bins.iter().copied().filter(|mv| *mv > band.voltage_mv).min();
-            let lower_clock = clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max();
+            let lower_clock = step_below(clock_bins, band.target_clock_mhz);
             if band.id == "performance" && band.last_qualified_clock_mhz.is_none()
                 && lower_clock.is_some() && search.integrity_errors < 2 {
                 // The upper candidate could not be qualified: at its power-free voltage it failed,
@@ -637,7 +686,7 @@ fn record_level(
             let floor = clock_hint.map_or(0, |hint| hint.stock_clock_mhz);
             let below = |limit: u32| {
                 clock_bins.iter().copied()
-                    .filter(|clock| *clock < band.target_clock_mhz && *clock <= limit && *clock > floor)
+                    .filter(|clock| clock + BOOST_STEP_MHZ <= band.target_clock_mhz && *clock <= limit && *clock > floor)
                     .max()
             };
             let lower_clock = clock_hint.and_then(|hint| below(hint.held_clock_mhz)).or_else(|| below(u32::MAX));
@@ -675,12 +724,20 @@ fn finish_level(
     let band = &mut search.bands[index];
     let lowest = band.last_qualified_voltage_mv;
     if band.id != "performance" {
-        let start = band.level_start_voltage_mv;
-        let distinct = lowest.zip(start).is_some_and(|(lowest, start)| {
-            nth_below(voltage_bins, start, DISTINCT_LEVEL_STEPS * LEVEL_STEP_BINS)
-                .is_some_and(|limit| lowest <= limit)
+        // The bin a 10 mV step skipped between the lowest pass and this edge gets its own test
+        // first, so the edge is one bin exact; Safe Loop recovery carries a crash there.
+        let skipped = lowest.and_then(|lowest| {
+            voltage_bins.iter().copied().filter(|mv| *mv > band.voltage_mv && *mv < lowest).max()
         });
-        let lower_clock = clock_bins.iter().copied().filter(|clock| *clock < band.target_clock_mhz).max()
+        if let Some(mv) = skipped.filter(|_| band.refining_edge.is_none()) {
+            band.refining_edge = Some(reason.into());
+            band.voltage_mv = mv;
+            band.status = "pending".into();
+            return;
+        }
+        let start = band.level_start_voltage_mv;
+        let distinct = lowest.zip(start).is_some_and(|(lowest, start)| lowest + DISTINCT_LEVEL_MV <= start);
+        let lower_clock = step_below(clock_bins, band.target_clock_mhz)
             .filter(|clock| lowest.is_some_and(|mv| undervolts(stock, *clock, mv)));
         if !distinct && band.clock_retries_used < LEVEL_CLOCK_RETRIES {
             if let (Some(clock), Some(mv)) = (lower_clock, lowest) {
@@ -703,9 +760,7 @@ fn finish_level(
     let relief = relief_mv(band.lowest_hot_bin);
     let publication = lowest
         .and_then(|lowest| bin_at_or_above(voltage_bins, lowest + relief + GAME_MARGIN_MV))
-        .filter(|mv| {
-            band.id != "performance" && band.first_qualified_voltage_mv.is_some_and(|start| *mv > start)
-        });
+        .filter(|mv| band.id != "performance" && !descent_tested(band, voltage_bins, *mv));
     match publication {
         // The stock curve already runs this clock below the game margin: no profile here.
         Some(mv) if !undervolts(stock, band.target_clock_mhz, mv) => close_band(band, "publication_at_stock"),
@@ -842,29 +897,53 @@ mod tests {
         let trace = walk_all(&mut state, &clocks, &volts, &[
             Qualified, Qualified, Qualified, Qualified, IntegrityError,
             Qualified, Qualified,
-            Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
-            Qualified, Qualified, Qualified, IntegrityError, Qualified,
+            Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError, Qualified,
+            Qualified, Qualified, IntegrityError, Qualified, Qualified,
         ]);
         assert_eq!(trace, [
-            // Top: 918 + 36 mV exceeds the power-free 937, so the top itself is not publishable.
+            // Top: 918 + 43 mV exceeds the power-free 937, so the top itself is not publishable.
             (0, 1920, 937), (0, 1920, 931), (0, 1920, 925), (0, 1920, 918), (0, 1920, 912),
-            // Compensated top two bins lower: margin pair first, then its publication pair.
-            (1, 1890, 900), (1, 1890, 937),
-            // -5% of 1890 from the dominated start, two bins per step; 850 + 36 mV = 887 was tested.
-            (2, 1800, 900), (2, 1800, 887), (2, 1800, 875), (2, 1800, 862), (2, 1800, 850), (2, 1800, 837),
-            // -10%: 825 + 36 mV = 862 is above its start, so it gets its own admission.
-            (3, 1710, 850), (3, 1710, 837), (3, 1710, 825), (3, 1710, 812), (3, 1710, 862),
+            // 961 → 962 sits 25 mV over 937: the compensated top is three boost steps lower, its
+            // margin pair first, then its publication pair.
+            (1, 1875, 893), (1, 1875, 937),
+            // -5% of 1875 from the dominated start, 10 mV per step. The bin skipped above the
+            // failure (837) passes, and 837 + 43 mV = 881 was already tested.
+            (2, 1785, 893), (2, 1785, 881), (2, 1785, 868), (2, 1785, 856), (2, 1785, 843), (2, 1785, 831),
+            (2, 1785, 837),
+            // -10%: its refined edge 818 + 43 mV = 862 is above its start, so it gets its own admission.
+            (3, 1695, 837), (3, 1695, 825), (3, 1695, 812), (3, 1695, 818), (3, 1695, 862),
         ]);
         let reasons: Vec<_> = state.bands.iter().map(|b| b.stop_reason.as_deref().unwrap()).collect();
         assert_eq!(reasons, ["integrity_edge", "published", "integrity_edge", "published"]);
-        assert_eq!(state.bands[1].last_qualified_voltage_mv, Some(900), "publication keeps the lowest pass");
+        assert_eq!(state.bands[1].last_qualified_voltage_mv, Some(893), "publication keeps the lowest pass");
         assert_eq!((state.integrity_errors, state.stop_reason.as_deref()), (0, Some("all_regions_closed")));
+    }
+    #[test]
+    fn a_publication_between_two_descent_steps_gets_its_own_admission() {
+        use Outcome::*;
+        // Run f2-forge-1792720262819 (3060 Ti, 2026-10-23): 1800 passed 831 and failed 818, 1710
+        // passed 781 and failed 768. Seven bins over a lowest pass on a 10 mV step land between two
+        // steps (875, 825); unproven, the profiles would take the tested step above (881, 831).
+        let (mut state, clocks, _) = staircase();
+        let volts: Vec<u32> = (0..=40u32).map(|bin| (75_000 + bin * 625) / 100).collect();
+        state.attempts_limit = STANDARD_ATTEMPTS;
+        let trace = walk_all(&mut state, &clocks, &volts, &[
+            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
+            Qualified, Qualified,
+            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError, IntegrityError, Qualified,
+            Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError, IntegrityError, Qualified,
+        ]);
+        assert_eq!(trace[7..9], [(1, 1890, 893), (1, 1890, 937)]);
+        assert_eq!(trace[14..18], [(2, 1800, 831), (2, 1800, 818), (2, 1800, 825), (2, 1800, 875)]);
+        assert_eq!(trace[22..], [(3, 1710, 781), (3, 1710, 768), (3, 1710, 775), (3, 1710, 825)]);
+        let reasons: Vec<_> = state.bands.iter().map(|b| b.stop_reason.as_deref().unwrap()).collect();
+        assert_eq!(reasons, ["integrity_edge", "published", "published", "published"]);
     }
     #[test]
     fn compensation_is_skipped_when_the_top_already_holds_the_game_margin() {
         use Outcome::*;
-        let (mut state, clocks, volts) = staircase_at(956);
-        walk_all(&mut state, &clocks, &volts, &[Qualified; 7]);
+        let (mut state, clocks, volts) = staircase_at(962);
+        walk_all(&mut state, &clocks, &volts, &[Qualified; 8]);
         walk(&mut state, &clocks, &volts, IntegrityError);
         assert_eq!(state.bands[1].stop_reason.as_deref(), Some("compensation_not_needed"));
         assert_eq!((state.bands[2].target_clock_mhz, state.bands[2].voltage_mv), (1830, 918));
@@ -876,15 +955,15 @@ mod tests {
         walk_all(&mut state, &clocks, &volts, &[Qualified, Qualified, Qualified, Qualified, IntegrityError]);
         let mut paused = state.clone();
         assert_eq!(walk_all(&mut state, &clocks, &volts, &[IntegrityError, Inconclusive, IntegrityError]),
-            [(1, 1890, 900), (1, 1875, 900), (1, 1860, 900)]);
+            [(1, 1875, 893), (1, 1860, 893), (1, 1845, 893)]);
         assert_eq!(state.bands[1].stop_reason.as_deref(), Some("compensated_top_unavailable"));
         assert_eq!(state.integrity_errors, 0, "the prediction failing is not an integrity budget event");
         // The lower levels then start from the top's lowest pass, which dominates them.
-        assert_eq!((state.bands[2].target_clock_mhz, state.bands[2].voltage_mv), (1770, 918));
-        // A TDR on the margin pair pauses with the search open, one clock bin lower.
+        assert_eq!((state.bands[2].target_clock_mhz, state.bands[2].voltage_mv), (1755, 918));
+        // A TDR on the margin pair pauses with the search open, one boost step lower.
         walk(&mut paused, &clocks, &volts, DriverFailure);
         assert_eq!((paused.stop_reason.as_deref(), paused.bands[1].status.as_str()), (None, "pending"));
-        assert_eq!(paused.bands[1].target_clock_mhz, 1875);
+        assert_eq!(paused.bands[1].target_clock_mhz, 1860);
     }
     #[test]
     fn tdr_edge_keeps_the_search_open_for_resume_but_a_dominated_start_failure_stops_it() {
@@ -895,12 +974,12 @@ mod tests {
         assert_eq!(state.stop_reason, None, "Resume after reboot continues with the next level");
         let mut restored: ForgeDiscoverySearch = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         resume_after_stock(&mut restored).unwrap();
-        // The lowest pass is 937: 937 + 36 mV rounds to 975, 38 mV over the power-free 937, so the
-        // compensated top is four clock bins lower (1860), verified at its margin pair 900.
-        assert_eq!(walk(&mut restored, &clocks, &volts, Outcome::Qualified), (1, 1860, 900));
+        // The lowest pass is 937: 937 + 43 mV rounds to 981, 44 mV over the power-free 937, so the
+        // compensated top is five boost steps lower (1845), verified at its margin pair 893.
+        assert_eq!(walk(&mut restored, &clocks, &volts, Outcome::Qualified), (1, 1845, 893));
         walk(&mut restored, &clocks, &volts, Outcome::Qualified);
         let mut dominated = restored.clone();
-        assert_eq!(walk(&mut restored, &clocks, &volts, Outcome::IntegrityError), (2, 1770, 900));
+        assert_eq!(walk(&mut restored, &clocks, &volts, Outcome::IntegrityError), (2, 1755, 893));
         assert_eq!((restored.stop_reason.as_deref(), restored.integrity_errors), (Some("dominated_pair_failed"), 1));
         assert_eq!(next_band(&restored), None);
         walk(&mut dominated, &clocks, &volts, Outcome::DriverFailure);
@@ -922,29 +1001,31 @@ mod tests {
     #[test]
     fn a_level_short_of_two_steps_retries_one_clock_bin_lower() {
         use Outcome::*;
-        // Run 1790761502529 with the power fix: the top holds 906, Godforge publishes 1905@937 and
-        // the -5% level TDRs on its first step below 900.
+        // Run 1790761502529 with the power fix: the top holds 906, Godforge publishes 1890@937 and
+        // the -5% level TDRs on its first step below its start, then on the bin that step skipped.
         let (mut state, clocks, volts) = staircase();
         let mut trace = walk_all(&mut state, &clocks, &volts, &[
             Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
             Qualified, Qualified,
-            Qualified, DriverFailure,
+            Qualified, DriverFailure, DriverFailure,
         ]);
         assert_eq!(state.stop_reason, None, "a TDR edge pauses with the search open");
         let balanced = &state.bands[2];
-        assert_eq!((balanced.target_clock_mhz, balanced.voltage_mv, balanced.clock_retries_used), (1800, 900, 1));
-        assert_eq!((balanced.level_start_voltage_mv, balanced.last_qualified_voltage_mv), (Some(900), None));
-        trace.extend(walk_all(&mut state, &clocks, &volts, &[Qualified, Qualified, Qualified, IntegrityError, Qualified]));
+        assert_eq!((balanced.target_clock_mhz, balanced.voltage_mv, balanced.clock_retries_used), (1785, 893, 1));
+        assert_eq!((balanced.level_start_voltage_mv, balanced.last_qualified_voltage_mv), (Some(893), None));
+        trace.extend(walk_all(&mut state, &clocks, &volts, &[
+            Qualified, Qualified, Qualified, IntegrityError, Qualified, Qualified,
+        ]));
         assert_eq!(trace[9..], [
-            (2, 1815, 900), (2, 1815, 887),
-            // One clock bin lower from the lowest pass (dominated there). 875 is two steps below the
-            // start, so 875 + 36 mV = 912 is published.
-            (2, 1800, 900), (2, 1800, 887), (2, 1800, 875), (2, 1800, 862), (2, 1800, 912),
+            (2, 1800, 893), (2, 1800, 881), (2, 1800, 887),
+            // One boost step lower from the lowest pass (dominated there). The refined edge 862 is
+            // more than 25 mV under the start, so 862 + 43 mV = 905 → 906 is published.
+            (2, 1785, 893), (2, 1785, 881), (2, 1785, 868), (2, 1785, 856), (2, 1785, 862), (2, 1785, 906),
         ]);
         assert_eq!(state.bands[2].stop_reason.as_deref(), Some("published"));
         let efficiency = &state.bands[3];
         assert_eq!((efficiency.target_clock_mhz, efficiency.voltage_mv, efficiency.level_start_voltage_mv),
-            (1725, 875, Some(875)));
+            (1710, 862, Some(862)));
     }
     #[test]
     fn retries_stop_after_two_clock_bins_and_publish_only_a_real_descent() {
@@ -955,21 +1036,24 @@ mod tests {
         ]);
         let mut never = state.clone();
         let trace = walk_all(&mut state, &clocks, &volts, &[
-            Qualified, IntegrityError, Qualified, IntegrityError, Qualified, Qualified, IntegrityError, Qualified,
+            Qualified, IntegrityError, IntegrityError, Qualified, IntegrityError, IntegrityError,
+            Qualified, Qualified, IntegrityError, Qualified, Qualified,
         ]);
         assert_eq!(trace, [
-            (2, 1815, 900), (2, 1815, 887), (2, 1800, 900), (2, 1800, 887),
-            // Out of retries after one step: 887 + 36 mV = 925 still sits under Godforge's 937.
-            (2, 1785, 900), (2, 1785, 887), (2, 1785, 875), (2, 1785, 925),
+            (2, 1800, 893), (2, 1800, 881), (2, 1800, 887), (2, 1785, 893), (2, 1785, 881), (2, 1785, 887),
+            // Out of retries short of 25 mV: the refined 875 + 43 mV = 918 still sits under
+            // Godforge's 937.
+            (2, 1770, 893), (2, 1770, 881), (2, 1770, 868), (2, 1770, 875), (2, 1770, 918),
         ]);
         assert_eq!((state.bands[2].stop_reason.as_deref(), state.bands[2].clock_retries_used), (Some("published"), 2));
         assert_eq!(state.integrity_errors, 0, "edges never spend the integrity budget");
         // Never below the start: no profile of its own; the -10% level starts from that lowest pass.
         walk_all(&mut never, &clocks, &volts, &[
-            Qualified, IntegrityError, Qualified, IntegrityError, Qualified, IntegrityError,
+            Qualified, IntegrityError, IntegrityError, Qualified, IntegrityError, IntegrityError,
+            Qualified, IntegrityError, IntegrityError,
         ]);
         assert_eq!(never.bands[2].stop_reason.as_deref(), Some("no_distinct_profile"));
-        assert_eq!((never.bands[3].target_clock_mhz, never.bands[3].voltage_mv), (1725, 900));
+        assert_eq!((never.bands[3].target_clock_mhz, never.bands[3].voltage_mv), (1710, 893));
     }
     #[test]
     fn a_retry_start_that_proves_nothing_never_claims_a_pair() {
@@ -977,18 +1061,18 @@ mod tests {
         let (mut state, clocks, volts) = staircase();
         walk_all(&mut state, &clocks, &volts, &[
             Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
-            Qualified, Qualified, Qualified, DriverFailure,
+            Qualified, Qualified, Qualified, DriverFailure, DriverFailure,
         ]);
         let mut power = state.clone();
         // Missing proof at the retry's dominated start closes the level without a pass.
-        assert_eq!(walk(&mut state, &clocks, &volts, Inconclusive), (2, 1800, 900));
+        assert_eq!(walk(&mut state, &clocks, &volts, Inconclusive), (2, 1785, 893));
         assert_eq!(state.bands[2].stop_reason.as_deref(), Some("evidence_incomplete_no_boundary_inferred"));
         assert_eq!(state.bands[2].last_qualified_voltage_mv, None);
-        assert_eq!((state.bands[3].target_clock_mhz, state.bands[3].voltage_mv), (1725, 900));
+        assert_eq!((state.bands[3].target_clock_mhz, state.bands[3].voltage_mv), (1710, 893));
         // A power-bound start only prepares a lower voltage, still unproven.
         walk(&mut power, &clocks, &volts, PowerBound);
         let band = &power.bands[2];
-        assert_eq!((band.voltage_mv, band.status.as_str(), band.last_qualified_voltage_mv), (893, "pending", None));
+        assert_eq!((band.voltage_mv, band.status.as_str(), band.last_qualified_voltage_mv), (887, "pending", None));
     }
     #[test]
     fn a_hot_bin_anchor_raises_the_publication_without_stopping_the_descent() {
@@ -998,14 +1082,14 @@ mod tests {
             Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
             Qualified, Qualified,
         ]);
-        // The -5% level's passes below 887 held 1815 mostly at the 1800 hot bin.
+        // The -5% level's passes below 881 held 1800 mostly at the 1785 hot bin.
         let trace = walk_all(&mut state, &clocks, &volts, &[
-            Qualified, Qualified, QualifiedHotBin, QualifiedHotBin, IntegrityError, Qualified,
+            Qualified, Qualified, QualifiedHotBin, QualifiedHotBin, IntegrityError, IntegrityError, Qualified,
         ]);
         assert_eq!(trace, [
-            (2, 1815, 900), (2, 1815, 887), (2, 1815, 875), (2, 1815, 862), (2, 1815, 850),
-            // 862 + 10 + 36 mV = 908 → 912; a plain anchor would publish the tested 900.
-            (2, 1815, 912),
+            (2, 1800, 893), (2, 1800, 881), (2, 1800, 868), (2, 1800, 856), (2, 1800, 843), (2, 1800, 850),
+            // 856 + 10 + 43 mV = 909 → 912; a plain anchor would publish 900.
+            (2, 1800, 912),
         ]);
         assert!(state.bands[2].lowest_hot_bin);
         assert_eq!((state.bands[2].stop_reason.as_deref(), state.integrity_errors), (Some("published"), 0));
@@ -1015,16 +1099,16 @@ mod tests {
         use Outcome::*;
         let (mut state, clocks, volts) = staircase();
         walk_all(&mut state, &clocks, &volts, &[Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError]);
-        // 900 + 10 + 36 mV = 946 → 950, over the power-free 937: the margin pair only held 1890.
+        // 893 + 10 + 43 mV = 946 → 950, over the power-free 937: the margin pair only held 1875.
         assert_eq!(walk_all(&mut state, &clocks, &volts, &[QualifiedHotBin, Qualified, Qualified]),
-            [(1, 1905, 900), (1, 1890, 900), (1, 1890, 937)]);
+            [(1, 1890, 893), (1, 1875, 893), (1, 1875, 937)]);
         assert_eq!(state.bands[1].stop_reason.as_deref(), Some("published"));
-        // A hot-bin top anchor: 906 + 10 + 36 mV = 952 → 956, 19 mV over 937, so two clock bins.
+        // A hot-bin top anchor: 906 + 10 + 43 mV = 959 → 962, 25 mV over 937, so three boost steps.
         let (mut hot_top, clocks, volts) = staircase();
         walk_all(&mut hot_top, &clocks, &volts, &[
             Qualified, Qualified, Qualified, Qualified, Qualified, QualifiedHotBin, IntegrityError,
         ]);
-        assert_eq!((hot_top.bands[1].target_clock_mhz, hot_top.bands[1].voltage_mv), (1890, 900));
+        assert_eq!((hot_top.bands[1].target_clock_mhz, hot_top.bands[1].voltage_mv), (1875, 893));
     }
     #[test]
     fn power_bound_lowers_voltage_at_same_clock_without_promoting_evidence() {
@@ -1092,14 +1176,15 @@ mod tests {
         assert_eq!(state.bands[0].last_qualified_clock_mhz, None, "a new hypothesis, never a pass");
         dropped(&mut state, Some(2830));
         assert_eq!(state.stop_reason.as_deref(), Some("qualified_top_unavailable"), "once per run");
-        assert_eq!(dropped(&mut fresh(), None).0, 2985, "without a measurement: one bin");
-        assert_eq!(dropped(&mut fresh(), Some(2800)).0, 2985, "held below every bin: one bin");
+        // RTX 50 curve points sit ~7.5 MHz apart; the search still moves one 15 MHz boost step.
+        assert_eq!(dropped(&mut fresh(), None).0, 2977, "without a measurement: one boost step");
+        assert_eq!(dropped(&mut fresh(), Some(2800)).0, 2977, "held below every bin: one boost step");
         // 0.8.6 at 1090 mV: the GPU held 2887, no more than that voltage's stock 2887 clock.
         let mut stock_level = fresh();
         admit(&mut stock_level, 0, 0, 100).unwrap();
         let hint = Some(ClockDropHint { held_clock_mhz: 2887, stock_clock_mhz: 2887 });
         record(&mut stock_level, 0, Outcome::Inconclusive, &clocks, &volts, &low_stock(&volts), None, hint).unwrap();
-        assert_eq!(stock_level.bands[0].target_clock_mhz, 2985, "never a pair at or under stock: one bin");
+        assert_eq!(stock_level.bands[0].target_clock_mhz, 2977, "never a pair at or under stock: one boost step");
     }
     #[test]
     fn every_pair_stays_below_the_stock_curve_of_a_gpu_at_its_voltage_limit() {
@@ -1122,18 +1207,18 @@ mod tests {
         };
         assert_eq!(go(&mut state, &[Inconclusive, Qualified, Qualified, Inconclusive]),
             [(0, 2760, 1100), (0, 2745, 1100), (0, 2745, 1095), (0, 2745, 1090)]);
-        // 1095 + 36 mV needs four clock bins (2685). Stock reaches 2685 at 1080, so its publication
-        // is 1075 and its margin pair 1035, not 1060 under the power-free 1100.
+        // 1095 + 43 mV → 1140 sits 40 mV over the power-free 1100: four boost steps (2685). Stock
+        // reaches 2685 at 1080, so its publication is 1075 and its margin pair 1030.
         let mut retried = state.clone();
-        assert_eq!(go(&mut state, &[Qualified, Qualified]), [(1, 2685, 1035), (1, 2685, 1075)]);
+        assert_eq!(go(&mut state, &[Qualified, Qualified]), [(1, 2685, 1030), (1, 2685, 1075)]);
         assert_eq!(state.bands[1].stop_reason.as_deref(), Some("published"));
-        // A failed margin pair steps one clock bin down with its own margin: 1065 - 36 mV.
+        // A failed margin pair steps one boost step down with its own margin: 1065 - 43 mV.
         go(&mut retried, &[IntegrityError]);
-        assert_eq!((retried.bands[1].target_clock_mhz, retried.bands[1].voltage_mv), (2670, 1025));
-        // -5% (2565) at 1035 would sit over its 2610 MHz stock point: it starts at 995 (2550).
+        assert_eq!((retried.bands[1].target_clock_mhz, retried.bands[1].voltage_mv), (2670, 1020));
+        // -5% (2565) at 1030 would sit over its 2610 MHz stock point: it starts at 995 (2550).
         let balanced = &state.bands[2];
         assert_eq!((balanced.target_clock_mhz, balanced.voltage_mv, balanced.level_start_voltage_mv),
-            (2565, 995, Some(1035)));
+            (2565, 995, Some(1030)));
         // That moved start is a new test, not a dominated pair: failing it closes only this level.
         let mut failed = state.clone();
         go(&mut failed, &[IntegrityError]);
@@ -1141,9 +1226,10 @@ mod tests {
             (None, Some("integrity_error_region_closed")));
         let efficiency = &failed.bands[3];
         assert_eq!((efficiency.target_clock_mhz, efficiency.voltage_mv, efficiency.level_start_voltage_mv),
-            (2430, 905, Some(1035)), "the next level starts from the voltage that passed above");
-        // Its edge one step lower leaves 995 + 36 mV = 1035 over the stock curve again: no profile.
-        go(&mut state, &[Qualified, IntegrityError]);
+            (2430, 905, Some(1030)), "the next level starts from the voltage that passed above");
+        // Its edge (985 failed, then the skipped 990) leaves 995 + 43 mV = 1040 over the stock
+        // curve again: no profile.
+        go(&mut state, &[Qualified, IntegrityError, IntegrityError]);
         assert_eq!(state.bands[2].stop_reason.as_deref(), Some("publication_at_stock"));
         assert_eq!((state.bands[3].target_clock_mhz, state.bands[3].voltage_mv), (2430, 905));
     }
@@ -1221,7 +1307,7 @@ mod tests {
         step(&mut state,Outcome::Inconclusive);
         assert_eq!(state.bands[0].last_qualified_clock_mhz,Some(1710), "1725 stays unproven");
         assert_eq!(state.bands[0].stop_reason.as_deref(),Some("evidence_incomplete_no_boundary_inferred"));
-        // This tiny grid has no bin 36 mV above 906, so no compensated top; and no bin lies in
+        // This tiny grid has no bin 43 mV above 906, so no compensated top; and no bin lies in
         // [95% of 1710, 1710), so balanced passes through to efficiency.
         assert_eq!(state.bands[1].stop_reason.as_deref(),Some("compensated_top_unavailable"));
         assert_eq!(state.bands[2].stop_reason.as_deref(),Some("clock_level_exhausted"));

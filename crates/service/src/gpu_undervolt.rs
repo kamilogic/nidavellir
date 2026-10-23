@@ -120,7 +120,7 @@ const POWER_P99_RECHECK_ABS_W: f32 = 8.0;
 #[cfg(windows)]
 const POWER_P99_RECHECK_REL: f32 = 0.05;
 /// Only a neighbouring measurement (the two-bin step of the lower levels) is comparable: at ~2 W
-/// per 6.25 mV bin, a publication pair 37 mV above its margin pair is legitimately ~12 W hotter
+/// per 6.25 mV bin, a publication pair 44 mV above its margin pair is legitimately ~14 W hotter
 /// (run 1790761502529 lost Godforge 1905@937 to that false anomaly).
 #[cfg(windows)]
 const POWER_P99_RECHECK_MAX_DISTANCE_MV: u32 = 13;

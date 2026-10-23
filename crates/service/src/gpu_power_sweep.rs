@@ -9010,9 +9010,10 @@ fn measure_multiclock_undervolt_forge(
         mode.label()
     ));
     prog.log.push(match mode {
-        PowerSweepMode::Standard => {
-            "Standard: até 24 tentativas em três bandas, orçamento de 8 h; cada candidato elegível exige matriz completa antes de refinar.".into()
-        }
+        PowerSweepMode::Standard => format!(
+            "Standard: até {} tentativas em três bandas, orçamento de 8 h; cada candidato elegível exige matriz completa antes de refinar.",
+            crate::qualified_search::STANDARD_ATTEMPTS
+        ),
         PowerSweepMode::Long => {
             "Long: mesmo orçamento de tentativas, com tempo proporcional às matrizes prolongadas; nenhuma repetição automática de inconclusivos.".into()
         }
@@ -9998,6 +9999,18 @@ fn measure_multiclock_undervolt_forge(
                 format!("Game-margin pair not proven · the top moves to {} MHz at {} mV", next.target_clock_mhz, next.voltage_mv),
                 None,
             );
+        } else if next.refining_edge.is_some() && next.status == "pending" {
+            prog.log.push(format!(
+                "Degrau {target} MHz: a borda caiu entre {lowest} aprovado e {mv} mV ({recorded:?}); antes de fechar, o bin que o passo pulou, {} mV, recebe o próprio teste.",
+                next.voltage_mv
+            ));
+            live_event(
+                &mut prog,
+                LogTone::Step,
+                live_phase,
+                format!("Refining the edge at {target} MHz · testing {} mV, the bin the last step skipped", next.voltage_mv),
+                None,
+            );
         } else if next.id != "performance" && next.status == "pending" && next.target_clock_mhz < target {
             prog.log.push(format!(
                 "Degrau {target} MHz terminou em {} mV, menos de 2 degraus abaixo do início ({} mV): o perfil não seria distinto do nível de cima. Tentativa {}/2 um bin de clock abaixo: {} MHz @ {} mV.",
@@ -10715,12 +10728,13 @@ mod tests {
         let pair = |clock, mv| (PowerSweepPoint {
             target_clock_mhz: Some(clock), vf_table_voltage_mv: Some(mv), ..Default::default()
         }, 0.95);
-        let kept: Vec<_> = f2_margin_proven(&[pair(1920, 937), pair(1920, 918), pair(1830, 893),
-            pair(1830, 887), pair(1830, 856)])
+        let kept: Vec<_> = f2_margin_proven(&[pair(1920, 937), pair(1920, 918), pair(1830, 900),
+            pair(1830, 893), pair(1830, 856)])
             .iter().map(|(point, _)| (point.target_clock_mhz.unwrap(), point.vf_table_voltage_mv.unwrap())).collect();
-        // Only a pair six bins (>=36 mV) above another pass at its clock: 893 over 856. 1920@937
-        // is only 19 mV above 918, the Godforge that TDR'd in Overwatch had 13 mV.
-        assert_eq!(kept, [(1830, 893)]);
+        // Only a pair seven bins (>=43 mV) above another pass at its clock: 900 over 856. Six bins
+        // (893, 37 mV) published the 1800@868 the user knows is unstable (2026-10-23); 1920@937 is
+        // only 19 mV above 918, and the Godforge that TDR'd in Overwatch had 13 mV.
+        assert_eq!(kept, [(1830, 900)]);
     }
 
     #[cfg(windows)]
@@ -10789,7 +10803,7 @@ mod tests {
             }
             lanes
         };
-        let observations: Vec<_> = [(1920, 937), (1920, 931), (1920, 925), (1920, 918), (1830, 893), (1830, 856)]
+        let observations: Vec<_> = [(1920, 937), (1920, 931), (1920, 925), (1920, 918), (1830, 900), (1830, 856)]
             .into_iter().flat_map(|(target, mv)| proven(target, mv)).collect();
         let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("nidavellir-restore-resynthesis-{}-{unique}", std::process::id()));
@@ -10810,9 +10824,9 @@ mod tests {
         condemned.rigid.push((1920, 925)); // field TDR floor: 1920 at or below 925 is refused
         assert!(f2_resynthesize_restored_profiles(&mut prog, &store, &observations, "gpu", &condemned));
         let key = |p: Option<PowerSweepPoint>| p.as_ref().and_then(f2_apply_key);
-        // 1920@937/931 have no pass 36 mV below them once 925/918 are refused; 1830@893 does (856).
+        // 1920@937/931 have no pass 43 mV below them once 925/918 are refused; 1830@900 does (856).
         assert_eq!([key(prog.godforge), key(prog.brokkrs), key(prog.deep_calm)],
-            [Some((1830, 893)); 3]);
+            [Some((1830, 900)); 3]);
         assert!(prog.log.last().is_some_and(|line| line.contains("ressintetizados")));
         // Deterministic: a second restore changes nothing and adds no log noise.
         let log_len = prog.log.len();
@@ -12992,13 +13006,13 @@ mod tests {
         };
         // Run 1790850465550 at 1815: the anchor 843 held field concurrency 69% at 1800.
         let proven = |anchor_hot: bool| {
-            f2_margin_proven(&[point(843, anchor_hot), point(881, false), point(893, false)])
+            f2_margin_proven(&[point(843, anchor_hot), point(887, false), point(900, false)])
                 .iter()
                 .map(|(p, _)| p.vf_table_voltage_mv.unwrap())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(proven(false), [881, 893]);
-        assert_eq!(proven(true), [893], "843 + 10 + 36 mV = 889 no longer covers 881");
+        assert_eq!(proven(false), [887, 900]);
+        assert_eq!(proven(true), [900], "843 + 10 + 43 mV = 896 no longer covers 887");
     }
 
     #[cfg(windows)]

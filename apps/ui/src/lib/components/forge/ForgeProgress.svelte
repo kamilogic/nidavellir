@@ -347,6 +347,7 @@
 
   function bandStatus(band) {
     if (band.publishing && band.status !== "closed") return "Publication check";
+    if (band.refining_edge && band.status !== "closed") return "Edge check";
     if (band.clock_retries_used > 0 && band.status !== "closed") return `Lower clock try ${band.clock_retries_used}/2`;
     return { waiting_for_top: "Waiting for the level above", pending: "Pending", in_flight: "Testing", closed: "Closed" }[band.status] ?? "Pending";
   }
