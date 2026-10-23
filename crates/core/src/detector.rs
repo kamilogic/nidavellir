@@ -21,6 +21,17 @@ pub fn detect_hardware() -> HardwareInfo {
     HardwareInfo { gpu: detect_gpu() }
 }
 
+/// Windows restarts by itself after a stop error ("Automatically restart" in Startup and Recovery,
+/// on by default). Without it a Forge run that blue-screens stays on the blue screen, and nothing
+/// can continue it. None when the value cannot be read. Read-only.
+pub fn windows_restarts_after_crash() -> Option<bool> {
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SYSTEM\CurrentControlSet\Control\CrashControl")
+        .and_then(|key| key.get_value::<u32, _>("AutoReboot"))
+        .ok()
+        .map(|value| value != 0)
+}
+
 fn detect_gpu() -> Vec<GpuInfo> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let gpu_base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";

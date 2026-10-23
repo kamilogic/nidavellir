@@ -132,9 +132,11 @@ const F2_PREHEAT_MIN_SAMPLES: u32 = 30;
 /// its pair and physical cone stay condemned for every future run, and it never blocks a later
 /// run. One run may spend at most this many attributable CandidateCrash/TDR events, a sanity
 /// ceiling against a bug or crash loop; past it, Resume is refused and the proven pairs publish.
-/// Unexpected TDRs (dominated or publication pairs) already close the search on their own.
+/// Unexpected TDRs (dominated or publication pairs) already close the search on their own. Twelve
+/// since each lower level may crash twice at its edge (its step, then the skipped bin) under the
+/// finer policy (user decision 2026-10-23); automatic restart and continuation carry each one.
 #[cfg(windows)]
-const F2_TDR_RUN_SANITY_CEILING: usize = 6;
+const F2_TDR_RUN_SANITY_CEILING: usize = 12;
 
 // Safety history is durable across positive-evidence revisions. v29 introduced attributed
 // CandidateCrash records; a workload revision must never erase their budget or physical cone.
@@ -9025,6 +9027,19 @@ fn measure_multiclock_undervolt_forge(
         format!("{run_label} Forge {}", if resume_requested { "resumed" } else { "started" }),
         (cap > 0.0).then(|| format!("power limit {cap:.0} W")),
     );
+    // A blue screen must restart Windows for the run to continue on its own (2026-10-23).
+    if nidavellir_core::detector::windows_restarts_after_crash() == Some(false) {
+        prog.log.push(
+            "Windows não reinicia sozinho após tela azul (CrashControl AutoReboot = 0): uma tela azul num teste deixaria a run parada ali. Ative \"Reiniciar automaticamente\" em Propriedades do Sistema, Inicialização e Recuperação.".into(),
+        );
+        live_event(
+            &mut prog,
+            LogTone::Attention,
+            "Setup",
+            "Windows will not restart by itself after a blue screen · a blue screen during a test would stop the run there",
+            Some("Turn on \"Automatically restart\" in System Properties, Startup and Recovery".into()),
+        );
+    }
     set(progress, prog.clone());
 
     // Stable physical identity scopes observations and persisted profiles to this exact GPU.
@@ -16671,14 +16686,15 @@ mod tests {
         events.push(crash("run-clean-c", "gpu-a", 1890, 918, "event-3"));
         let fresh = f2_tdr_safety_policy(&events, "gpu-a", None, &targets, &bins).unwrap();
         assert_eq!(fresh.crashes.len(), 3);
-        // One run may spend six; the seventh ends its exploration.
-        let run_events = (0..6)
+        // One run may spend twelve (two per lower level's edge, 2026-10-23); the thirteenth ends
+        // its exploration.
+        let run_events = (0..12)
             .map(|n| crash("run-d", "gpu-a", 1890, 918, &format!("run-d-{n}")))
             .collect::<Vec<_>>();
         let mut with_run = events.clone();
         with_run.extend(run_events);
         assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-d"), &targets, &bins).is_ok());
-        with_run.push(crash("run-d", "gpu-a", 1890, 918, "run-d-6"));
+        with_run.push(crash("run-d", "gpu-a", 1890, 918, "run-d-12"));
         assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-d"), &targets, &bins)
             .unwrap_err()
             .contains("safety ceiling reached"));

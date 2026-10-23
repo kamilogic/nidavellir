@@ -636,6 +636,7 @@ fn system_facts() -> SystemFacts {
         r#"$g = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -ErrorAction SilentlyContinue"#,
         r#""gpu_scheduling=$($g.HwSchMode)""#,
         r#""tdr_settings=delay $($g.TdrDelay) ddi $($g.TdrDdiDelay) level $($g.TdrLevel)""#,
+        r#""auto_reboot=$((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -ErrorAction SilentlyContinue).AutoReboot)""#,
         r#""displays=$((Get-CimInstance Win32_VideoController | ForEach-Object { '{0} {1}x{2}@{3}' -f $_.Name, $_.CurrentHorizontalResolution, $_.CurrentVerticalResolution, $_.CurrentRefreshRate }) -join ' / ')""#,
         r#""gpu_tools=$((Get-Process -Name MSIAfterburner,RTSS,PrecisionX_x64,GPUTweakIII,'NVIDIA app','NVIDIA Overlay',Discord,steam,obs64,HWiNFO64,GPU-Z,OCCT,FurMark -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique) -join ', ')""#,
     ]
