@@ -8666,11 +8666,13 @@ fn f2_clock_drop_hint(
     Some(crate::qualified_search::ClockDropHint { held_clock_mhz: held, stock_clock_mhz: stock })
 }
 
-/// The GPU sat at its anchor: the mean measured voltage is within 2 mV of it. A limiter that kept
-/// it one 5 mV point lower for much of a dwell pulls the mean further down (RTX 5070, 2026-10-21);
-/// a pinned anchor reads exactly (RTX 30: 937/937/937 mV).
+/// The GPU sat at its anchor: the mean measured voltage is at most one 5 mV reading under it. An
+/// RTX 5070 reads every anchor exactly 5 mV under: 29 anchors from 1095 to 920 mV did, and its clock
+/// never followed the voltage (run f2-forge-1792745373708, 0.8.11). The RTX 30 and 40 read theirs
+/// exactly (937/937/937, 1060/1060 mV). A GPU held a point lower reads further under: two 5 mV
+/// points, or one 6.25 mV bin (6-7 mV in integer mV).
 fn f2_reached_anchor(mean_mv: u32, anchor_mv: u32) -> bool {
-    mean_mv + 2 >= anchor_mv
+    mean_mv + 5 >= anchor_mv
 }
 
 /// A confirmed ClockDrop at this run's exact discovery pair whose GPU sat under the anchor voltage
@@ -8701,6 +8703,23 @@ fn f2_voltage_limited_hint(
         return None;
     }
     Some(crate::qualified_search::PowerBoundHint { measured_voltage_mv: mean })
+}
+
+/// The voltage-limited retry, once per clock. A real voltage ceiling holds the GPU at the voltage
+/// it settled at; a GPU that sits under the next anchor too follows the request, and each further
+/// step only takes voltage from a clock it does not hold. An RTX 5070 walked 1095 → 915 mV at
+/// 2977 MHz that way, one step per dwell, into a TDR (0.8.11).
+#[cfg(windows)]
+fn f2_voltage_limited_retry(
+    observations: &[nidavellir_core::f2_observation::F2Observation],
+    run_id: &str,
+    gpu_key: &str,
+    target: u32,
+    voltage: u32,
+) -> Option<crate::qualified_search::PowerBoundHint> {
+    let (last, earlier) = observations.split_last()?;
+    let retried = earlier.iter().any(|o| f2_voltage_limited_hint(o, run_id, gpu_key, target, o.anchor_mv).is_some());
+    f2_voltage_limited_hint(last, run_id, gpu_key, target, voltage).filter(|_| !retried)
 }
 
 #[cfg(windows)]
@@ -9684,14 +9703,12 @@ fn measure_multiclock_undervolt_forge(
                 clock_hint = observations.last().and_then(|o| {
                     f2_clock_drop_hint(o, &run_id, &gpu_key, target, mv, &f2_inputs.sane_base_curve)
                 });
-                // A GPU limiter that NVML does not report held the GPU a voltage point under the
-                // anchor, below the power cap: an RTX 5070 sat at 1090 mV 87% of a 1095 mV dwell
-                // at 230 of 250 W (field report 2026-10-21). As with the power limit, the same
-                // target is tried next at the voltage the GPU settled at. A ClockDrop never
-                // confirms the calibration, so this is decided before that check; 0.8.9 decided it
-                // after and never ran (2977@1090 sat at 1085 mV, field report 2026-10-22).
-                if let Some(hint) = observations.last()
-                    .and_then(|o| f2_voltage_limited_hint(o, &run_id, &gpu_key, target, mv))
+                // A limiter that NVML does not report held the GPU more than one 5 mV reading under
+                // the anchor, below the power cap: the same target is tried once at the voltage
+                // the GPU settled at. An RTX 5070's constant 5 mV under every anchor is how it
+                // reads, not this (2026-10-23). A ClockDrop never confirms the calibration, so this
+                // is decided before that check; 0.8.9 decided it after and never ran.
+                if let Some(hint) = f2_voltage_limited_retry(&observations, &run_id, &gpu_key, target, mv)
                     .filter(|_| !stop.load(Ordering::SeqCst))
                 {
                     power_hint = Some(hint);
@@ -16452,16 +16469,30 @@ mod tests {
         assert_eq!(hint(&F2Observation { sample_count: Some(40), ..dropped.clone() }, 2992), None, "too short");
         assert_eq!(hint(&F2Observation { measured_voltage_avg_mv: Some(1050), ..dropped.clone() }, 2992), None,
             "the voltage stayed below the anchor");
-        assert_eq!(hint(&F2Observation { measured_voltage_avg_mv: Some(1082), ..dropped.clone() }, 2992), None,
-            "a mean 3 mV under the anchor is a voltage limit, not a clock drop at the anchor");
+        assert_eq!(hint(&F2Observation { measured_voltage_avg_mv: Some(1079), ..dropped.clone() }, 2992), None,
+            "a mean more than one 5 mV reading under the anchor is a voltage limit, not a clock drop at the anchor");
         assert_eq!(hint(&dropped, 2985), None, "another pair");
+        // 2026-10-23 (0.8.11): this GPU reads every anchor 5 mV under; 2977@1075 held p5 2895.
+        let read_under = F2Observation {
+            target_mhz: 2977,
+            anchor_mv: 1075,
+            sustained_clock_mhz: Some(2895),
+            measured_voltage_min_mv: Some(1070),
+            measured_voltage_avg_mv: Some(1070),
+            measured_voltage_max_mv: Some(1075),
+            ..dropped.clone()
+        };
+        assert_eq!(f2_clock_drop_hint(&read_under, "run", "gpu", 2977, 1075, &curve).map(|h| (h.held_clock_mhz, h.stock_clock_mhz)),
+            Some((2895, 2857)), "the top goes to the clock the GPU held, not down its voltage");
     }
 
-    /// Field report 2026-10-21 (RTX 5070, 0.8.8): under a 2992@1095 anchor the GPU sat at 1090 mV
-    /// 87% of the dwell (1090/1090/1095 mV) at 231 of 250 W, NVML silent.
+    /// A GPU held two 5 mV points under its anchor, NVML silent, is tried once at the voltage it
+    /// settled at. One reading under is the anchor: an RTX 5070 read every anchor from 1095 to
+    /// 920 mV 5 mV under (1090/1090/1095 at 1095), and taking that for a limit walked its voltage
+    /// down at 2977 MHz into a TDR (0.8.11, 2026-10-23).
     #[cfg(windows)]
     #[test]
-    fn a_gpu_held_under_its_anchor_descends_the_voltage_and_a_pinned_one_does_not() {
+    fn a_gpu_held_under_its_anchor_descends_the_voltage_once_and_a_pinned_one_does_not() {
         use nidavellir_core::f2_observation::{F2ObsOutcome, F2_DISCOVERY_CONTRACT_VERSION};
         let limited = F2Observation {
             run_id: "run".into(),
@@ -16469,14 +16500,18 @@ mod tests {
             outcome: F2ObsOutcome::ClockDrop,
             sustained_clock_mhz: Some(2850),
             sample_count: Some(130),
-            measured_voltage_min_mv: Some(1090),
-            measured_voltage_avg_mv: Some(1090),
+            measured_voltage_min_mv: Some(1085),
+            measured_voltage_avg_mv: Some(1085),
             measured_voltage_max_mv: Some(1095),
             measured_voltage_sample_count: 8,
             ..power_obs(2992, 1095, Some(231.0), true, Some(231), "gpu")
         };
         let hint = |o: &F2Observation| f2_voltage_limited_hint(o, "run", "gpu", 2992, 1095).map(|h| h.measured_voltage_mv);
-        assert_eq!(hint(&limited), Some(1090));
+        assert_eq!(hint(&limited), Some(1085));
+        let read_under = F2Observation {
+            measured_voltage_min_mv: Some(1090), measured_voltage_avg_mv: Some(1090), ..limited.clone()
+        };
+        assert_eq!(hint(&read_under), None, "one 5 mV reading under is how an RTX 5070 reads its anchor");
         let pinned = F2Observation {
             measured_voltage_min_mv: Some(1095), measured_voltage_avg_mv: Some(1095), ..limited.clone()
         };
@@ -16485,7 +16520,23 @@ mod tests {
         assert_eq!(hint(&F2Observation { outcome: F2ObsOutcome::PowerBoundClockDrop, ..limited.clone() }), None,
             "the power limit has its own hint");
         assert_eq!(hint(&F2Observation { measured_voltage_sample_count: 2, ..limited.clone() }), None, "too few readings");
-        assert!(f2_reached_anchor(937, 937) && f2_reached_anchor(1083, 1085) && !f2_reached_anchor(1090, 1095));
+        assert!(f2_reached_anchor(937, 937) && f2_reached_anchor(1090, 1095) && !f2_reached_anchor(1085, 1095));
+        assert!(!f2_reached_anchor(931, 937), "one 6.25 mV bin under still is not the anchor");
+        // Once per clock: the GPU under the next anchor too follows the request, not a ceiling.
+        let retry = |history: &[F2Observation], mv| {
+            f2_voltage_limited_retry(history, "run", "gpu", 2992, mv).map(|h| h.measured_voltage_mv)
+        };
+        let again = F2Observation {
+            anchor_mv: 1085,
+            measured_voltage_min_mv: Some(1075),
+            measured_voltage_avg_mv: Some(1075),
+            measured_voltage_max_mv: Some(1085),
+            ..limited.clone()
+        };
+        assert_eq!(retry(std::slice::from_ref(&limited), 1095), Some(1085));
+        assert_eq!(retry(&[limited.clone(), again.clone()], 1085), None, "the second time it is a clock drop");
+        let elsewhere = F2Observation { target_mhz: 3007, ..limited.clone() };
+        assert_eq!(retry(&[elsewhere, again], 1085), Some(1075), "another clock's retry does not count");
     }
 
     #[cfg(windows)]
