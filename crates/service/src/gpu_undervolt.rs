@@ -1591,6 +1591,19 @@ fn f2_finalize_power_cap_state(
     cap_state
 }
 
+/// A clock drop this close to the board limit is the power limiter's until a lower voltage proves
+/// otherwise. NVML power is a 1 s average on Ampere and misses the peaks the limiter acts on. An RTX
+/// 3060 Ti dropped 1920@950 to 1890 at 98.4% of 200 W; read as a clock drop, the run gave up the
+/// 1920 the previous run had qualified at 937 (field report 2026-10-23). The search then descends
+/// the voltage at the same clock, where the power reading becomes unambiguous.
+const F2_DROP_NEAR_CAP_RATIO: f32 = 0.95;
+
+fn f2_drop_near_cap(power_p99_w: Option<f32>, power_limit_w: Option<f32>) -> bool {
+    power_p99_w.zip(power_limit_w).is_some_and(|(power, limit)| {
+        power.is_finite() && limit.is_finite() && limit > 0.0 && power >= limit * F2_DROP_NEAR_CAP_RATIO
+    })
+}
+
 fn f2_power_bound_clock_drop(outcome: &F2Outcome, near_power_limit: bool) -> F2Outcome {
     if matches!(outcome, F2Outcome::ClockDrop) && near_power_limit {
         F2Outcome::PowerBoundClockDrop
@@ -5264,7 +5277,8 @@ pub(crate) fn run_confirmed_f2_power_calibration(
     let conservative_p99 = f2_confirm_power_attempts(&mut attempts, rechecked);
     let mut aggregate = f2_aggregate_power_attempts(&attempts, conservative_p99);
     let cap_state = f2_finalize_power_cap_state(&mut attempts, &mut aggregate, power_limit_w, Some(F2PowerCapState::OffCap));
-    let near_cap = cap_state == F2PowerCapState::NearCap;
+    let near_cap = cap_state == F2PowerCapState::NearCap
+        || f2_drop_near_cap(aggregate.power_p99_w, power_limit_w);
     aggregate.outcome = f2_power_bound_clock_drop(&aggregate.outcome, near_cap);
     for attempt in &mut attempts {
         if attempt.power_p99_confirmed {
@@ -6071,6 +6085,18 @@ mod tests {
             Some(off_cap_p99_w),
             Some(200.0),
             Some(1.0)
+        ));
+    }
+
+    #[test]
+    fn a_clock_drop_near_the_board_limit_is_the_limiters_first() {
+        // Field report 2026-10-23: 1920@950 dropped to 1890 at 196.8 of 200 W.
+        assert!(f2_drop_near_cap(Some(196.8), Some(200.0)) && f2_drop_near_cap(Some(190.0), Some(200.0)));
+        assert!(!f2_drop_near_cap(Some(189.9), Some(200.0)), "away from the limit a drop is the clock's");
+        assert!(!f2_drop_near_cap(Some(196.8), None) && !f2_drop_near_cap(None, Some(200.0)));
+        assert!(matches!(
+            f2_power_bound_clock_drop(&F2Outcome::ClockDrop, f2_drop_near_cap(Some(196.8), Some(200.0))),
+            F2Outcome::PowerBoundClockDrop
         ));
     }
 
