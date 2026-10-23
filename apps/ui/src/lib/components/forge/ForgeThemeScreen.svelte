@@ -857,7 +857,8 @@
   .forge-theme-screen {
     position: relative;
     min-height: 100vh;
-    overflow-x: hidden;
+    /* clip, not hidden: hidden would make this a scroll box and unstick the header from the window. */
+    overflow-x: clip;
     color: #d8dbde;
     background-color: #0a0d0e;
     background-image: var(--forge-texture);
@@ -1134,6 +1135,10 @@
   }
 
   .command-header {
+    /* The menus stay at the top of the window while a page scrolls (user request 2026-10-23). */
+    position: sticky;
+    top: 0;
+    z-index: 30;
     display: grid;
     /* The nav takes its own width (four items); the status items share what is left. */
     grid-template-columns: max-content max-content minmax(0, 1fr);
