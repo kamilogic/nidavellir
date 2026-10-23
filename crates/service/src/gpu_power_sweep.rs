@@ -239,6 +239,22 @@ pub(crate) fn auto_resume_eligible(
         })
 }
 
+/// A crash at a staircase edge is the search working: the run goes on, and its final summary
+/// carries the crash. One that closed the search ended the run, and only a report tells anyone: an
+/// RTX 5070's TDR at the top ended a 0.8.11 run and nothing was sent.
+#[cfg(windows)]
+fn f2_edge_crash_continues(
+    progress: &PowerSweepProgress,
+    pending: Option<&nidavellir_core::safe_loop::ForgeIncident>,
+) -> bool {
+    progress.discovery_search.as_ref().is_some_and(|search| search.stop_reason.is_none())
+        && pending.is_some_and(|incident| {
+            incident.kind == nidavellir_core::safe_loop::ForgeIncidentKind::CandidateCrash
+                && incident.run_id.is_some()
+                && incident.run_id == progress.run_id
+        })
+}
+
 #[cfg(windows)]
 fn f2_run_crash_count(crashes: &[nidavellir_core::condemnation::CondemnationEvent], run_id: Option<&str>) -> usize {
     run_id.map_or(0, |run| crashes.iter().filter(|event| event.run_id.as_deref() == Some(run)).count())
@@ -1655,11 +1671,7 @@ impl PowerSweepHandle {
             #[cfg(windows)]
             if let Ok(prog) = progress.lock().map(|p| p.clone()) {
                 let pending = store.load_record().pending_forge_incident;
-                let edge_crash = pending.as_ref().is_some_and(|incident| {
-                    incident.kind == nidavellir_core::safe_loop::ForgeIncidentKind::CandidateCrash
-                        && incident.run_id.is_some()
-                        && incident.run_id == prog.run_id
-                });
+                let edge_crash = f2_edge_crash_continues(&prog, pending.as_ref());
                 crate::reports::after_run(&prog, result.is_err(), edge_crash || auto_resume_eligible(&prog, pending.as_ref()));
             }
             let terminal = progress.lock().ok().map(|p| (p.phase.clone(), p.run_id.clone()));
@@ -16537,6 +16549,27 @@ mod tests {
         assert_eq!(retry(&[limited.clone(), again.clone()], 1085), None, "the second time it is a clock drop");
         let elsewhere = F2Observation { target_mhz: 3007, ..limited.clone() };
         assert_eq!(retry(&[elsewhere, again], 1085), Some(1075), "another clock's retry does not count");
+    }
+
+    /// Field report 2026-10-23 (RTX 5070, 0.8.11): a TDR at the top closed the search and ended the
+    /// run, yet nothing was sent, because every candidate crash counted as a staircase edge.
+    #[cfg(windows)]
+    #[test]
+    fn a_crash_that_ends_the_run_is_reported_and_an_edge_crash_waits_for_the_summary() {
+        use nidavellir_core::safe_loop::{ForgeIncident, ForgeIncidentKind};
+        let mut progress = PowerSweepProgress {
+            phase: "interrupted".into(),
+            run_id: Some("run-a".into()),
+            discovery_search: Some(Default::default()),
+            ..Default::default()
+        };
+        let crash = ForgeIncident::new(
+            ForgeIncidentKind::CandidateCrash, Some("run-a".into()), Some("gpu".into()), Some(2977), Some(915), "tdr",
+        );
+        assert!(f2_edge_crash_continues(&progress, Some(&crash)), "the search goes on; its summary carries the crash");
+        progress.discovery_search.as_mut().unwrap().stop_reason = Some("driver_failure_recovery_required".into());
+        assert!(!f2_edge_crash_continues(&progress, Some(&crash)));
+        assert!(!auto_resume_eligible(&progress, Some(&crash)), "so the run's own report goes out now");
     }
 
     #[cfg(windows)]
