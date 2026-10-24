@@ -8430,7 +8430,7 @@ fn f2_set_run_points(prog: &mut PowerSweepProgress, points: &[(PowerSweepPoint, 
 /// anchor that held its target through the hot bin counts
 /// [`crate::qualified_search::HOT_BIN_RELIEF_MV`] higher, exactly as the search plans it.
 #[cfg(windows)]
-fn f2_margin_proven(points: &[(PowerSweepPoint, f64)]) -> Vec<(PowerSweepPoint, f64)> {
+fn f2_margin_proven(points: &[(PowerSweepPoint, f64)], anchors: &[(PowerSweepPoint, f64)]) -> Vec<(PowerSweepPoint, f64)> {
     let margin = crate::qualified_search::GAME_MARGIN_MV;
     let relief = |q: &PowerSweepPoint| {
         if q.hot_bin_relief { crate::qualified_search::HOT_BIN_RELIEF_MV } else { 0 }
@@ -8439,7 +8439,7 @@ fn f2_margin_proven(points: &[(PowerSweepPoint, f64)]) -> Vec<(PowerSweepPoint, 
         .iter()
         .copied()
         .filter(|(p, _)| {
-            points.iter().any(|(q, _)| {
+            anchors.iter().any(|(q, _)| {
                 q.target_clock_mhz == p.target_clock_mhz
                     && q.vf_table_voltage_mv.zip(p.vf_table_voltage_mv)
                         .is_some_and(|(lower, mv)| lower + relief(q) + margin <= mv)
@@ -8448,16 +8448,37 @@ fn f2_margin_proven(points: &[(PowerSweepPoint, f64)]) -> Vec<(PowerSweepPoint, 
         .collect()
 }
 
+/// The pairs that can prove a game margin: every pair of the run with complete proof and no field
+/// failure, minus pairs condemned themselves. The condemnation envelope's line between failures
+/// at other clocks never outweighs a pass measured at the pair's own clock: on 0.8.13, 1770@812
+/// sat under the 1680@768 to 1905@906 line, and Brokkr's lost the tested 856 for 875.
+#[cfg(windows)]
+fn f2_margin_anchors(
+    store: &SafeLoopStore,
+    observations: &[F2Observation],
+    run_id: &str,
+    gpu_key: &str,
+    condemned: &nidavellir_core::condemnation::CondemnedPairs,
+) -> Result<Vec<(PowerSweepPoint, f64)>, String> {
+    Ok(f2_run_profile_points(store, observations, run_id, gpu_key, &Default::default())?
+        .into_iter()
+        .filter(|(point, _)| {
+            f2_apply_key(point).is_none_or(|pair| !condemned.rigid.contains(&pair) && !condemned.quarantine.contains(&pair))
+        })
+        .collect())
+}
+
 /// Name the three profiles from proven points; Apply readiness follows the run's mode policy.
 #[cfg(windows)]
 fn f2_publish_run_profiles(
     prog: &mut PowerSweepProgress,
     points: &[(PowerSweepPoint, f64)],
+    anchors: &[(PowerSweepPoint, f64)],
     cap: f32,
     mode_policy: F2ForgeModePolicy,
 ) {
     f2_set_run_points(prog, points);
-    let proven = f2_margin_proven(points);
+    let proven = f2_margin_proven(points, anchors);
     if proven.len() < points.len() {
         prog.log.push(format!(
             "FORGE: {} par(es) sem margem de jogo ficaram fora dos perfis (é preciso outro par aprovado ≥{} mV abaixo no mesmo clock).",
@@ -8501,10 +8522,13 @@ fn f2_resynthesize_restored_profiles(
     };
     let before = keys(prog);
     let log_len = prog.log.len();
-    match f2_run_profile_points(store, observations, &run_id, gpu_key, condemned) {
-        Ok(points) => {
+    let proofs = f2_run_profile_points(store, observations, &run_id, gpu_key, condemned).and_then(|points| {
+        Ok((points, f2_margin_anchors(store, observations, &run_id, gpu_key, condemned)?))
+    });
+    match proofs {
+        Ok((points, anchors)) => {
             let cap = prog.power_limit_w;
-            f2_publish_run_profiles(prog, &points, cap, mode.f2_policy());
+            f2_publish_run_profiles(prog, &points, &anchors, cap, mode.f2_policy());
         }
         Err(error) => {
             prog.profiles_qualified = false;
@@ -10262,7 +10286,8 @@ fn measure_multiclock_undervolt_forge(
         condemned.rigid.extend_from_slice(&tdr_safety_cone);
         let points = f2_run_profile_points(store, &observations, &run_id, &gpu_key, &condemned)?;
         if forge_complete {
-            f2_publish_run_profiles(&mut prog, &points, cap, mode_policy);
+            let anchors = f2_margin_anchors(store, &observations, &run_id, &gpu_key, &condemned)?;
+            f2_publish_run_profiles(&mut prog, &points, &anchors, cap, mode_policy);
         } else {
             f2_set_run_points(&mut prog, &points);
         }
@@ -10375,10 +10400,13 @@ fn measure_multiclock_undervolt_forge(
         && discovery.stop_reason.is_some()
         && match current_f2_condemned_pairs(store, &gpu_key).and_then(|condemned| {
             let observations = obs_store.load_all_checked().map_err(|e| e.to_string())?;
-            f2_run_profile_points(store, &observations, &run_id, &gpu_key, &condemned)
+            Ok((
+                f2_run_profile_points(store, &observations, &run_id, &gpu_key, &condemned)?,
+                f2_margin_anchors(store, &observations, &run_id, &gpu_key, &condemned)?,
+            ))
         }) {
-            Ok(points) => {
-                f2_publish_run_profiles(&mut prog, &points, cap, mode_policy);
+            Ok((points, anchors)) => {
+                f2_publish_run_profiles(&mut prog, &points, &anchors, cap, mode_policy);
                 prog.godforge.is_some()
             }
             Err(error) => {
@@ -10757,13 +10785,17 @@ mod tests {
         let pair = |clock, mv| (PowerSweepPoint {
             target_clock_mhz: Some(clock), vf_table_voltage_mv: Some(mv), ..Default::default()
         }, 0.95);
-        let kept: Vec<_> = f2_margin_proven(&[pair(1920, 937), pair(1920, 918), pair(1830, 900),
-            pair(1830, 893), pair(1830, 856)])
-            .iter().map(|(point, _)| (point.target_clock_mhz.unwrap(), point.vf_table_voltage_mv.unwrap())).collect();
+        let kept = |points: &[(PowerSweepPoint, f64)], anchors: &[(PowerSweepPoint, f64)]| -> Vec<(u32, u32)> {
+            f2_margin_proven(points, anchors).iter()
+                .map(|(point, _)| (point.target_clock_mhz.unwrap(), point.vf_table_voltage_mv.unwrap())).collect()
+        };
+        let points = [pair(1920, 937), pair(1920, 918), pair(1830, 900), pair(1830, 893), pair(1830, 856)];
         // Only a pair seven bins (>=43 mV) above another pass at its clock: 900 over 856. Six bins
         // (893, 37 mV) published the 1800@868 the user knows is unstable (2026-10-23); 1920@937 is
         // only 19 mV above 918, and the Godforge that TDR'd in Overwatch had 13 mV.
-        assert_eq!(kept, [(1830, 900)]);
+        assert_eq!(kept(&points, &points), [(1830, 900)]);
+        // 0.8.13: the envelope kept 1770@812 out of the profiles, yet its own pass proves 856.
+        assert_eq!(kept(&[pair(1770, 856), pair(1770, 875)], &[pair(1770, 812)]), [(1770, 856), (1770, 875)]);
     }
 
     #[cfg(windows)]
@@ -10805,6 +10837,15 @@ mod tests {
         assert_eq!(points(&condemned), [1920, 1830]);
         condemned.rigid.push((1830, 893)); // a cone covering it removes it from publication
         assert_eq!(points(&condemned), [1920]);
+        // ...but its own complete pass still proves a game margin, until it is condemned itself.
+        let anchors = |condemned: &nidavellir_core::condemnation::CondemnedPairs| {
+            f2_margin_anchors(&store, &observations, "crash-run", "gpu", condemned).unwrap()
+                .iter().map(|(point, _)| (point.target_clock_mhz.unwrap(), point.vf_table_voltage_mv.unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(anchors(&condemned), [(1920, 937), (1830, 887)]);
+        condemned.quarantine.push((1830, 887));
+        assert_eq!(anchors(&condemned), [(1920, 937)]);
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -13035,7 +13076,8 @@ mod tests {
         };
         // Run 1790850465550 at 1815: the anchor 843 held field concurrency 69% at 1800.
         let proven = |anchor_hot: bool| {
-            f2_margin_proven(&[point(843, anchor_hot), point(887, false), point(900, false)])
+            let points = [point(843, anchor_hot), point(887, false), point(900, false)];
+            f2_margin_proven(&points, &points)
                 .iter()
                 .map(|(p, _)| p.vf_table_voltage_mv.unwrap())
                 .collect::<Vec<_>>()
