@@ -9330,7 +9330,13 @@ fn measure_multiclock_undervolt_forge(
         set(progress, prog);
         return;
     };
-    info!("{}", vf_curve_summary(&f2_inputs.sane_base_curve, seed.stock_boost_max_mhz));
+    // The driver lowers the curve with temperature: a 3060 Ti read 15 MHz less after a 75 °C
+    // preheat (2026-10-23), so the read temperature explains a lower top.
+    info!(
+        "{} · read after the preheat at {:.0} °C",
+        vf_curve_summary(&f2_inputs.sane_base_curve, seed.stock_boost_max_mhz),
+        preheat.temperature_c
+    );
     info!("{}", vf_curve_points(&f2_inputs.sane_base_curve));
 
     let qualification_needs_goldens =
@@ -9533,10 +9539,11 @@ fn measure_multiclock_undervolt_forge(
     );
     prog.clock_table_ceiling_mhz = Some(clock_table_ceiling_mhz);
     prog.log.push(format!(
-        "Domínio stock: Ctable {} MHz / {} bins físicos; Cboost {} MHz após preheat; Cmax ainda não provado.",
+        "Domínio stock: Ctable {} MHz / {} bins físicos; Cboost {} MHz após preheat, curva lida a {:.0} °C; Cmax ainda não provado.",
         clock_table_ceiling_mhz,
         f2_inputs.sane_base_curve.len(),
-        seed.stock_boost_max_mhz
+        seed.stock_boost_max_mhz,
+        preheat.temperature_c
     ));
     use crate::qualified_search::{self as search, Outcome};
     let candidate_ms = mode_policy
