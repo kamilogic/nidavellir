@@ -177,7 +177,7 @@ test("J01: default run needs no mode selection and only one start", async ({ pag
   const primary = page.locator(".plate-button");
   await expect(primary).toHaveText("Forge GPU");
   await expect(page.getByRole("heading", { name: "NVIDIA GeForce RTX 3060 Ti", exact: true })).toBeVisible();
-  await expect(page.locator(".hero-option").first()).toContainText("Standard · up to 8 h");
+  await expect(page.locator(".hero-option").first()).toContainText("Standard · up to 9 h");
   await page.screenshot({ path: testInfo.outputPath("ready.png"), fullPage: true });
   await primary.click();
   await startFromSheet(page);
@@ -849,7 +849,7 @@ test("Pre-Forge: the sheet explains the run, Cancel starts nothing and Start use
   await page.locator(".plate-button").click();
   await sheet.getByRole("radio", { name: "Long" }).click();
   await expect(sheet.getByRole("radio", { name: "Long" })).toHaveAttribute("aria-checked", "true");
-  await expect(sheet).toContainText("Up to about 18 h");
+  await expect(sheet).toContainText("Up to about 20 h");
   await sheet.getByRole("button", { name: "Start Forge" }).click();
   await expect.poll(() => page.evaluate(() => window.__forgeTest.calls.filter((m) => m.startsWith("Start")))).toEqual(["StartPowerSweepLong"]);
 });

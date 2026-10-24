@@ -427,6 +427,14 @@ pub struct ForgeDiscoveryBand {
     /// value is that failure's edge reason, kept if the bin passes. None otherwise.
     #[serde(default)]
     pub refining_edge: Option<String>,
+    /// Search 15, Godforge level: its candidate is a power measurement only (no matrix), raising
+    /// the voltage at its clock until the pair stops holding within the limits.
+    #[serde(default)]
+    pub measuring_power: bool,
+    /// Search 15, Godforge level: the highest voltage measured to hold its clock within the power
+    /// limit and below the stock curve. Its game-margin pair sits the margin under it.
+    #[serde(default)]
+    pub allowed_voltage_mv: Option<u32>,
     pub last_qualified_clock_mhz: Option<u32>,
     pub last_qualified_voltage_mv: Option<u32>,
     /// Performance exploration alternates one lower voltage bin and one higher clock bin.

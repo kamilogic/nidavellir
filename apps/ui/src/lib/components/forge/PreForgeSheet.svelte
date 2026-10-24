@@ -16,11 +16,11 @@
     onStart,
   } = $props();
 
-  // Budgets from the Core: Standard and Clean Run stop at 8 h; Long's longer dwells scale it to ~18 h.
+  // Budgets from the Core: Standard and Clean Run stop at 9 h; Long's longer dwells scale it to ~20 h.
   const MODES = [
-    { id: "standard", label: "Standard", note: "Recommended. Reuses what this GPU already proved and measures the rest. Up to 8 h." },
-    { id: "long", label: "Long", note: "Tests each candidate more than twice as long, for extra confidence. Up to about 18 h." },
-    { id: "clean", label: "Clean Run", note: "Measures everything again from scratch. Known failures stay blocked. Up to 8 h." },
+    { id: "standard", label: "Standard", note: "Recommended. Reuses what this GPU already proved and measures the rest. Up to 9 h." },
+    { id: "long", label: "Long", note: "Tests each candidate more than twice as long, for extra confidence. Up to about 20 h." },
+    { id: "clean", label: "Clean Run", note: "Measures everything again from scratch. Known failures stay blocked. Up to 9 h." },
   ];
 
   let dialog = $state(null);

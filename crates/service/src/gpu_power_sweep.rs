@@ -1805,7 +1805,7 @@ pub(crate) fn live_event(
 fn band_phase(id: &str) -> &'static str {
     match id {
         "performance" => "Performance",
-        "compensated" => "Game margin",
+        "compensated" => "Godforge",
         "balanced" => "Balance",
         "efficiency" => "Efficiency",
         _ => "Search",
@@ -9066,8 +9066,9 @@ fn measure_multiclock_undervolt_forge(
     ));
     prog.log.push(match mode {
         PowerSweepMode::Standard => format!(
-            "Standard: até {} tentativas em três bandas, orçamento de 8 h; cada candidato elegível exige matriz completa antes de refinar.",
-            crate::qualified_search::STANDARD_ATTEMPTS
+            "Standard: até {} tentativas em três bandas, orçamento de {} h; cada candidato elegível exige matriz completa antes de refinar.",
+            crate::qualified_search::STANDARD_ATTEMPTS,
+            crate::qualified_search::STANDARD_BUDGET_MS / 3_600_000
         ),
         PowerSweepMode::Long => {
             "Long: mesmo orçamento de tentativas, com tempo proporcional às matrizes prolongadas; nenhuma repetição automática de inconclusivos.".into()
@@ -9687,6 +9688,7 @@ fn measure_multiclock_undervolt_forge(
         let mut failure_reason = String::new();
         let mut power_hint = None;
         let mut clock_hint = None;
+        let measuring = band.measuring_power;
         let result = (|| -> Result<Outcome, String> {
             let observations = obs_store.load_all_checked().map_err(|e| e.to_string())?;
             let ledger = nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir());
@@ -9807,6 +9809,11 @@ fn measure_multiclock_undervolt_forge(
             }
             if latest.outcome != nidavellir_core::f2_observation::F2ObsOutcome::Validated {
                 return Ok(Outcome::Inconclusive);
+            }
+            // The Godforge level's power measurement ends here: the pair held its clock within
+            // the power limit. The matrix belongs to the pairs the level tests under it.
+            if measuring {
+                return Ok(Outcome::PowerFree);
             }
             for is_exact in [false, true] {
                 exact_gate = is_exact;
@@ -10001,6 +10008,7 @@ fn measure_multiclock_undervolt_forge(
                 "stayed under the requested voltage (the GPU's own limit), not at the clock".to_string(),
             ),
             Outcome::PowerBound => (LogTone::Attention, "held the power limit, not the clock".to_string()),
+            Outcome::PowerFree => (LogTone::Pass, "held its clock within the power limit (power check only)".to_string()),
             Outcome::IntegrityError => (LogTone::Fail, "failed: integrity error".to_string()),
             Outcome::DriverFailure => (LogTone::Fail, "crashed the driver".to_string()),
             Outcome::OperationalFailure => (LogTone::Fail, "could not be tested safely".to_string()),
@@ -10049,14 +10057,42 @@ fn measure_multiclock_undervolt_forge(
             );
         } else if next.id == "compensated" && next.status == "pending" && next.target_clock_mhz < target {
             prog.log.push(format!(
-                "Par de margem {target} MHz @ {mv} mV não foi provado ({recorded:?}); o topo compensado desce para {} MHz @ {} mV.",
-                next.target_clock_mhz, next.voltage_mv
+                "Godforge {target} MHz não fechou a margem de jogo dentro da tensão que segura o clock ({mv} mV: {recorded:?}); desce um passo de boost para {} MHz, a partir de {} mV ({}).",
+                next.target_clock_mhz,
+                next.voltage_mv,
+                if next.measuring_power { "medição de potência" } else { "par de margem" }
             ));
             live_event(
                 &mut prog,
                 LogTone::Attention,
                 live_phase,
-                format!("Game-margin pair not proven · the top moves to {} MHz at {} mV", next.target_clock_mhz, next.voltage_mv),
+                format!("Game margin does not fit at {target} MHz · Godforge tries {} MHz, from {} mV", next.target_clock_mhz, next.voltage_mv),
+                None,
+            );
+        } else if next.id == "compensated" && next.status == "pending" && next.measuring_power && next.target_clock_mhz == target {
+            prog.log.push(format!(
+                "Godforge {target} MHz: {mv} mV segura o clock dentro do limite de potência (só medição, sem matriz); medindo {} mV.",
+                next.voltage_mv
+            ));
+            live_event(
+                &mut prog,
+                LogTone::Step,
+                live_phase,
+                format!("Power check at {target} MHz · {mv} mV fits · trying {} mV", next.voltage_mv),
+                None,
+            );
+        } else if next.id == "compensated" && next.status == "pending" && next.last_qualified_clock_mhz.is_none()
+            && next.target_clock_mhz == target && next.voltage_mv < mv {
+            let allowed = next.allowed_voltage_mv.unwrap_or(mv);
+            prog.log.push(format!(
+                "Godforge {target} MHz: a maior tensão que segura o clock dentro dos limites é {allowed} mV ({mv} mV: {recorded:?}). O par de margem {} mV, {margin} mV abaixo, recebe a matriz completa.",
+                next.voltage_mv
+            ));
+            live_event(
+                &mut prog,
+                LogTone::Step,
+                live_phase,
+                format!("Highest voltage that holds {target} MHz: {allowed} mV · testing the game-margin pair at {} mV", next.voltage_mv),
                 None,
             );
         } else if next.refining_edge.is_some() && next.status == "pending" {
@@ -10100,7 +10136,7 @@ fn measure_multiclock_undervolt_forge(
                     "Par de publicação {target} MHz @ {mv} mV qualificado, com margem de jogo sobre {lowest}."
                 )),
                 "compensated_top_unavailable" => prog.log.push(
-                    "Topo compensado não foi provado; os degraus abaixo partem da menor tensão aprovada no topo.".into(),
+                    "Nenhum clock abaixo do topo fechou a margem de jogo; os degraus abaixo partem da menor tensão aprovada no topo.".into(),
                 ),
                 "no_distinct_profile" => prog.log.push(format!(
                     "Degrau {target} MHz não desceu abaixo do início ({} mV) nem com os bins de clock extras; sem perfil próprio neste nível.",
@@ -10130,7 +10166,7 @@ fn measure_multiclock_undervolt_forge(
                     &mut prog,
                     LogTone::Attention,
                     live_phase,
-                    "Game-margin top not proven · the lower levels start from the top's lowest passing voltage",
+                    "No clock under the top fit the game margin · the lower levels start from the top's lowest passing voltage",
                     None,
                 ),
                 "no_distinct_profile" => live_event(
@@ -10169,7 +10205,7 @@ fn measure_multiclock_undervolt_forge(
                     LogTone::Step,
                     band_phase(&level.id),
                     if level.id == "compensated" {
-                        format!("Next: the game-margin top at {} MHz, starting at {} mV", level.target_clock_mhz, level.voltage_mv)
+                        format!("Next: Godforge, one boost step under the top · {} MHz from {} mV", level.target_clock_mhz, level.voltage_mv)
                     } else {
                         format!("Next level: {} MHz at {} mV", level.target_clock_mhz, level.voltage_mv)
                     },
@@ -10177,8 +10213,13 @@ fn measure_multiclock_undervolt_forge(
                 );
                 prog.log.push(if level.id == "compensated" {
                     format!(
-                        "Topo compensado pela margem de jogo: {} MHz; primeiro o par de margem {} mV ({margin} mV abaixo da publicação, que fica sob a tensão de potência e abaixo da curva stock), depois o par publicado.",
-                        level.target_clock_mhz, level.voltage_mv
+                        "Nível Godforge: {} MHz, um passo de boost abaixo do topo. {} a maior tensão que segura esse clock dentro da potência e abaixo da curva stock; o par {margin} mV abaixo dela recebe a matriz. Se passar, o nível desce até a borda e publica borda + {margin} mV; se falhar, desce um passo de clock.",
+                        level.target_clock_mhz,
+                        if level.measuring_power {
+                            format!("Primeiro mede, só com medições de potência a partir de {} mV,", level.voltage_mv)
+                        } else {
+                            format!("A tensão do topo já é a mais alta permitida; par de margem {} mV:", level.voltage_mv)
+                        }
                     )
                 } else if crate::qualified_search::moved_below_stock(level) {
                     format!(
@@ -10215,6 +10256,7 @@ fn measure_multiclock_undervolt_forge(
                 Outcome::Qualified | Outcome::QualifiedHotBin => "CandidateQualified",
                 Outcome::PowerBound if voltage_limited => "VoltageLimitedClockDrop",
                 Outcome::PowerBound => "PowerBoundClockDrop",
+                Outcome::PowerFree => "PowerMeasured",
                 Outcome::IntegrityError => "BandClosedIntegrityError",
                 Outcome::DriverFailure => "CandidateCrash",
                 Outcome::OperationalFailure => "OperationalFailure",
@@ -13057,7 +13099,7 @@ mod tests {
         let entries = saved["progress"]["log_entries"].as_array().unwrap();
         assert_eq!(entries.len(), FORGE_STATE_LOG_TAIL, "the saved state keeps the short tail");
         assert_eq!(entries.last().unwrap()["tone"], "fail");
-        assert_eq!(band_phase("compensated"), "Game margin");
+        assert_eq!(band_phase("compensated"), "Godforge");
     }
 
     #[test]

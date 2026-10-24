@@ -197,8 +197,8 @@
   );
   const actionLabel = $derived(primaryAction.label);
   const primaryActionReason = $derived(primaryAction.reason);
-  // Each mode's time budget comes from the Core (Long's longer dwells scale Standard's 8 h).
-  const RUN_MODES = { standard: "Standard · up to 8 h", long: "Long · up to about 18 h", clean: "Clean Run · up to 8 h" };
+  // Each mode's time budget comes from the Core (Long's longer dwells scale Standard's 9 h).
+  const RUN_MODES = { standard: "Standard · up to 9 h", long: "Long · up to about 20 h", clean: "Clean Run · up to 9 h" };
   let preForgeOpen = $state(false);
   // The sheet only starts a new run: it closes when the main action becomes anything else.
   $effect(() => {

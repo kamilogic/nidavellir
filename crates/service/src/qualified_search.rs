@@ -4,9 +4,11 @@
 //! Staircase (user decisions 2026-09-28/29), one level at a time:
 //! 1. Find the top below the power limit, then descend its voltage until the first failure.
 //! 2. Games need a margin above what the matrix approves. If the top's lowest pass plus that
-//!    margin exceeds the top's power-free voltage, a compensated top one or more clock bins lower
-//!    must pass its margin pair (power-free voltage minus the margin) before its publication pair
-//!    (the power-free voltage) is qualified.
+//!    margin exceeds the top's power-free voltage, the Godforge level is measured one boost step
+//!    lower at a time (search 15, user decision 2026-10-24): at each clock, the highest voltage
+//!    that holds it within the power limit and below stock, then its game-margin pair that far
+//!    under it. The first clock whose pair passes is Godforge's; it descends to its edge there and
+//!    publishes edge + margin, like the lower levels. No slope prediction, no rounding.
 //! 3. The -5% and -10% levels of the compensated top start at the lowest voltage the level above
 //!    passed and descend in two-bin steps until the first failure. A publication pair the descent
 //!    did not test, above its range or between two of its steps, gets its own admission.
@@ -30,11 +32,14 @@
 
 use nidavellir_core::ipc::{ForgeDiscoveryBand, ForgeDiscoverySearch};
 
-pub const VERSION: u32 = 14;
-/// Room for the distinct-profile clock retries, each level's edge refinement and a publication pair
-/// the descent skipped; the time budget remains the hard cap.
-pub const STANDARD_ATTEMPTS: u32 = 36;
-pub const STANDARD_BUDGET_MS: u64 = 8 * 60 * 60 * 1_000;
+pub const VERSION: u32 = 15;
+/// Room for the distinct-profile clock retries, each level's edge refinement, a publication pair
+/// the descent skipped and the Godforge level's power measurements and descent; the time budget
+/// remains the hard cap.
+pub const STANDARD_ATTEMPTS: u32 = 44;
+/// The measured Godforge level adds about an hour to a 3060 Ti run (6.4 h on 0.8.13); a run
+/// that recovers from edge crashes needs the rest.
+pub const STANDARD_BUDGET_MS: u64 = 9 * 60 * 60 * 1_000;
 /// Games need about this much more voltage than the matrix approves (user decisions 2026-09-29 and
 /// 2026-10-23). 1830@856 passed the matrix, yet 1815@875 crashes Overwatch within 30 min and 1800@875
 /// is the user's daily undervolt. Godforge 1920@925, two bins above its failure, TDR'd in Overwatch
@@ -46,18 +51,17 @@ pub const GAME_MARGIN_MV: u32 = 43;
 /// GPU Boost moves clocks in 15 MHz steps on every series, even where curve points sit closer (an
 /// RTX 5070's are ~7.5 MHz apart), so the search moves a clock by at least this much.
 const BOOST_STEP_MHZ: u32 = 15;
-/// Test-edge slope used only to predict the compensated top clock. On the test 3060 Ti the edge
-/// fell 918 → 856 mV over 1920 → 1830 MHz, ~10 mV per boost step. The margin pair verifies it.
-const COMPENSATION_MV_PER_BOOST_STEP: u32 = 10;
-/// A hot-bin pass is evidence one boost step lower, worth this much voltage at the target by the
-/// same test-edge slope. Profile synthesis applies the identical anchor rule.
-pub const HOT_BIN_RELIEF_MV: u32 = COMPENSATION_MV_PER_BOOST_STEP;
+/// A hot-bin pass is evidence one boost step lower, worth this much voltage at the target: on the
+/// test 3060 Ti the edge fell 918 → 856 mV over 1920 → 1830 MHz, ~10 mV per boost step. Profile
+/// synthesis applies the identical anchor rule.
+pub const HOT_BIN_RELIEF_MV: u32 = 10;
 
 fn relief_mv(hot_bin: bool) -> u32 {
     if hot_bin { HOT_BIN_RELIEF_MV } else { 0 }
 }
-/// A compensated top whose margin pair fails steps one boost step down, at most this often.
-const COMPENSATION_RETRIES: u32 = 2;
+/// The Godforge level starts one boost step under the top and steps one more down per failed
+/// game-margin pair, at most this often (60 MHz in all).
+const COMPENSATION_RETRIES: u32 = 3;
 /// Lower levels descend about this much per admission, two bins on 6.25 mV and 5 mV curves alike:
 /// their descent from the dominated start spans ~10 bins. The bin a step skips above the first
 /// failure is then tested on its own, so the edge is one bin exact (user decision 2026-10-23).
@@ -94,13 +98,6 @@ fn undervolts(stock: &[(usize, u32, u32)], clock: u32, mv: u32) -> bool {
 /// The highest voltage bin at or below `limit` that still undervolts `clock`.
 fn undervolt_bin(voltage_bins: &[u32], stock: &[(usize, u32, u32)], clock: u32, limit: u32) -> Option<u32> {
     voltage_bins.iter().copied().filter(|mv| *mv <= limit && undervolts(stock, clock, *mv)).max()
-}
-
-/// The compensated top's margin pair: the game margin below its publication voltage, the highest
-/// one that is power-free and still undervolts the clock. It follows the clock down.
-fn compensated_margin(voltage_bins: &[u32], stock: &[(usize, u32, u32)], power_free: u32, clock: u32) -> Option<u32> {
-    let publication = undervolt_bin(voltage_bins, stock, clock, power_free)?;
-    bin_at_or_below(voltage_bins, publication.saturating_sub(GAME_MARGIN_MV))
 }
 
 /// A lower level whose start moved under the voltage the level above passed, to stay below the
@@ -191,6 +188,9 @@ pub enum Outcome {
     QualifiedHotBin,
     /// Confirmed power limitation, no integrity/thermal/containment error, cleanup confirmed.
     PowerBound,
+    /// A power measurement only (the Godforge level's): the pair held its clock within the power
+    /// limit. No matrix ran, so it proves nothing about stability.
+    PowerFree,
     IntegrityError,
     Inconclusive,
     DriverFailure,
@@ -352,30 +352,23 @@ fn start_next_level(
     if let Some(comp) = search.bands.iter().position(|b| b.id == "compensated") {
         if search.bands[comp].status == "waiting_for_top" {
             let publication = bin_at_or_above(voltage_bins, top_lowest + top_relief + GAME_MARGIN_MV);
-            // Predict how far the clock must drop for the margin to fit under the power-free voltage.
-            let clock = publication.filter(|mv| *mv > power_free).and_then(|mv| {
-                let drop_mhz = (mv - power_free).div_ceil(COMPENSATION_MV_PER_BOOST_STEP).max(1) * BOOST_STEP_MHZ;
-                clock_bins.iter().copied().filter(|clock| clock + drop_mhz <= top_clock).max()
-            });
-            let margin = clock.and_then(|clock| compensated_margin(voltage_bins, stock, power_free, clock));
-            let band = &mut search.bands[comp];
-            band.clock_ceiling_mhz = top_clock;
-            match (clock, margin) {
-                _ if publication.is_some_and(|mv| mv <= power_free) => {
-                    band.target_clock_mhz = top_clock;
-                    band.voltage_mv = top_lowest;
-                    close_band(band, "compensation_not_needed");
-                }
-                (Some(clock), Some(margin)) => {
-                    band.target_clock_mhz = clock;
-                    band.voltage_mv = margin;
-                    band.status = "pending".into();
-                    return;
-                }
-                _ => {
-                    band.target_clock_mhz = top_clock;
-                    band.voltage_mv = top_lowest;
-                    close_band(band, "compensated_top_unavailable");
+            search.bands[comp].clock_ceiling_mhz = top_clock;
+            if publication.is_some_and(|mv| mv <= power_free) {
+                let band = &mut search.bands[comp];
+                band.target_clock_mhz = top_clock;
+                band.voltage_mv = top_lowest;
+                close_band(band, "compensation_not_needed");
+            } else {
+                // One boost step under the top, the top's power-free voltage holds the clock too.
+                let clock = step_below(clock_bins, top_clock);
+                let allowed = clock.and_then(|clock| undervolt_bin(voltage_bins, stock, clock, power_free));
+                match clock.zip(allowed) {
+                    Some((clock, mv)) => {
+                        search.bands[comp].target_clock_mhz = clock;
+                        search.bands[comp].allowed_voltage_mv = Some(mv);
+                        measure_or_margin(search, comp, voltage_bins, stock);
+                    }
+                    None => godforge_unavailable(search, comp),
                 }
             }
         }
@@ -449,6 +442,9 @@ pub fn record(
             search.control_retries_used += u32::from(outcome == Outcome::ControlMismatch);
             search.bands[index].status = "pending".into();
         }
+        Outcome::PowerFree if !search.bands[index].measuring_power => {
+            return Err("power_measurement_not_requested".into());
+        }
         _ if search.bands[index].publishing => record_publication(search, index, outcome),
         _ if search.bands[index].id == "compensated" => {
             record_compensated(search, index, outcome, clock_bins, voltage_bins, stock)
@@ -474,11 +470,11 @@ fn record_publication(search: &mut ForgeDiscoverySearch, index: usize, outcome: 
     }
 }
 
-/// The compensated top. Its margin pair must pass at the predicted clock before its publication
-/// pair (the margin pair plus the game margin, at most the top's power-free voltage and below the
-/// stock curve) is qualified. A failure means the prediction was too high: one clock bin lower,
-/// with its own margin pair, a bounded number of times. A TDR here pauses like a level edge, and
-/// Resume retries the lower clock.
+/// The Godforge level (search 15). At each clock it first measures, with power measurements only,
+/// the highest voltage that holds the clock within the power limit and below the stock curve. Its
+/// game-margin pair then sits the margin under that voltage: a pass makes this clock Godforge's,
+/// and the level descends to its edge like a lower level. A failed pair steps one boost step down,
+/// a bounded number of times; a TDR there pauses like a level edge, and Resume tries the lower clock.
 fn record_compensated(
     search: &mut ForgeDiscoverySearch,
     index: usize,
@@ -487,46 +483,99 @@ fn record_compensated(
     voltage_bins: &[u32],
     stock: &[(usize, u32, u32)],
 ) {
-    let top = search.bands.iter().find(|band| band.id == "performance");
-    let power_free = top.and_then(|band| band.first_qualified_voltage_mv);
-    let top_lowest = top.and_then(|band| band.last_qualified_voltage_mv);
     let band = &mut search.bands[index];
-    if matches!(outcome, Outcome::Qualified | Outcome::QualifiedHotBin) {
-        let hot_bin = outcome == Outcome::QualifiedHotBin;
-        let clock = band.target_clock_mhz;
-        let publication = bin_at_or_above(voltage_bins, band.voltage_mv + relief_mv(hot_bin) + GAME_MARGIN_MV)
-            .filter(|mv| power_free.is_none_or(|limit| *mv <= limit) && undervolts(stock, clock, *mv));
-        if let Some(publication) = publication {
-            band.first_qualified_voltage_mv = Some(band.voltage_mv);
-            band.last_qualified_clock_mhz = Some(band.target_clock_mhz);
-            band.last_qualified_voltage_mv = Some(band.voltage_mv);
-            band.lowest_hot_bin = hot_bin;
-            band.voltage_mv = publication;
-            band.publishing = true;
-            band.status = "pending".into();
-            return;
-        }
-        // Only the hot bin can push the publication over that limit: the margin pair held one
-        // clock bin lower, so the prediction steps down like a failed margin pair.
-    }
-    let lower = step_below(clock_bins, band.target_clock_mhz);
-    let retry = lower.zip(power_free).and_then(|(clock, power_free)| {
-        compensated_margin(voltage_bins, stock, power_free, clock).map(|margin| (clock, margin))
-    });
-    match retry {
-        Some((clock, margin)) if band.attempts <= COMPENSATION_RETRIES => {
-            band.target_clock_mhz = clock;
-            band.voltage_mv = margin;
-            band.status = "pending".into();
-        }
-        _ => {
-            // The lower levels then start from the top's lowest pass, which dominates them.
-            if let Some(mv) = top_lowest {
-                band.voltage_mv = mv;
+    if band.measuring_power {
+        match outcome {
+            Outcome::PowerFree | Outcome::Qualified | Outcome::QualifiedHotBin => {
+                band.allowed_voltage_mv = Some(band.voltage_mv);
+                measure_or_margin(search, index, voltage_bins, stock);
             }
-            close_band(band, "compensated_top_unavailable");
+            // More voltage at a lower clock than a pair the top passed: a crash is no edge there.
+            Outcome::DriverFailure => close_all(search, "driver_failure_recovery_required"),
+            // Over the power limit, short of the clock or anything else: the last voltage holds.
+            _ => margin_pair(search, index, voltage_bins),
         }
+        return;
     }
+    if band.last_qualified_clock_mhz == Some(band.target_clock_mhz)
+        || matches!(outcome, Outcome::Qualified | Outcome::QualifiedHotBin)
+    {
+        return record_level(search, index, outcome, clock_bins, voltage_bins, stock, None, None);
+    }
+    step_godforge_down(search, index, clock_bins, voltage_bins, stock);
+}
+
+/// The next power measurement, one bin above the highest voltage that held the clock while it
+/// still undervolts it; past that, the game-margin pair.
+fn measure_or_margin(search: &mut ForgeDiscoverySearch, index: usize, voltage_bins: &[u32], stock: &[(usize, u32, u32)]) {
+    let band = &mut search.bands[index];
+    let clock = band.target_clock_mhz;
+    let higher = band.allowed_voltage_mv
+        .and_then(|mv| voltage_bins.iter().copied().filter(|bin| *bin > mv).min())
+        .filter(|mv| undervolts(stock, clock, *mv));
+    match higher {
+        Some(mv) => {
+            band.measuring_power = true;
+            band.voltage_mv = mv;
+            band.status = "pending".into();
+        }
+        None => margin_pair(search, index, voltage_bins),
+    }
+}
+
+/// The game-margin pair: the margin under the highest voltage that held the clock.
+fn margin_pair(search: &mut ForgeDiscoverySearch, index: usize, voltage_bins: &[u32]) {
+    let band = &mut search.bands[index];
+    band.measuring_power = false;
+    match band.allowed_voltage_mv.and_then(|mv| bin_at_or_below(voltage_bins, mv.saturating_sub(GAME_MARGIN_MV))) {
+        Some(mv) => {
+            band.voltage_mv = mv;
+            band.status = "pending".into();
+        }
+        None => godforge_unavailable(search, index),
+    }
+}
+
+/// One boost step down, where what held the clock holds too (re-checked against the stock curve).
+fn step_godforge_down(
+    search: &mut ForgeDiscoverySearch,
+    index: usize,
+    clock_bins: &[u32],
+    voltage_bins: &[u32],
+    stock: &[(usize, u32, u32)],
+) {
+    let band = &mut search.bands[index];
+    let lower = step_below(clock_bins, band.target_clock_mhz);
+    let allowed = lower.zip(band.allowed_voltage_mv)
+        .and_then(|(clock, mv)| undervolt_bin(voltage_bins, stock, clock, mv));
+    match lower.zip(allowed) {
+        Some((clock, mv)) if band.clock_retries_used < COMPENSATION_RETRIES => {
+            band.clock_retries_used += 1;
+            band.target_clock_mhz = clock;
+            band.allowed_voltage_mv = Some(mv);
+            band.first_qualified_voltage_mv = None;
+            band.last_qualified_clock_mhz = None;
+            band.last_qualified_voltage_mv = None;
+            band.lowest_hot_bin = false;
+            measure_or_margin(search, index, voltage_bins, stock);
+        }
+        _ => godforge_unavailable(search, index),
+    }
+}
+
+/// No Godforge clock passed: the lower levels start from the top's lowest pass, which dominates
+/// them, relative to the top's clock.
+fn godforge_unavailable(search: &mut ForgeDiscoverySearch, index: usize) {
+    let top = search.bands.iter().find(|band| band.id == "performance");
+    let (clock, lowest) = (top.and_then(|band| band.last_qualified_clock_mhz), top.and_then(|band| band.last_qualified_voltage_mv));
+    let band = &mut search.bands[index];
+    band.target_clock_mhz = clock.unwrap_or(band.target_clock_mhz);
+    band.voltage_mv = lowest.unwrap_or(band.voltage_mv);
+    band.measuring_power = false;
+    band.first_qualified_voltage_mv = None;
+    band.last_qualified_clock_mhz = None;
+    band.last_qualified_voltage_mv = None;
+    close_band(band, "compensated_top_unavailable");
 }
 
 /// The top and the lower levels. A level first qualifies its clock, then descends until its
@@ -712,7 +761,9 @@ fn record_level(
 /// above's voltage with less clock, so it first retries one clock bin lower from its lowest pass
 /// (dominated there, and only while that still undervolts the lower clock); one that never went
 /// below its start publishes nothing. When the descent did not test the publication pair, the
-/// level qualifies it next, unless it would not undervolt; otherwise the level closes.
+/// level qualifies it next, unless it would not undervolt; otherwise the level closes. The
+/// Godforge level publishes within the voltage it measured to hold its clock: hot-bin relief can
+/// push the publication over it, and then the level steps one boost step down.
 fn finish_level(
     search: &mut ForgeDiscoverySearch,
     index: usize,
@@ -735,6 +786,8 @@ fn finish_level(
             band.status = "pending".into();
             return;
         }
+    }
+    if band.id != "performance" && band.id != "compensated" {
         let start = band.level_start_voltage_mv;
         let distinct = lowest.zip(start).is_some_and(|(lowest, start)| lowest + DISTINCT_LEVEL_MV <= start);
         let lower_clock = step_below(clock_bins, band.target_clock_mhz)
@@ -761,6 +814,9 @@ fn finish_level(
     let publication = lowest
         .and_then(|lowest| bin_at_or_above(voltage_bins, lowest + relief + GAME_MARGIN_MV))
         .filter(|mv| band.id != "performance" && !descent_tested(band, voltage_bins, *mv));
+    if band.id == "compensated" && publication.zip(band.allowed_voltage_mv).is_some_and(|(mv, allowed)| mv > allowed) {
+        return step_godforge_down(search, index, clock_bins, voltage_bins, stock);
+    }
     match publication {
         // The stock curve already runs this clock below the game margin: no profile here.
         Some(mv) if !undervolts(stock, band.target_clock_mhz, mv) => close_band(band, "publication_at_stock"),
@@ -866,12 +922,22 @@ mod tests {
     /// The test 3060 Ti grid: 15 MHz clock bins and 6.25 mV voltage bins (integer mV).
     fn staircase_at(power_free_mv: u32) -> (ForgeDiscoverySearch, Vec<u32>, Vec<u32>) {
         let seed = |id| Seed { id, target_clock_mhz: 1920, voltage_mv: power_free_mv, clock_ceiling_mhz: 1920 };
-        let state = new(&[seed("performance"), seed("balanced"), seed("efficiency")], 24, 10_000);
+        let state = new(&[seed("performance"), seed("balanced"), seed("efficiency")], STANDARD_ATTEMPTS, 10_000);
         let volts = (0..=30u32).map(|bin| (81_250 + bin * 625) / 100).collect();
         (state, (1695..=1920).step_by(15).collect(), volts)
     }
     fn staircase() -> (ForgeDiscoverySearch, Vec<u32>, Vec<u32>) {
         staircase_at(937)
+    }
+    /// The top passes 937 → 906 at 1920 and fails 900. Godforge: 943 is over the power limit at
+    /// 1905 and its margin pair 893 fails; at 1890, 943 is over the limit again, 893 passes, the
+    /// edge is 893 (881 and the refined 887 fail) and 893 + 43 mV = 937 is published.
+    fn godforge_1890(state: &mut ForgeDiscoverySearch, clocks: &[u32], volts: &[u32]) -> Vec<(usize, u32, u32)> {
+        use Outcome::*;
+        walk_all(state, clocks, volts, &[
+            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
+            PowerBound, IntegrityError, PowerBound, Qualified, IntegrityError, IntegrityError, Qualified,
+        ])
     }
     /// A stock curve far below every target: every pair undervolts.
     fn low_stock(volts: &[u32]) -> Vec<(usize, u32, u32)> {
@@ -891,51 +957,60 @@ mod tests {
         outcomes.iter().map(|outcome| walk(state, clocks, volts, *outcome)).collect()
     }
     #[test]
-    fn compensated_staircase_publishes_every_level_with_the_game_margin() {
+    fn godforge_is_measured_one_boost_step_at_a_time_and_publishes_edge_plus_margin() {
         use Outcome::*;
         let (mut state, clocks, volts) = staircase();
         let trace = walk_all(&mut state, &clocks, &volts, &[
             Qualified, Qualified, Qualified, Qualified, IntegrityError,
-            Qualified, Qualified,
-            Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError, Qualified,
-            Qualified, Qualified, IntegrityError, Qualified, Qualified,
+            PowerFree, PowerBound, IntegrityError,
+            PowerFree, PowerBound, Qualified, Qualified, IntegrityError, Qualified, Qualified,
         ]);
         assert_eq!(trace, [
             // Top: 918 + 43 mV exceeds the power-free 937, so the top itself is not publishable.
             (0, 1920, 937), (0, 1920, 931), (0, 1920, 925), (0, 1920, 918), (0, 1920, 912),
-            // 961 → 962 sits 25 mV over 937: the compensated top is three boost steps lower, its
-            // margin pair first, then its publication pair.
-            (1, 1875, 893), (1, 1875, 937),
-            // -5% of 1875 from the dominated start, 10 mV per step. The bin skipped above the
-            // failure (837) passes, and 837 + 43 mV = 881 was already tested.
-            (2, 1785, 893), (2, 1785, 881), (2, 1785, 868), (2, 1785, 856), (2, 1785, 843), (2, 1785, 831),
-            (2, 1785, 837),
-            // -10%: its refined edge 818 + 43 mV = 862 is above its start, so it gets its own admission.
-            (3, 1695, 837), (3, 1695, 825), (3, 1695, 812), (3, 1695, 818), (3, 1695, 862),
+            // One boost step down, 937 holds too; 943 holds within the power limit and 950 does
+            // not (power checks only). The margin pair 943 - 43 mV = 900 fails.
+            (1, 1905, 943), (1, 1905, 950), (1, 1905, 900),
+            // 1890: 950 holds, 956 does not, and 950 - 43 mV = 906 passes. The level descends to
+            // its edge, refines the skipped 887 (passes) and publishes 887 + 43 mV = 931.
+            (1, 1890, 950), (1, 1890, 956), (1, 1890, 906), (1, 1890, 893), (1, 1890, 881), (1, 1890, 887),
+            (1, 1890, 931),
         ]);
-        let reasons: Vec<_> = state.bands.iter().map(|b| b.stop_reason.as_deref().unwrap()).collect();
-        assert_eq!(reasons, ["integrity_edge", "published", "integrity_edge", "published"]);
-        assert_eq!(state.bands[1].last_qualified_voltage_mv, Some(893), "publication keeps the lowest pass");
-        assert_eq!((state.integrity_errors, state.stop_reason.as_deref()), (0, Some("all_regions_closed")));
+        let godforge = &state.bands[1];
+        assert_eq!(godforge.stop_reason.as_deref(), Some("published"));
+        assert_eq!((godforge.last_qualified_clock_mhz, godforge.last_qualified_voltage_mv), (Some(1890), Some(887)));
+        assert_eq!((godforge.allowed_voltage_mv, godforge.clock_retries_used), (Some(950), 1));
+        // -5% of Godforge's clock, from its lowest pass (dominated there).
+        let balanced = &state.bands[2];
+        assert_eq!((balanced.target_clock_mhz, balanced.voltage_mv, balanced.status.as_str()), (1800, 887, "pending"));
+        assert_eq!(state.integrity_errors, 0, "a failed margin pair is no integrity budget event");
+        // A power measurement is never a result for a pair that asked for its matrix.
+        let index = next_band(&state).unwrap();
+        admit(&mut state, index, 0, 100).unwrap();
+        assert_eq!(record(&mut state, index, PowerFree, &clocks, &volts, &low_stock(&volts), None, None),
+            Err("power_measurement_not_requested".into()));
     }
     #[test]
-    fn a_publication_between_two_descent_steps_gets_its_own_admission() {
+    fn the_user_s_game_tested_profiles_come_out_of_the_0_8_11_edges() {
         use Outcome::*;
-        // Run f2-forge-1792720262819 (3060 Ti, 2026-10-23): 1800 passed 831 and failed 818, 1710
-        // passed 781 and failed 768. Seven bins over a lowest pass on a 10 mV step land between two
-        // steps (875, 825); unproven, the profiles would take the tested step above (881, 831).
+        // Run f2-forge-1792720262819 (3060 Ti, 2026-10-23): 1890 passed 893 and failed 887, 1800
+        // passed 831 and failed 818, 1710 passed 781 and failed 768; 825 at 1800 failed on 02/10.
+        // Every level publishes its edge + 43 mV: 1890@937, 1800@875 and 1710@825, the set the
+        // user runs in games. 875 and 825 sit between two 10 mV steps, so each gets its own test.
         let (mut state, clocks, _) = staircase();
         let volts: Vec<u32> = (0..=40u32).map(|bin| (75_000 + bin * 625) / 100).collect();
-        state.attempts_limit = STANDARD_ATTEMPTS;
         let trace = walk_all(&mut state, &clocks, &volts, &[
             Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
-            Qualified, Qualified,
+            PowerBound, IntegrityError, PowerBound, Qualified, IntegrityError, IntegrityError, Qualified,
             Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError, IntegrityError, Qualified,
             Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError, IntegrityError, Qualified,
         ]);
-        assert_eq!(trace[7..9], [(1, 1890, 893), (1, 1890, 937)]);
-        assert_eq!(trace[14..18], [(2, 1800, 831), (2, 1800, 818), (2, 1800, 825), (2, 1800, 875)]);
-        assert_eq!(trace[22..], [(3, 1710, 781), (3, 1710, 768), (3, 1710, 775), (3, 1710, 825)]);
+        assert_eq!(trace[7..14], [
+            (1, 1905, 943), (1, 1905, 893), (1, 1890, 943), (1, 1890, 893), (1, 1890, 881), (1, 1890, 887),
+            (1, 1890, 937),
+        ]);
+        assert_eq!(trace[19..23], [(2, 1800, 831), (2, 1800, 818), (2, 1800, 825), (2, 1800, 875)]);
+        assert_eq!(trace[27..], [(3, 1710, 781), (3, 1710, 768), (3, 1710, 775), (3, 1710, 825)]);
         let reasons: Vec<_> = state.bands.iter().map(|b| b.stop_reason.as_deref().unwrap()).collect();
         assert_eq!(reasons, ["integrity_edge", "published", "published", "published"]);
     }
@@ -949,21 +1024,29 @@ mod tests {
         assert_eq!((state.bands[2].target_clock_mhz, state.bands[2].voltage_mv), (1830, 918));
     }
     #[test]
-    fn compensated_top_steps_down_on_a_failed_margin_pair_and_gives_up_after_two_retries() {
+    fn godforge_steps_down_on_a_failed_margin_pair_and_gives_up_after_three_retries() {
         use Outcome::*;
         let (mut state, clocks, volts) = staircase();
         walk_all(&mut state, &clocks, &volts, &[Qualified, Qualified, Qualified, Qualified, IntegrityError]);
         let mut paused = state.clone();
-        assert_eq!(walk_all(&mut state, &clocks, &volts, &[IntegrityError, Inconclusive, IntegrityError]),
-            [(1, 1875, 893), (1, 1860, 893), (1, 1845, 893)]);
+        let mut crashed = state.clone();
+        assert_eq!(walk_all(&mut state, &clocks, &volts, &[
+            PowerBound, IntegrityError, PowerBound, Inconclusive, PowerBound, IntegrityError, PowerBound, IntegrityError,
+        ]), [
+            (1, 1905, 943), (1, 1905, 893), (1, 1890, 943), (1, 1890, 893),
+            (1, 1875, 943), (1, 1875, 893), (1, 1860, 943), (1, 1860, 893),
+        ]);
         assert_eq!(state.bands[1].stop_reason.as_deref(), Some("compensated_top_unavailable"));
-        assert_eq!(state.integrity_errors, 0, "the prediction failing is not an integrity budget event");
-        // The lower levels then start from the top's lowest pass, which dominates them.
-        assert_eq!((state.bands[2].target_clock_mhz, state.bands[2].voltage_mv), (1755, 918));
+        assert_eq!(state.integrity_errors, 0, "a failed margin pair is no integrity budget event");
+        // The lower levels then start from the top's lowest pass, relative to the top's clock.
+        assert_eq!((state.bands[2].target_clock_mhz, state.bands[2].voltage_mv), (1830, 918));
         // A TDR on the margin pair pauses with the search open, one boost step lower.
-        walk(&mut paused, &clocks, &volts, DriverFailure);
+        walk_all(&mut paused, &clocks, &volts, &[PowerBound, DriverFailure]);
         assert_eq!((paused.stop_reason.as_deref(), paused.bands[1].status.as_str()), (None, "pending"));
-        assert_eq!(paused.bands[1].target_clock_mhz, 1860);
+        assert_eq!((paused.bands[1].target_clock_mhz, paused.bands[1].measuring_power), (1890, true));
+        // More voltage at a lower clock than a pair the top passed: a crash there ends the search.
+        walk(&mut crashed, &clocks, &volts, DriverFailure);
+        assert_eq!(crashed.stop_reason.as_deref(), Some("driver_failure_recovery_required"));
     }
     #[test]
     fn tdr_edge_keeps_the_search_open_for_resume_but_a_dominated_start_failure_stops_it() {
@@ -974,12 +1057,14 @@ mod tests {
         assert_eq!(state.stop_reason, None, "Resume after reboot continues with the next level");
         let mut restored: ForgeDiscoverySearch = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         resume_after_stock(&mut restored).unwrap();
-        // The lowest pass is 937: 937 + 43 mV rounds to 981, 44 mV over the power-free 937, so the
-        // compensated top is five boost steps lower (1845), verified at its margin pair 893.
-        assert_eq!(walk(&mut restored, &clocks, &volts, Outcome::Qualified), (1, 1845, 893));
-        walk(&mut restored, &clocks, &volts, Outcome::Qualified);
+        // The lowest pass is 937: 937 + 43 mV rounds to 981, over the power-free 937, so Godforge
+        // is measured one boost step down.
+        assert_eq!(walk(&mut restored, &clocks, &volts, Outcome::PowerBound), (1, 1905, 943));
+        assert_eq!(walk_all(&mut restored, &clocks, &volts, &[
+            Outcome::Qualified, Outcome::IntegrityError, Outcome::IntegrityError, Outcome::Qualified,
+        ]), [(1, 1905, 893), (1, 1905, 881), (1, 1905, 887), (1, 1905, 937)]);
         let mut dominated = restored.clone();
-        assert_eq!(walk(&mut restored, &clocks, &volts, Outcome::IntegrityError), (2, 1755, 893));
+        assert_eq!(walk(&mut restored, &clocks, &volts, Outcome::IntegrityError), (2, 1815, 893));
         assert_eq!((restored.stop_reason.as_deref(), restored.integrity_errors), (Some("dominated_pair_failed"), 1));
         assert_eq!(next_band(&restored), None);
         walk(&mut dominated, &clocks, &volts, Outcome::DriverFailure);
@@ -993,7 +1078,9 @@ mod tests {
     fn a_failed_publication_pair_is_inconsistent_evidence() {
         use Outcome::*;
         let (mut state, clocks, volts) = staircase();
-        walk_all(&mut state, &clocks, &volts, &[Qualified, Qualified, Qualified, Qualified, IntegrityError, Qualified]);
+        walk_all(&mut state, &clocks, &volts, &[
+            Qualified, Qualified, Qualified, Qualified, IntegrityError, PowerBound, Qualified, IntegrityError, IntegrityError,
+        ]);
         assert!(state.bands[1].publishing);
         walk(&mut state, &clocks, &volts, IntegrityError);
         assert_eq!((state.stop_reason.as_deref(), state.integrity_errors), (Some("dominated_pair_failed"), 1));
@@ -1004,11 +1091,8 @@ mod tests {
         // Run 1790761502529 with the power fix: the top holds 906, Godforge publishes 1890@937 and
         // the -5% level TDRs on its first step below its start, then on the bin that step skipped.
         let (mut state, clocks, volts) = staircase();
-        let mut trace = walk_all(&mut state, &clocks, &volts, &[
-            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
-            Qualified, Qualified,
-            Qualified, DriverFailure, DriverFailure,
-        ]);
+        let mut trace = godforge_1890(&mut state, &clocks, &volts);
+        trace.extend(walk_all(&mut state, &clocks, &volts, &[Qualified, DriverFailure, DriverFailure]));
         assert_eq!(state.stop_reason, None, "a TDR edge pauses with the search open");
         let balanced = &state.bands[2];
         assert_eq!((balanced.target_clock_mhz, balanced.voltage_mv, balanced.clock_retries_used), (1785, 893, 1));
@@ -1016,7 +1100,7 @@ mod tests {
         trace.extend(walk_all(&mut state, &clocks, &volts, &[
             Qualified, Qualified, Qualified, IntegrityError, Qualified, Qualified,
         ]));
-        assert_eq!(trace[9..], [
+        assert_eq!(trace[14..], [
             (2, 1800, 893), (2, 1800, 881), (2, 1800, 887),
             // One boost step lower from the lowest pass (dominated there). The refined edge 862 is
             // more than 25 mV under the start, so 862 + 43 mV = 905 → 906 is published.
@@ -1031,9 +1115,7 @@ mod tests {
     fn retries_stop_after_two_clock_bins_and_publish_only_a_real_descent() {
         use Outcome::*;
         let (mut state, clocks, volts) = staircase();
-        walk_all(&mut state, &clocks, &volts, &[
-            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError, Qualified, Qualified,
-        ]);
+        godforge_1890(&mut state, &clocks, &volts);
         let mut never = state.clone();
         let trace = walk_all(&mut state, &clocks, &volts, &[
             Qualified, IntegrityError, IntegrityError, Qualified, IntegrityError, IntegrityError,
@@ -1059,10 +1141,8 @@ mod tests {
     fn a_retry_start_that_proves_nothing_never_claims_a_pair() {
         use Outcome::*;
         let (mut state, clocks, volts) = staircase();
-        walk_all(&mut state, &clocks, &volts, &[
-            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
-            Qualified, Qualified, Qualified, DriverFailure, DriverFailure,
-        ]);
+        godforge_1890(&mut state, &clocks, &volts);
+        walk_all(&mut state, &clocks, &volts, &[Qualified, DriverFailure, DriverFailure]);
         let mut power = state.clone();
         // Missing proof at the retry's dominated start closes the level without a pass.
         assert_eq!(walk(&mut state, &clocks, &volts, Inconclusive), (2, 1785, 893));
@@ -1078,10 +1158,7 @@ mod tests {
     fn a_hot_bin_anchor_raises_the_publication_without_stopping_the_descent() {
         use Outcome::*;
         let (mut state, clocks, volts) = staircase();
-        walk_all(&mut state, &clocks, &volts, &[
-            Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError,
-            Qualified, Qualified,
-        ]);
+        godforge_1890(&mut state, &clocks, &volts);
         // The -5% level's passes below 881 held 1800 mostly at the 1785 hot bin.
         let trace = walk_all(&mut state, &clocks, &volts, &[
             Qualified, Qualified, QualifiedHotBin, QualifiedHotBin, IntegrityError, IntegrityError, Qualified,
@@ -1095,20 +1172,28 @@ mod tests {
         assert_eq!((state.bands[2].stop_reason.as_deref(), state.integrity_errors), (Some("published"), 0));
     }
     #[test]
-    fn a_hot_bin_margin_or_top_anchor_compensates_one_clock_bin_deeper() {
+    fn a_hot_bin_edge_that_puts_godforge_over_its_voltage_steps_one_boost_step_down() {
         use Outcome::*;
         let (mut state, clocks, volts) = staircase();
         walk_all(&mut state, &clocks, &volts, &[Qualified, Qualified, Qualified, Qualified, Qualified, Qualified, IntegrityError]);
-        // 893 + 10 + 43 mV = 946 → 950, over the power-free 937: the margin pair only held 1875.
-        assert_eq!(walk_all(&mut state, &clocks, &volts, &[QualifiedHotBin, Qualified, Qualified]),
-            [(1, 1890, 893), (1, 1875, 893), (1, 1875, 937)]);
+        // At 1890 the edge 893 held mostly at the hot bin: 893 + 10 + 43 mV = 946 → 950, over the
+        // 937 that holds the clock within the power limit, so 1875 is measured next.
+        assert_eq!(walk_all(&mut state, &clocks, &volts, &[
+            PowerBound, IntegrityError, PowerBound, QualifiedHotBin, IntegrityError, IntegrityError,
+            PowerBound, Qualified, IntegrityError, IntegrityError, Qualified,
+        ]), [
+            (1, 1905, 943), (1, 1905, 893), (1, 1890, 943), (1, 1890, 893), (1, 1890, 881), (1, 1890, 887),
+            (1, 1875, 943), (1, 1875, 893), (1, 1875, 881), (1, 1875, 887), (1, 1875, 937),
+        ]);
         assert_eq!(state.bands[1].stop_reason.as_deref(), Some("published"));
-        // A hot-bin top anchor: 906 + 10 + 43 mV = 959 → 962, 25 mV over 937, so three boost steps.
+        assert!(!state.bands[1].lowest_hot_bin, "the step down drops the hot-bin anchor of 1890");
+        // A hot-bin top anchor: 906 + 10 + 43 mV = 959 → 962, over 937, so Godforge is measured.
         let (mut hot_top, clocks, volts) = staircase();
         walk_all(&mut hot_top, &clocks, &volts, &[
             Qualified, Qualified, Qualified, Qualified, Qualified, QualifiedHotBin, IntegrityError,
         ]);
-        assert_eq!((hot_top.bands[1].target_clock_mhz, hot_top.bands[1].voltage_mv), (1875, 893));
+        let godforge = &hot_top.bands[1];
+        assert_eq!((godforge.target_clock_mhz, godforge.voltage_mv, godforge.measuring_power), (1905, 943, true));
     }
     #[test]
     fn power_bound_lowers_voltage_at_same_clock_without_promoting_evidence() {
@@ -1207,14 +1292,18 @@ mod tests {
         };
         assert_eq!(go(&mut state, &[Inconclusive, Qualified, Qualified, Inconclusive]),
             [(0, 2760, 1100), (0, 2745, 1100), (0, 2745, 1095), (0, 2745, 1090)]);
-        // 1095 + 43 mV → 1140 sits 40 mV over the power-free 1100: four boost steps (2685). Stock
-        // reaches 2685 at 1080, so its publication is 1075 and its margin pair 1030.
+        // 1095 + 43 mV → 1140 sits over the power-free 1100, so Godforge is measured one boost step
+        // down. 1105 does not hold 2730 (the GPU's own 1100 mV limit); its margin pair is 1055.
         let mut retried = state.clone();
-        assert_eq!(go(&mut state, &[Qualified, Qualified]), [(1, 2685, 1030), (1, 2685, 1075)]);
+        assert_eq!(go(&mut state, &[Inconclusive, IntegrityError, IntegrityError, IntegrityError, Qualified]),
+            [(1, 2730, 1105), (1, 2730, 1055), (1, 2715, 1050), (1, 2700, 1040), (1, 2685, 1030)]);
+        // Each step down re-checks the stock curve, which runs 2715 at 1100, 2700 at 1090-1095 and
+        // 2685 at 1080-1085: the highest undervolting voltages are 1095, 1085 and 1075.
+        assert_eq!(go(&mut state, &[IntegrityError, IntegrityError, Qualified]),
+            [(1, 2685, 1020), (1, 2685, 1025), (1, 2685, 1075)]);
         assert_eq!(state.bands[1].stop_reason.as_deref(), Some("published"));
-        // A failed margin pair steps one boost step down with its own margin: 1065 - 43 mV.
-        go(&mut retried, &[IntegrityError]);
-        assert_eq!((retried.bands[1].target_clock_mhz, retried.bands[1].voltage_mv), (2670, 1020));
+        go(&mut retried, &[Inconclusive, IntegrityError]);
+        assert_eq!((retried.bands[1].target_clock_mhz, retried.bands[1].voltage_mv), (2715, 1050));
         // -5% (2565) at 1030 would sit over its 2610 MHz stock point: it starts at 995 (2550).
         let balanced = &state.bands[2];
         assert_eq!((balanced.target_clock_mhz, balanced.voltage_mv, balanced.level_start_voltage_mv),
@@ -1358,6 +1447,10 @@ mod tests {
         step(&mut state,Outcome::PowerBound);
         assert_eq!(state.bands[0].voltage_mv,906);
         assert_eq!(state.bands[0].stop_reason.as_deref(),Some("power_integrity_boundary"));
+        // Godforge measures one boost step down; this tiny grid has no margin pair under 906.
+        assert_eq!((next_band(&state), state.bands[1].target_clock_mhz, state.bands[1].voltage_mv), (Some(1), 1605, 906));
+        step(&mut state, Outcome::PowerFree);
+        assert_eq!(state.bands[1].stop_reason.as_deref(), Some("compensated_top_unavailable"));
         assert_eq!(next_band(&state),Some(3));
         assert_eq!((state.bands[3].target_clock_mhz,state.bands[3].voltage_mv),(1605,900));
     }

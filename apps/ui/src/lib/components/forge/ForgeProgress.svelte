@@ -342,13 +342,16 @@
   }
 
   function bandLabel(id) {
-    return { performance: "Performance", compensated: "Game-margin top", balanced: "Balance", efficiency: "Efficiency" }[id] ?? id;
+    return { performance: "Performance", compensated: "Godforge", balanced: "Balance", efficiency: "Efficiency" }[id] ?? id;
   }
 
   function bandStatus(band) {
     if (band.publishing && band.status !== "closed") return "Publication check";
     if (band.refining_edge && band.status !== "closed") return "Edge check";
-    if (band.clock_retries_used > 0 && band.status !== "closed") return `Lower clock try ${band.clock_retries_used}/2`;
+    if (band.measuring_power && band.status !== "closed") return "Power check";
+    if (band.clock_retries_used > 0 && band.status !== "closed") {
+      return band.id === "compensated" ? `Boost step down ${band.clock_retries_used}/3` : `Lower clock try ${band.clock_retries_used}/2`;
+    }
     return { waiting_for_top: "Waiting for the level above", pending: "Pending", in_flight: "Testing", closed: "Closed" }[band.status] ?? "Pending";
   }
 
@@ -377,7 +380,7 @@
       clock_level_exhausted: "No clock bin lies below the previous level at this step.",
       tdr_budget_exhausted: "Another Resume would exceed the driver-reset limit, so the run published its proven pairs.",
       compensation_not_needed: "The top already holds the game margin below its power-free voltage.",
-      compensated_top_unavailable: "No lower top clock proved the game margin. The lower levels start from the top's lowest passing voltage.",
+      compensated_top_unavailable: "No clock under the top fit the game margin. The lower levels start from the top's lowest passing voltage.",
       published: "Its publication pair, a game margin above the lowest passing voltage, passed its own matrix.",
       publication_unproven: "Its publication pair could not be proven, so this level publishes no profile.",
       no_distinct_profile: "Even two clock bins lower, this level never passed below the voltage it started at, so it publishes no profile of its own.",
