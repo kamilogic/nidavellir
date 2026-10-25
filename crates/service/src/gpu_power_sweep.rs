@@ -225,18 +225,41 @@ pub(crate) fn auto_resume_eligible(
     progress: &PowerSweepProgress,
     pending: Option<&nidavellir_core::safe_loop::ForgeIncident>,
 ) -> bool {
+    progress.auto_resume
+        && progress.auto_resume_consent
+        && !progress.running
+        && run_continues_after_crash(progress, pending)
+}
+
+/// The crash itself lets the run continue: this run's own staircase-edge TDR with its search still
+/// open, or its first driver crash during the stock checks, with no other incident pending.
+#[cfg(windows)]
+fn run_continues_after_crash(
+    progress: &PowerSweepProgress,
+    pending: Option<&nidavellir_core::safe_loop::ForgeIncident>,
+) -> bool {
     use nidavellir_core::safe_loop::ForgeIncidentKind;
     let edge_crash = progress.phase == "interrupted"
         && progress.discovery_search.as_ref().is_some_and(|search| search.stop_reason.is_none());
     let stock_crash = progress.phase == "paused" && progress.stock_crash_paused && progress.stock_crashes == 1;
     let expected = if stock_crash { ForgeIncidentKind::RuntimeFailure } else { ForgeIncidentKind::CandidateCrash };
-    progress.auto_resume
-        && progress.auto_resume_consent
-        && !progress.running
-        && (edge_crash || stock_crash)
+    (edge_crash || stock_crash)
         && pending.is_none_or(|incident| {
             incident.kind == expected && incident.run_id.is_some() && incident.run_id == progress.run_id
         })
+}
+
+/// A run restored with a pending incident waits for the user, except a crash the run continues
+/// after: marking that one too stopped every automatic continuation, because each of them restarts
+/// the Core (driver reset, Windows restart, blue screen). On 0.8.14 a TDR at 1890@881 became a blue
+/// screen, Windows restarted itself, and the Core shut down instead of continuing the run.
+#[cfg(windows)]
+fn restored_run_needs_attention(
+    progress: &PowerSweepProgress,
+    record: &nidavellir_core::safe_loop::SafeLoopRecord,
+) -> bool {
+    record.pending_forge_incident.is_some()
+        && !run_continues_after_crash(progress, record.pending_forge_incident.as_ref())
 }
 
 /// A crash at a staircase edge is the search working: the run goes on, and its final summary
@@ -2780,6 +2803,8 @@ fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
             };
             if safe_record.pending_forge_incident.is_some() {
                 prog.profiles_qualified = false;
+            }
+            if restored_run_needs_attention(&prog, &safe_record) {
                 prog.phase = "needs_attention".into();
                 prog.note = Some(
                     "Uma execução Forge interrompida requer revisão e reconhecimento explícito antes de continuar."
@@ -12935,6 +12960,41 @@ mod tests {
         progress.phase = "interrupted".into();
         progress.auto_resume = false;
         assert!(!auto_resume_eligible(&progress, Some(&crash("run-a"))));
+    }
+
+    /// 0.8.14 (2026-10-25): a TDR at 1890@881 became a blue screen and Windows restarted itself.
+    /// The restored run was marked as needing attention, auto-continue never saw it and the Core
+    /// shut down. A crash the run continues after keeps its state; anything else still waits.
+    #[cfg(windows)]
+    #[test]
+    fn a_restored_run_keeps_its_edge_crash_resumable_and_waits_on_anything_else() {
+        use nidavellir_core::safe_loop::{ForgeIncident, ForgeIncidentKind, SafeLoopRecord};
+        let progress = PowerSweepProgress {
+            auto_resume: true,
+            auto_resume_consent: true,
+            phase: "interrupted".into(),
+            run_id: Some("run-a".into()),
+            discovery_search: Some(Default::default()),
+            ..Default::default()
+        };
+        let incident = |kind, run: &str| {
+            ForgeIncident::new(kind, Some(run.into()), Some("gpu".into()), Some(1890), Some(881), "tdr")
+        };
+        let record = |pending: Option<ForgeIncident>| SafeLoopRecord { pending_forge_incident: pending, ..Default::default() };
+        let edge = record(Some(incident(ForgeIncidentKind::CandidateCrash, "run-a")));
+        assert!(!restored_run_needs_attention(&progress, &edge));
+        assert!(auto_resume_eligible(&progress, edge.pending_forge_incident.as_ref()), "so auto-continue picks it up");
+        assert!(restored_run_needs_attention(&progress, &record(Some(incident(ForgeIncidentKind::CandidateCrash, "run-b")))));
+        assert!(restored_run_needs_attention(&progress, &record(Some(incident(ForgeIncidentKind::UnaccountedRestart, "run-a")))));
+        let mut closed = progress.clone();
+        closed.discovery_search.as_mut().unwrap().stop_reason = Some("driver_failure_recovery_required".into());
+        assert!(restored_run_needs_attention(&closed, &edge), "a crash that closed the search waits");
+        // The first driver crash during the stock checks continues after its Windows restart too.
+        let stock = PowerSweepProgress {
+            phase: "paused".into(), stock_crash_paused: true, stock_crashes: 1, discovery_search: None, ..progress.clone()
+        };
+        assert!(!restored_run_needs_attention(&stock, &record(Some(incident(ForgeIncidentKind::RuntimeFailure, "run-a")))));
+        assert!(!restored_run_needs_attention(&progress, &record(None)), "nothing pending");
     }
 
     /// Every GPU family logs the curve the search walks: points, voltage and clock steps.
