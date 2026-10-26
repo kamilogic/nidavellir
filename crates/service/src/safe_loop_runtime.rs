@@ -17,13 +17,23 @@ use tracing::{info, warn};
 /// How often the liveness heartbeat is refreshed.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
-fn retain_boot_flag_until_reapply(action: &RecoveryAction) -> bool {
-    matches!(
-        action,
-        RecoveryAction::RecoverDiagnosticInterruption { .. }
-            | RecoveryAction::BlacklistAndRecede { .. }
-            | RecoveryAction::EnterSafeMode { .. }
-    )
+/// A crash flag stays armed until apply-on-boot skips the persisted profile, except a Forge
+/// candidate's whose incident is pending: that incident already keeps apply-on-boot at stock until
+/// it is acknowledged. Retained, it blocked the automatic continuation after every blue screen,
+/// which runs without the program and so without apply-on-boot (0.8.15, 2026-10-26: auto-continue
+/// acknowledged a TDR at 1815@837 that became a blue screen, and Resume found the flag armed).
+fn retain_boot_flag_until_reapply(action: &RecoveryAction, forge_incident_guards_flag: bool) -> bool {
+    match action {
+        RecoveryAction::BlacklistAndRecede { .. } => !forge_incident_guards_flag,
+        RecoveryAction::RecoverDiagnosticInterruption { .. } | RecoveryAction::EnterSafeMode { .. } => true,
+        _ => false,
+    }
+}
+
+/// The armed flag is a Forge candidate's and a Forge incident is pending for it.
+fn forge_incident_guards_flag(boot_flag: Option<&safe_loop::BootFlag>, record: &SafeLoopRecord) -> bool {
+    boot_flag.is_some_and(|flag| flag.phase == safe_loop::SUPERVISED_F2_FORGE_PHASE)
+        && record.pending_forge_incident.is_some()
 }
 
 /// Run boot-time crash recovery and return the (persisted) updated record.
@@ -155,7 +165,8 @@ pub fn run_startup_recovery(store: &SafeLoopStore) -> SafeLoopRecord {
     // Keep an accounted crash flag armed until apply-on-boot has observed it and explicitly skipped
     // the persisted profile. Clearing it here would let the same crashing profile be reapplied later
     // in this startup sequence. Clean/idle actions have no crash profile to suppress.
-    let retain_until_reapply = retain_boot_flag_until_reapply(&action);
+    let retain_until_reapply =
+        retain_boot_flag_until_reapply(&action, forge_incident_guards_flag(boot_flag.as_ref(), &record));
     if !retain_until_reapply {
         if let Some(expected) = boot_flag.as_ref() {
             match store.clear_boot_flag_if_matches(expected) {
@@ -419,6 +430,31 @@ mod tests {
         store.save_record(&record).unwrap();
     }
 
+    /// 0.8.15 (2026-10-26): after a blue screen at a Forge candidate, startup kept its flag armed
+    /// until the program's apply-on-boot, so the automatic continuation without a login found it
+    /// armed. The pending incident is what keeps apply-on-boot at stock.
+    #[cfg(windows)]
+    #[test]
+    fn startup_releases_a_forge_crash_flag_while_its_incident_is_pending() {
+        let base = std::env::temp_dir().join(format!(
+            "nidavellir-forge-flag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let store = SafeLoopStore::new(&base);
+        pending_candidate_crash(&store);
+        let intent = TuningPoint::from_axes([("gpu_freq_mhz", 1800), ("gpu_vf_bin_mv", 875)]);
+        store.arm_boot_flag(&safe_loop::BootFlag::new(intent, safe_loop::SUPERVISED_F2_FORGE_PHASE)).unwrap();
+        run_startup_recovery(&store);
+        assert!(!store.is_boot_flag_armed(), "released at boot");
+        assert!(store.load_record().pending_forge_incident.is_some(), "the incident still keeps apply-on-boot at stock");
+        // A profile apply's crash flag still waits for apply-on-boot to skip that profile.
+        store.arm_boot_flag(&safe_loop::BootFlag::new(TuningPoint::stock(), "gpu_apply_undervolt")).unwrap();
+        run_startup_recovery(&store);
+        assert!(store.is_boot_flag_armed());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[cfg(windows)]
     #[test]
     fn candidate_crash_ack_persists_rigid_v29_before_releasing_latch() {
@@ -484,29 +520,48 @@ mod tests {
     #[test]
     fn crash_recovery_retains_flag_until_reapply_can_skip_bad_profile() {
         let point = TuningPoint::stock();
-        assert!(retain_boot_flag_until_reapply(
-            &RecoveryAction::BlacklistAndRecede {
-                crashed: point.clone(),
-                recede_to: point.clone(),
-                class: CrashClass::Unknown,
-                count_toward_safe_mode: true,
-            }
-        ));
-        assert!(retain_boot_flag_until_reapply(
-            &RecoveryAction::EnterSafeMode {
-                stock: point.clone()
-            }
-        ));
+        let recede = RecoveryAction::BlacklistAndRecede {
+            crashed: point.clone(),
+            recede_to: point.clone(),
+            class: CrashClass::Unknown,
+            count_toward_safe_mode: true,
+        };
+        assert!(retain_boot_flag_until_reapply(&recede, false));
+        // A Forge candidate's flag with its incident pending: released at boot, so the automatic
+        // continuation after a blue screen finds it clear (0.8.15, 2026-10-26).
+        assert!(!retain_boot_flag_until_reapply(&recede, true));
+        let safe_mode = RecoveryAction::EnterSafeMode { stock: point.clone() };
+        assert!(retain_boot_flag_until_reapply(&safe_mode, false) && retain_boot_flag_until_reapply(&safe_mode, true));
         assert!(retain_boot_flag_until_reapply(
             &RecoveryAction::RecoverDiagnosticInterruption {
                 interrupted: point.clone(),
                 class: CrashClass::Unknown,
-            }
+            },
+            true
         ));
-        assert!(!retain_boot_flag_until_reapply(&RecoveryAction::Idle));
+        assert!(!retain_boot_flag_until_reapply(&RecoveryAction::Idle, false));
         assert!(!retain_boot_flag_until_reapply(
-            &RecoveryAction::ApplyLastValidated { point }
+            &RecoveryAction::ApplyLastValidated { point },
+            false
         ));
+
+        let flag = |phase: &str| safe_loop::BootFlag::new(TuningPoint::stock(), phase);
+        let pending = SafeLoopRecord {
+            pending_forge_incident: Some(safe_loop::ForgeIncident::new(
+                safe_loop::ForgeIncidentKind::CandidateCrash,
+                Some("run".into()),
+                Some("gpu".into()),
+                Some(1815),
+                Some(837),
+                "tdr",
+            )),
+            ..SafeLoopRecord::default()
+        };
+        let forge = flag(safe_loop::SUPERVISED_F2_FORGE_PHASE);
+        assert!(forge_incident_guards_flag(Some(&forge), &pending));
+        assert!(!forge_incident_guards_flag(Some(&forge), &SafeLoopRecord::default()), "nothing pending guards it");
+        assert!(!forge_incident_guards_flag(Some(&flag("gpu_apply")), &pending), "a profile apply keeps its flag");
+        assert!(!forge_incident_guards_flag(None, &pending));
     }
 
     #[test]
