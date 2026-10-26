@@ -1,6 +1,6 @@
 [package]
 name = "nidavellir-ui"
-version = "0.8.15"
+version = "0.8.16"
 description = "Nidavellir UI — unprivileged hardware tuning frontend"
 edition.workspace = true
 license.workspace = true
