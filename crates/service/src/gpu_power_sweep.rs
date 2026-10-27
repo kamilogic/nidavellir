@@ -5506,9 +5506,9 @@ fn synthesize_forge_profiles(
 ///   drawing less than Brokkr's whenever one exists.
 ///
 /// Sustainability uses `p5_clock_mhz` when present (dip-aware), else `clock_mhz`
-/// (legacy fallback). Selection uses clock / power / p5 / confidence ONLY — NEVER
-/// measured voltage (`vf_table_voltage_mv` is the deterministic apply axis, not used
-/// for selection here). Only points with confidence ≥ `policy.confidence_threshold`
+/// (legacy fallback). Selection uses clock / power / p5 / confidence — NEVER measured
+/// voltage. The apply bin (`vf_table_voltage_mv`) only keeps the lowest of one clock's F2
+/// pairs. Only points with confidence ≥ `policy.confidence_threshold`
 /// are eligible; if none qualify the gate is dropped (best-effort) and logged, so
 /// synthesis never returns nothing. Pure + unit-tested; the multi-clock frontier that
 /// feeds it is produced by F1b Phase 2.
@@ -5626,22 +5626,33 @@ fn synthesize_forge_profiles_capped(
         }
     };
 
-    // Godforge = highest sustainable clock; among those, the lowest power that holds it. Readings
-    // within 1% of that one, or all on the board limit, are the limiter's set point, not the pair's:
-    // an RTX 3060 Ti's 1890 pairs at 937 and 950 mV read 199 and 195.7 of 200 W (field report
-    // 2026-10-23). Then the lowest voltage takes it: the same clock with less heat.
-    let top_clock = pool.iter().map(|(p, _)| sustained(p)).max().unwrap();
-    let at_top: Vec<_> = pool.iter().copied().filter(|(p, _)| sustained(p) == top_clock).collect();
-    let least_power = at_top.iter().map(|(p, _)| profile_power(p)).fold(f32::INFINITY, f32::min);
-    let on_limit = |power: f32| power_limit_w > 0.0 && power >= power_limit_w * 0.97;
-    let godforge = at_top
+    // F2: one pair per clock, its lowest voltage. At one clock power falls with voltage, so a
+    // reading that ranks a higher voltage lower is the limiter's set point, heat or noise: 1890 at
+    // 937 and 950 mV read 199 and 195.7 of 200 W (2026-10-23), and 1830@900 read 0.5 W under 893,
+    // which ran right after a reboot, and became Brokkr's (2026-10-27). Each profile is then its
+    // clock's edge + 43 mV whenever that pair passed (decision 2026-10-24).
+    let f2_mv = |p: &PowerSweepPoint| p.vf_table_voltage_mv.filter(|_| p.boundary_voltage_mv.is_some());
+    let pool: Vec<_> = pool
         .iter()
         .copied()
         .filter(|(p, _)| {
-            let power = profile_power(p);
-            power <= least_power * 1.01 || (on_limit(least_power) && on_limit(power))
+            !pool.iter().any(|(q, _)| {
+                sustained(q) == sustained(p) && f2_mv(q).zip(f2_mv(p)).is_some_and(|(lower, mv)| lower < mv)
+            })
         })
-        .min_by_key(|(p, _)| p.vf_table_voltage_mv.unwrap_or(u32::MAX))
+        .collect();
+
+    // Godforge = highest sustainable clock (ties → the lowest power that holds it).
+    let godforge = pool
+        .iter()
+        .copied()
+        .max_by(|a, b| {
+            sustained(&a.0).cmp(&sustained(&b.0)).then(
+                profile_power(&b.0)
+                    .partial_cmp(&profile_power(&a.0))
+                    .unwrap_or(Ord::Equal),
+            )
+        })
         .unwrap();
     let gc = sustained(&godforge.0) as f64;
     let gp = profile_power(&godforge.0) as f64;
@@ -12608,20 +12619,28 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn godforge_takes_the_lowest_voltage_when_power_readings_sit_on_the_board_limit() {
-        // Field report 2026-10-23 (RTX 3060 Ti, 200 W): 1890 pairs held the target with the limiter
-        // at its set point, so their power readings rank nothing.
-        let pair = |mv: u32, power: f32| (PowerSweepPoint {
-            target_clock_mhz: Some(1890), p5_clock_mhz: Some(1875), boundary_voltage_mv: Some(893),
-            vf_table_voltage_mv: Some(mv), power_p99_w: Some(power), ..fp(1890, power)
+    fn each_clock_publishes_its_lowest_f2_voltage_whatever_the_power_readings() {
+        // Field reports (RTX 3060 Ti, 200 W): 1890 pairs held the target with the limiter at its
+        // set point (2026-10-23); 1830@893 ran hotter, right after a reboot (2026-10-27).
+        let pair = |clock: u32, mv: u32, power: f32| (PowerSweepPoint {
+            target_clock_mhz: Some(clock), p5_clock_mhz: Some(clock - 15), boundary_voltage_mv: Some(850),
+            vf_table_voltage_mv: Some(mv), power_p99_w: Some(power), ..fp(clock, power)
         }, 0.99);
         let godforge = |points: &[(PowerSweepPoint, f64)]| {
             synthesize_forge_profiles_capped(points, &ForgePolicy::balanced(), 200.0)
                 .godforge.and_then(|point| point.vf_table_voltage_mv)
         };
-        assert_eq!(godforge(&[pair(950, 195.7), pair(937, 199.0)]), Some(937));
-        assert_eq!(godforge(&[pair(950, 168.0), pair(937, 169.5)]), Some(937), "within 1%: a tie");
-        assert_eq!(godforge(&[pair(950, 160.0), pair(937, 170.0)]), Some(950), "off the limit, power decides");
+        assert_eq!(godforge(&[pair(1890, 950, 195.7), pair(1890, 937, 199.0)]), Some(937));
+        assert_eq!(godforge(&[pair(1890, 950, 160.0), pair(1890, 937, 170.0)]), Some(937), "off the limit too");
+
+        // Run f2-forge-1793062612508's margin-proven pairs.
+        let run = [
+            pair(1920, 943, 191.707), pair(1920, 950, 193.503), pair(1920, 956, 197.015),
+            pair(1830, 893, 183.489), pair(1830, 900, 182.978), pair(1740, 856, 168.515),
+        ];
+        let profiles = synthesize_forge_profiles_capped(&run, &ForgePolicy::balanced(), 200.0);
+        let keys = [profiles.godforge, profiles.brokkrs, profiles.deep_calm].map(|p| p.as_ref().and_then(f2_apply_key));
+        assert_eq!(keys, [Some((1920, 943)), Some((1830, 893)), Some((1740, 856))]);
     }
 
     #[cfg(windows)]
