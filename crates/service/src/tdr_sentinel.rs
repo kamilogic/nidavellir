@@ -82,7 +82,7 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn current_boot_epoch_ms() -> u64 {
+pub(crate) fn current_boot_epoch_ms() -> u64 {
     let uptime_ms = unsafe { GetTickCount64() };
     now_epoch_ms().saturating_sub(uptime_ms)
 }
@@ -95,7 +95,7 @@ fn event_epoch_ms(timestamp: &str) -> Option<u64> {
         .ok()
 }
 
-fn event_is_from_current_boot(timestamp: &str, boot_epoch_ms: u64) -> bool {
+pub(crate) fn event_is_from_current_boot(timestamp: &str, boot_epoch_ms: u64) -> bool {
     event_epoch_ms(timestamp)
         .is_some_and(|event_ms| event_ms >= boot_epoch_ms.saturating_sub(BOOT_TIME_TOLERANCE_MS))
 }
@@ -1797,6 +1797,11 @@ mod tests {
             boot_ms
         ));
         assert!(!event_is_from_current_boot("invalid", boot_ms));
+        // 2026-10-28: the power check's reference. Windows came back at ~04:34:30 after a blue
+        // screen; 1815@837 was measured at 04:31:57, 1815@843 at 04:41:43.
+        let boot_ms = event_epoch_ms("2026-10-28T04:34:30Z").unwrap();
+        assert!(!event_is_from_current_boot("2026-10-28T04:31:57.0000000Z", boot_ms));
+        assert!(event_is_from_current_boot("2026-10-28T04:41:43.0000000Z", boot_ms));
     }
 
     #[test]

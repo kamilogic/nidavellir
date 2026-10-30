@@ -5209,11 +5209,16 @@ pub(crate) fn run_confirmed_f2_power_calibration(
             };
         }
     };
+    // Only this Windows boot's readings compare: after the 2026-10-28 blue screen every reading ran
+    // 5–8% higher at the same clock, voltage and temperature, and against the neighbours measured
+    // before it the recheck left the publication pair 1815@893 unproven.
+    let boot_epoch_ms = crate::tdr_sentinel::current_boot_epoch_ms();
     let previous_confirmed_power = prior_observations
         .into_iter()
         .filter(|observation| {
             observation.target_mhz == target_mhz
                 && observation.gpu_key.as_deref() == Some(gpu_key)
+                && crate::tdr_sentinel::event_is_from_current_boot(&observation.timestamp, boot_epoch_ms)
                 && is_current_discovery_evidence(observation)
                 && observation.reset_to_stock_ok
                 && observation.boot_flag_cleared
