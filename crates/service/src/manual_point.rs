@@ -198,7 +198,7 @@ pub(crate) fn apply_resolved_point(
         Some((target_mhz, resolved_voltage_mv)),
     )?;
     arm_manual_point(store, target_mhz, resolved_voltage_mv, offset_mhz, source)?;
-    crate::gpu_undervolt::apply_anchored_undervolt(target_mhz, resolved_voltage_mv)
+    crate::gpu_undervolt::apply_anchored_undervolt(target_mhz, resolved_voltage_mv, target_mhz)
 }
 
 pub(crate) fn apply_resolved_curve_point(

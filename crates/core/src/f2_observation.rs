@@ -69,9 +69,25 @@ pub const F2_MAX_THERMAL_SHIFT_MHZ: u32 = 45;
 /// when that sits lower by more than the held bin, within a thermal shift. The ceiling always
 /// stays on the target.
 pub fn f2_held_reference_mhz(target: u32, live_anchor_mhz: Option<u32>) -> u32 {
+    let max_shift_mhz = if f2_live_curve_follows_load() { u32::MAX } else { F2_MAX_THERMAL_SHIFT_MHZ };
+    f2_held_reference_within(target, live_anchor_mhz, max_shift_mhz)
+}
+fn f2_held_reference_within(target: u32, live_anchor_mhz: Option<u32>, max_shift_mhz: u32) -> u32 {
     live_anchor_mhz
-        .filter(|live| live + F2_HELD_BIN_BELOW_MHZ < target && live + F2_MAX_THERMAL_SHIFT_MHZ >= target)
+        .filter(|live| live + F2_HELD_BIN_BELOW_MHZ < target && live.saturating_add(max_shift_mhz) >= target)
         .unwrap_or(target)
+}
+static LIVE_CURVE_FOLLOWS_LOAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+/// An RTX 50 moves its own V/F curve under load: an RTX 5070's anchor ran 15 to 60 MHz under the
+/// table read after the preheat, falling within one 10 s dwell at a steady 72 °C (field report
+/// 2026-10-28). On that GPU, which the service marks once at startup, a clock that follows its live
+/// curve point holds at any distance, and the pair is what the GPU ran. RTX 30/40 keep the thermal
+/// shift (user decision 2026-10-30).
+pub fn f2_follow_live_curve_under_load() {
+    let _ = LIVE_CURVE_FOLLOWS_LOAD.set(());
+}
+pub fn f2_live_curve_follows_load() -> bool {
+    LIVE_CURVE_FOLLOWS_LOAD.get().is_some()
 }
 pub fn f2_clock_held(clock: u32, target: u32, live_anchor_mhz: Option<u32>) -> bool {
     let floor = f2_held_reference_mhz(target, live_anchor_mhz).saturating_sub(F2_HELD_BIN_BELOW_MHZ);
@@ -1464,6 +1480,30 @@ pub fn point_has_current_exact_apply_qualification(
     point_has_n_current_exact_apply_qualifications(obs, run_id, target_mhz, apply_mv, gpu_key, 1)
 }
 
+fn is_pair_apply_evidence(o: &F2Observation, run_id: &str, target_mhz: u32, apply_mv: u32, gpu_key: &str) -> bool {
+    o.run_id == run_id
+        && o.target_mhz == target_mhz
+        && o.anchor_mv == apply_mv
+        && o.gpu_key.as_deref() == Some(gpu_key)
+        && is_current_apply_qualification_evidence(o)
+}
+
+/// The highest clock the pair ran in its current exact-Apply qualification lanes. An RTX 50's live
+/// curve falls under load, so its applied ceiling is this rather than the target: the profile never
+/// runs a clock it did not run there (user decision 2026-10-30).
+pub fn f2_exercised_max_clock_mhz(
+    obs: &[F2Observation],
+    run_id: &str,
+    target_mhz: u32,
+    apply_mv: u32,
+    gpu_key: &str,
+) -> Option<u32> {
+    obs.iter()
+        .filter(|o| is_pair_apply_evidence(o, run_id, target_mhz, apply_mv, gpu_key))
+        .filter_map(|o| o.max_clock_mhz)
+        .max()
+}
+
 /// True when at least `required_matrices` complete exact-Apply matrices were persisted by the
 /// CURRENT run at this exact pair/GPU. Evidence is consumed in append order and must complete the
 /// declared DX11 → Vulkan → DX12 → Endurance sequence; duplicated/retried lanes inside one ladder
@@ -1482,13 +1522,7 @@ pub fn point_has_n_current_exact_apply_qualifications(
     }
     let mut next_pattern = 0usize;
     let mut complete_matrices = 0u32;
-    for o in obs.iter().filter(|o| {
-        o.run_id == run_id
-            && o.target_mhz == target_mhz
-            && o.anchor_mv == apply_mv
-            && o.gpu_key.as_deref() == Some(gpu_key)
-            && is_current_apply_qualification_evidence(o)
-    }) {
+    for o in obs.iter().filter(|o| is_pair_apply_evidence(o, run_id, target_mhz, apply_mv, gpu_key)) {
         let Some(pattern) = o
             .qualification_coverage
             .as_ref()
@@ -1718,6 +1752,12 @@ mod tests {
         // One bin is the held bin the RTX 30's game margin was calibrated with: nothing changes.
         assert_eq!(f2_held_reference_mhz(1920, Some(1905)), 1920);
         assert!(!f2_clock_held(1889, 1920, Some(1905)), "two bins under the target still fail");
+        // RTX 50 (2026-10-28): 2917@1070 followed its live point down to 2835. There the floor
+        // follows the live point at any distance; elsewhere 45 MHz still bounds it.
+        assert!(!f2_live_curve_follows_load(), "only the service marks the GPU, never a test");
+        assert_eq!(f2_held_reference_within(2917, Some(2835), u32::MAX), 2835);
+        assert_eq!(f2_held_reference_within(2917, Some(2835), F2_MAX_THERMAL_SHIFT_MHZ), 2917);
+        assert_eq!(f2_held_reference_within(2917, Some(2930), u32::MAX), 2917, "never above the target");
     }
 
     fn reproducible_provenance() -> F2EvidenceProvenance {
@@ -2720,6 +2760,23 @@ mod tests {
             None,
             "a thermal slowdown that sagged the clock still fails closed"
         );
+    }
+
+    /// RTX 50 (user decision 2026-10-30): the applied ceiling is the highest clock the pair ran in
+    /// its own qualification lanes, never another run's or another pair's.
+    #[test]
+    fn the_exercised_max_clock_comes_from_the_pair_s_own_qualification_lanes() {
+        let lane = |pattern, max: u32| {
+            let mut o = apply_qualification_pass(obs(2917, 1070, F2ObsOutcome::Validated), pattern);
+            o.run_id = "R1".into();
+            o.gpu_key = Some("RTX 5070".into());
+            o.max_clock_mhz = Some(max);
+            o
+        };
+        let lanes = [lane(F2QualificationPattern::Dx11Game, 2887), lane(F2QualificationPattern::Texture, 2902)];
+        assert_eq!(f2_exercised_max_clock_mhz(&lanes, "R1", 2917, 1070, "RTX 5070"), Some(2902));
+        assert_eq!(f2_exercised_max_clock_mhz(&lanes, "R2", 2917, 1070, "RTX 5070"), None, "another run");
+        assert_eq!(f2_exercised_max_clock_mhz(&lanes, "R1", 2917, 1065, "RTX 5070"), None, "another pair");
     }
 
     #[test]

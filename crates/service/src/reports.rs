@@ -363,7 +363,7 @@ fn random_hex() -> String {
 }
 
 /// "NVIDIA GeForce RTX 5070 Ti" is family "RTX 50": fixes target GPU families, not single cards.
-fn gpu_family(name: &str) -> String {
+pub(crate) fn gpu_family(name: &str) -> String {
     let words: Vec<&str> = name.split_whitespace().collect();
     words
         .windows(2)

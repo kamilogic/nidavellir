@@ -4219,8 +4219,12 @@ pub(crate) fn resolve_manual_diagnostic_point(
 /// `prev_offset = 0`. Owns NO Safe Loop arm / persist — the caller
 /// ([`crate::gpu_apply::apply_and_persist_undervolt`]) owns the boot-flag + persistence lifecycle.
 #[cfg(windows)]
-pub(crate) fn apply_anchored_undervolt(target_mhz: u32, anchor_mv: u32) -> Result<(), String> {
-    apply_anchored_undervolt_with_mode(target_mhz, anchor_mv, true)
+pub(crate) fn apply_anchored_undervolt(
+    target_mhz: u32,
+    anchor_mv: u32,
+    clock_ceiling_mhz: u32,
+) -> Result<(), String> {
+    apply_anchored_undervolt_with_mode(target_mhz, anchor_mv, clock_ceiling_mhz, true)
 }
 
 /// Apply the same anchored curve and maximum clock ceiling as the Forge, but leave the lower
@@ -4228,13 +4232,14 @@ pub(crate) fn apply_anchored_undervolt(target_mhz: u32, anchor_mv: u32) -> Resul
 /// diagnostic-only and must not replace the voltage-locked Forge apply path above.
 #[cfg(windows)]
 pub(crate) fn apply_anchored_curve_only(target_mhz: u32, anchor_mv: u32) -> Result<(), String> {
-    apply_anchored_undervolt_with_mode(target_mhz, anchor_mv, false)
+    apply_anchored_undervolt_with_mode(target_mhz, anchor_mv, target_mhz, false)
 }
 
 #[cfg(windows)]
 fn apply_anchored_undervolt_with_mode(
     target_mhz: u32,
     anchor_mv: u32,
+    clock_ceiling_mhz: u32,
     lock_voltage: bool,
 ) -> Result<(), String> {
     use nidavellir_gpu_nvapi as gpu;
@@ -4345,12 +4350,12 @@ fn apply_anchored_undervolt_with_mode(
         // Absolute clock ceiling at the applied target — the plateau caps alone shift with the
         // driver's thermal curve compensation, so without the ceiling the delivered regime exceeds
         // the validated point. Fail-closed: no ceiling ⇒ no apply (undo the verified curve too).
-        if let Err(e) = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(target_mhz) {
+        if let Err(e) = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(clock_ceiling_mhz) {
             warn!("F2 apply: clock ceiling failed ({e}) — resetting to stock (fail closed)");
             let touched: Vec<usize> = plan.entries.iter().map(|e| e.index).collect();
             return Err(reset_and_confirm(
                 &touched,
-                format!("F2 apply: clock ceiling ({target_mhz} MHz) failed ({e})"),
+                format!("F2 apply: clock ceiling ({clock_ceiling_mhz} MHz) failed ({e})"),
             ));
         }
         let voltage_mode = if lock_voltage {
@@ -4358,7 +4363,7 @@ fn apply_anchored_undervolt_with_mode(
         } else {
             format!("{anchor_mv} mV curve anchor with elastic lower bins")
         };
-        info!("F2 apply: anchored undervolt verified ({target_mhz} MHz ceiling + {voltage_mode})");
+        info!("F2 apply: anchored undervolt verified ({target_mhz} MHz at {anchor_mv} mV, {clock_ceiling_mhz} MHz ceiling + {voltage_mode})");
         return Ok(());
     }
 

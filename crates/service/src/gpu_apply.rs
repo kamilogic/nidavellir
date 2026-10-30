@@ -707,7 +707,7 @@ fn exact_undervolt_apply_preflight(
     anchor_mv: u32,
     gpu_key: &str,
     qualification_run_id: &str,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     if let Some(event) = crate::tdr_sentinel::reboot_required_event() {
         return Err(format!(
             "GPU reboot is required after driver reset {event}; no GPU write is allowed in this boot"
@@ -767,7 +767,19 @@ fn exact_undervolt_apply_preflight(
             "F2 apply proof is missing/incomplete for run {qualification_run_id}, GPU {gpu_key}, exact pair {target_mhz}@{anchor_mv}: {required_matrices} complete v29 matrix/matrices required"
         ));
     }
-    Ok(())
+    // The clock ceiling: the target, or on an RTX 50, whose live curve falls under load, the highest
+    // clock the pair ran in its qualification, so the profile never runs one it did not run there.
+    if !nidavellir_core::f2_observation::f2_live_curve_follows_load() {
+        return Ok(target_mhz);
+    }
+    Ok(nidavellir_core::f2_observation::f2_exercised_max_clock_mhz(
+        &observations,
+        qualification_run_id,
+        target_mhz,
+        anchor_mv,
+        gpu_key,
+    )
+    .map_or(target_mhz, |exercised| exercised.min(target_mhz)))
 }
 
 /// The transaction whose survival timer is running. Status shows that armed flag as verification
@@ -855,7 +867,7 @@ pub fn apply_and_persist_undervolt(
     // Last line of defence shared by explicit Apply and apply-on-boot. It re-loads strict Safe Loop
     // and ledger state, applies the current TDR cone, and admits exact Quarantine only after the
     // current run/GPU/pair has the required number of complete v29 matrices.
-    exact_undervolt_apply_preflight(
+    let clock_ceiling_mhz = exact_undervolt_apply_preflight(
         store,
         target_mhz,
         anchor_mv,
@@ -886,7 +898,7 @@ pub fn apply_and_persist_undervolt(
 
     // Fail-closed: a non-verified write has already reset to stock inside this call, so nothing is left
     // applied. The boot-flag stays armed on the error path (same as the F1 apply) — safe; reset clears it.
-    crate::gpu_undervolt::apply_anchored_undervolt(target_mhz, anchor_mv)?;
+    crate::gpu_undervolt::apply_anchored_undervolt(target_mhz, anchor_mv, clock_ceiling_mhz)?;
     if let Some(m) = mem_offset_mhz {
         if let Err(e) = nidavellir_gpu_nvapi::set_mem_offset_mhz(m) {
             crate::gpu_power_sweep::reset_to_stock();

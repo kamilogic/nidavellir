@@ -2893,6 +2893,12 @@ pub(crate) fn current_gpu_key() -> String {
         .next()
     {
         if let Some(uuid) = gpu.uuid {
+            // An RTX 50 moves its own V/F curve under load (user decision 2026-10-30). Marked with
+            // the read that fixes the key, so no Forge or Apply runs on this GPU unmarked.
+            if crate::reports::gpu_family(&gpu.name) == "RTX 50" && !nidavellir_core::f2_observation::f2_live_curve_follows_load() {
+                nidavellir_core::f2_observation::f2_follow_live_curve_under_load();
+                info!("{}: a held clock follows the GPU's live V/F curve point", gpu.name);
+            }
             return UUID_KEY.get_or_init(|| format!("nvml:{uuid}")).clone();
         }
         return format!("nvml-index-{}:{}", gpu.index, gpu.name);
@@ -4456,6 +4462,7 @@ fn load_and_measure_for_with_phase_hook(
     });
     let live_anchor = Arc::new(AtomicU32::new(u32::MAX));
     let live_anchor_for_sampler = live_anchor.clone();
+    let live_curve_follows_load = nidavellir_core::f2_observation::f2_live_curve_follows_load();
     let t0 = std::time::Instant::now();
     let sampler = std::thread::spawn(move || {
         // Resolve the anchor once. At most five diagnostic snapshots per lane, after timed
@@ -4581,6 +4588,17 @@ fn load_and_measure_for_with_phase_hook(
                                 {
                                     live_anchor_for_sampler.fetch_min(effective_mhz, Ordering::SeqCst);
                                 }
+                            }
+                        }
+                        // An RTX 50's curve keeps falling within a dwell (2026-10-28: 2902 → 2857
+                        // between snapshots, the clock at 2835), so its anchor is read with every
+                        // retained voltage sample too.
+                        if live_curve_follows_load && retain_dwell_sample(voltage_started_ms, power_characterization) {
+                            if let Some((_, _, effective_mhz, _)) =
+                                live_anchor_index.and_then(nidavellir_gpu_nvapi::read_vf_point_snapshot)
+                                    .filter(|&(_, _, mhz, mv)| crate::gpu_undervolt::is_f2_sane_point(mv, mhz))
+                            {
+                                live_anchor_for_sampler.fetch_min(effective_mhz, Ordering::SeqCst);
                             }
                         }
                     }
