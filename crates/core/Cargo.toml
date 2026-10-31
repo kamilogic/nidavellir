@@ -1,6 +1,6 @@
 [package]
 name = "nidavellir-core"
-version = "0.8.19"
+version = "0.8.20"
 description = "Shared core logic for Nidavellir v2"
 edition.workspace = true
 license.workspace = true
