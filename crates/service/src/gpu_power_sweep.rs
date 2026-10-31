@@ -8937,9 +8937,9 @@ fn f2_record_candidate_clock(
         .push(nidavellir_core::ipc::ForgeClockSearch {
             target_mhz: target,
             last_good_mv,
-            first_bad_mv: prior_failure.or_else(|| {
-                (outcome == crate::qualified_search::Outcome::IntegrityError).then_some(mv)
-            }),
+            // The highest voltage that failed bounds the edge, whichever failed first.
+            first_bad_mv: prior_failure
+                .max((outcome == crate::qualified_search::Outcome::IntegrityError).then_some(mv)),
             stop_reason: reason,
             // Closing a band does not mean every voltage at this clock was explored.
             completed: false,
@@ -11230,6 +11230,22 @@ mod tests {
         );
         assert_eq!(progress.clock_search[0].first_bad_mv, Some(900));
         assert!(!progress.clock_search[0].completed);
+        // 31/10: 1905 MHz failed at 887 mV first and at 893 mV next; the edge sits above 893.
+        f2_record_candidate_clock(
+            &mut progress,
+            1755,
+            906,
+            Outcome::IntegrityError,
+            "error".into(),
+        );
+        f2_record_candidate_clock(
+            &mut progress,
+            1755,
+            893,
+            Outcome::IntegrityError,
+            "error".into(),
+        );
+        assert_eq!(progress.clock_search[0].first_bad_mv, Some(906));
         f2_record_candidate_clock(
             &mut progress,
             1740,
