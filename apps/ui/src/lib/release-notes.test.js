@@ -9,6 +9,16 @@ test("versions compare numerically", () => {
   assert.equal(compareVersions("0.4.9", "0.5"), -1);
 });
 
+test("a diagnostics pre-release sits between the patch before it and its own release", () => {
+  assert.equal(compareVersions("0.8.21-diag.1", "0.8.20"), 1);
+  assert.equal(compareVersions("0.8.21", "0.8.21-diag.1"), 1);
+  assert.equal(compareVersions("0.8.21-diag.10", "0.8.21-diag.9"), 1);
+  assert.equal(compareVersions("0.8.21-diag.1", "0.8.21-diag.1"), 0);
+  const files = { "x/v0.8.20.md": "Twenty.", "x/v0.8.21-diag.1.md": "Diag.", "x/v0.8.21.md": "One." };
+  assert.deepEqual(releasesSince("0.8.20", "0.8.21-diag.1", files).map((release) => release.version), ["0.8.21-diag.1"]);
+  assert.deepEqual(releasesSince("0.8.21-diag.1", "0.8.21", files).map((release) => release.version), ["0.8.21"]);
+});
+
 test("after an update, every release since the previous version shows, newest first", () => {
   const files = { "x/v0.5.0.md": "Zero.", "x/v0.5.1.md": "One.", "x/v0.5.2.md": "Two.", "x/v0.5.3.md": "Three." };
   assert.deepEqual(releasesSince("0.5.0", "0.5.2", files).map((release) => release.version), ["0.5.2", "0.5.1"]);
