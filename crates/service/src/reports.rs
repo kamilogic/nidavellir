@@ -151,7 +151,7 @@ fn write_pending(kind: &str, class: &str, message: &str, prog: Option<&PowerSwee
         "panic": panic.as_deref().map(clean),
         "events": prog.map(|p| events(p).iter().map(|line| clean(line)).collect::<Vec<_>>()),
         "result": prog.filter(|_| kind == "summary").map(result),
-        "forge_log": prog.and_then(|p| crate::gpu_power_sweep::forge_log_text(p).ok()).map(|log| clean(&head_and_tail(&log.text, FORGE_LOG_MAX_CHARS))),
+        "forge_log": prog.and_then(|p| crate::gpu_power_sweep::forge_log_text(p).ok()).map(|log| clean(&head_and_tail(&without_live_log(&log.text), FORGE_LOG_MAX_CHARS))),
         "driver_events": clean(&driver_events()),
         "core_log": clean(&core_log_tail()),
         "created_at": nidavellir_core::f2_observation::now_rfc3339(),
@@ -518,6 +518,15 @@ fn head_and_tail(text: &str, max_chars: usize) -> String {
     format!("{head}\n…\n{tail}")
 }
 
+/// The report leaves out the live narrative: the dwell table records every attempt, and without the
+/// narrative in front of it a whole run's table fits the budget. The exported log keeps both.
+fn without_live_log(text: &str) -> String {
+    match (text.find("\n-- Live progress log"), text.find("\n-- Recorded dwells")) {
+        (Some(start), Some(end)) if start < end => format!("{}{}", &text[..start], &text[end..]),
+        _ => text.to_owned(),
+    }
+}
+
 fn core_log_tail() -> String {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(data_dir().join("core.log")) else { return String::new() };
@@ -698,6 +707,13 @@ mod tests {
         assert!(valid_id("1791962702636-error-stock_crash.json"));
         assert!(!valid_id(r"..\..\Windows\win.ini") && !valid_id("a/b.json") && !valid_id("x.txt"));
         assert_eq!(head_and_tail("abcdef", 4), "ab\n…\nef");
+    }
+
+    #[test]
+    fn the_report_forge_log_drops_the_live_narrative_and_keeps_the_dwell_table() {
+        let log = "header\n\n-- Live progress log --\nstep\n\n-- Recorded dwells (1 observations) --\nrow\n";
+        assert_eq!(without_live_log(log), "header\n\n-- Recorded dwells (1 observations) --\nrow\n");
+        assert_eq!(without_live_log("header only"), "header only");
     }
 
     #[test]
