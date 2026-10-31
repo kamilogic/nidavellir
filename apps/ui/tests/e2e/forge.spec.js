@@ -609,7 +609,21 @@ test("UX: profile columns show clock, voltage, typical power and the change from
   await expect(brokkrs.locator(".profile-clock")).toHaveText("1800MHz");
   await expect(brokkrs).toContainText("950 mV · 155 W");
   await expect(brokkrs).toContainText("−22% power");
-  await expect(page.locator(".profile-column").first()).toContainText("Stock");
+  const stock = page.locator(".profile-column").first();
+  await expect(stock).toContainText("Stock");
+  await expect(stock).toContainText("The reference for every number");
+  // The regime stock showed under heavy load: at its power limit, or under it.
+  await page.evaluate(() => { window.__forgeTest.power.power_limit_w = 200; });
+  await expect(stock).toContainText("Held back by its 200 W limit");
+  await page.evaluate(() => { window.__forgeTest.power.stock_power_p99_w = 180; });
+  await expect(stock).toContainText("Below its 200 W limit");
+  // One bin under is the held bin and keeps the target; an RTX 50 that ran its own curve 30 MHz
+  // under shows the clock it held.
+  await page.evaluate(() => { window.__forgeTest.power.brokkrs.p5_clock_mhz = 1785; });
+  await expect(brokkrs.locator(".profile-clock")).toHaveText("1800MHz");
+  await page.evaluate(() => { window.__forgeTest.power.brokkrs.p5_clock_mhz = 1770; });
+  await expect(brokkrs.locator(".profile-clock")).toHaveText("1770MHz");
+  await expect(brokkrs).toContainText("−30 MHz");
   await page.screenshot({ path: testInfo.outputPath("profiles.png"), fullPage: true, animations: "disabled" });
   await expect(page.getByText(/distinct settings? ·/)).toHaveCount(0);
 });

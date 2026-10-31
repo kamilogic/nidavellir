@@ -155,6 +155,16 @@
   const stockActive = $derived(!applied?.core && !applied?.mem_offset_mhz);
   const stockClock = $derived(finite(powerSweep?.stock_clock_mhz) == null ? null : Math.round(finite(powerSweep?.stock_clock_mhz)));
   const stockPower = $derived(finite(powerSweep?.stock_power_p99_w) == null ? null : Math.round(finite(powerSweep?.stock_power_p99_w)));
+  // Whether stock already runs into the power limit under heavy load (≥95% of it, as the Forge
+  // reads a power-bound drop): then undervolting gives back clock, otherwise it mostly saves power.
+  const stockRegime = $derived.by(() => {
+    const limit = finite(powerSweep?.power_limit_w);
+    const watts = finite(powerSweep?.stock_power_p99_w);
+    if (limit == null || limit <= 0 || watts == null) return null;
+    return watts >= limit * 0.95
+      ? { text: `Held back by its ${Math.round(limit)} W limit`, title: "Under heavy load at stock this GPU runs into its power limit, so a lower voltage gives back clock as well as power." }
+      : { text: `Below its ${Math.round(limit)} W limit`, title: "Under heavy load at stock this GPU stays under its power limit, so a lower voltage mostly saves power and heat." };
+  });
   // Runes: Othala (inheritance, the factory curve), Thurisaz (Thor; Brokkr forged Mjölnir),
   // Berkano (B for Brokkr), Laguz (water, calm).
   const PROFILE_RUNES = { godforge: "ᚦ", brokkrs: "ᛒ", deep_calm: "ᛚ" };
@@ -298,9 +308,17 @@
     return average != null && average > 0 ? average : null;
   }
 
-  function profileTarget(point) {
+  /** The clock a profile holds under heavy load, as the Forge ranks it: its target, or its measured
+   * p5 when that sits more than one 15 MHz bin under (an RTX 50 moves its own curve under load). */
+  function heldClock(point) {
     const target = finite(point?.target_clock_mhz ?? point?.clock_mhz);
-    return target == null ? "—" : `${target.toFixed(0)} MHz`;
+    const p5 = finite(point?.p5_clock_mhz);
+    return target != null && p5 != null && p5 + 15 < target ? p5 : target;
+  }
+
+  function profileTarget(point) {
+    const clock = heldClock(point);
+    return clock == null ? "—" : `${clock.toFixed(0)} MHz`;
   }
 
   function profilePeakPowerText(point) {
@@ -336,8 +354,8 @@
   }
 
   function profileClock(point) {
-    const target = finite(point?.target_clock_mhz ?? point?.clock_mhz);
-    return target == null ? "—" : target.toFixed(0);
+    const clock = heldClock(point);
+    return clock == null ? "—" : clock.toFixed(0);
   }
 
   function profileFacts(point) {
@@ -347,11 +365,11 @@
 
   /** Clock and typical power against the stock baseline the same Forge measured. */
   function profileDelta(point) {
-    const target = finite(point?.target_clock_mhz ?? point?.clock_mhz);
+    const clock = heldClock(point);
     const watts = typicalPower(point);
-    if (!stockClock || !stockPower || target == null || watts == null) return null;
+    if (!stockClock || !stockPower || clock == null || watts == null) return null;
     const signed = (value, unit) => `${value > 0 ? "+" : value < 0 ? "−" : ""}${Math.abs(value)}${unit}`;
-    const mhz = Math.round(target - stockClock);
+    const mhz = Math.round(clock - stockClock);
     const power = Math.round(((watts - stockPower) / stockPower) * 100);
     return { mhz, power, mhzText: signed(mhz, " MHz"), powerText: signed(power, "% power") };
   }
@@ -479,7 +497,7 @@
     {#if profilesReady && stockClock != null}
       <div class="profile-clock">{stockClock}<span>MHz</span></div>
       <div class="profile-facts">NVIDIA default curve{stockPower != null ? ` · ${stockPower} W` : ""}</div>
-      <div class="profile-delta">The reference for every number</div>
+      <div class="profile-delta" title={stockRegime?.title}>{stockRegime?.text ?? "The reference for every number"}</div>
       <div class="profile-bar" aria-hidden="true"><i style="width: 100%"></i></div>
       {#if stockActive}
         {@render appliedMark()}
