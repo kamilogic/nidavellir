@@ -220,8 +220,13 @@ pub fn effective_condemnation_events(events: &[CondemnationEvent]) -> Vec<Condem
 /// Conservative downward safety cone derived from current-contract Rigid failures.
 ///
 /// `targets_descending` and `voltage_bins_ascending` describe physical bins. Starting at each
-/// effective condemned pair, every lower clock may relieve at most one physical voltage bin per
-/// physical clock bin. Overlapping cones retain the highest (safest) floor. Events outside either
+/// effective condemned pair, every lower clock may relieve one physical voltage bin per physical
+/// clock bin. When `measured_failures` (this GPU's failure pairs, crashes included) span two
+/// clocks, the cone relieves at their flattest falling slope instead, rounded up to a physical
+/// bin, over as many clock bins as they span; beyond that, one bin per bin again. It never falls
+/// faster than the measured failures do, and falls slower where they show the edge flattening
+/// (option B, user decision 2026-10-30: a 3060 Ti's edge falls ~8 mV per 15 MHz bin mid-range,
+/// ~3 under 1710 MHz). Overlapping cones retain the highest (safest) floor. Events outside either
 /// supplied bin set cannot define a physical cone and are ignored.
 pub fn rigid_tdr_safety_cone_floors(
     events: &[CondemnationEvent],
@@ -229,8 +234,10 @@ pub fn rigid_tdr_safety_cone_floors(
     min_contract: u32,
     targets_descending: &[u32],
     voltage_bins_ascending: &[u32],
+    measured_failures: &[(u32, u32)],
 ) -> Vec<(u32, u32)> {
     let mut floors = std::collections::BTreeMap::<u32, u32>::new();
+    let relief = measured_cone_relief(measured_failures, targets_descending);
 
     for (event_index, event) in events.iter().enumerate() {
         if event.rehabilitated
@@ -270,7 +277,18 @@ pub fn rigid_tdr_safety_cone_floors(
         };
 
         for (clock_relief, &target_mhz) in targets_descending[clock_index..].iter().enumerate() {
-            let floor_mv = voltage_bins_ascending[voltage_index.saturating_sub(clock_relief)];
+            let floor_mv = match relief {
+                None => voltage_bins_ascending[voltage_index.saturating_sub(clock_relief)],
+                Some((slope_mv, span)) => {
+                    let measured = clock_relief.min(span);
+                    let line = f64::from(event.vf_bin_mv) - slope_mv * measured as f64;
+                    let at = voltage_bins_ascending
+                        .iter()
+                        .position(|&mv| f64::from(mv) >= line)
+                        .unwrap_or(voltage_index);
+                    voltage_bins_ascending[at.saturating_sub(clock_relief - measured)]
+                }
+            };
             floors
                 .entry(target_mhz)
                 .and_modify(|current| *current = (*current).max(floor_mv))
@@ -279,6 +297,25 @@ pub fn rigid_tdr_safety_cone_floors(
     }
 
     floors.into_iter().rev().collect()
+}
+
+/// The cone's measured relief: the flattest falling slope between two failure pairs at different
+/// clocks, in mV per clock bin, and the clock bins those pairs span. `None` below two clocks.
+fn measured_cone_relief(failures: &[(u32, u32)], targets_descending: &[u32]) -> Option<(f64, usize)> {
+    let points: Vec<(usize, u32)> = failures
+        .iter()
+        .filter_map(|&(clock, mv)| Some((targets_descending.iter().position(|&c| c == clock)?, mv)))
+        .collect();
+    let slope = points
+        .iter()
+        .flat_map(|&(i, high)| {
+            points.iter().filter_map(move |&(j, low)| {
+                (j > i && high > low).then(|| f64::from(high - low) / (j - i) as f64)
+            })
+        })
+        .reduce(f64::min)?;
+    let span = points.iter().map(|p| p.0).max()? - points.iter().map(|p| p.0).min()?;
+    Some((slope, span))
 }
 
 /// Monotone V/F floor envelope over condemned (clock, mv) pairs — the same math as the field
@@ -529,6 +566,37 @@ mod tests {
     }
 
     #[test]
+    fn measured_failures_set_how_fast_the_tdr_cone_relaxes() {
+        // Option B (user decision 2026-10-30). 3060 Ti, 2026-10-28: 1815@837 crashed; a failure at
+        // 1710@768 under it falls ~9.9 mV per 15 MHz bin, faster than one 6.25 mV bin.
+        let targets: Vec<u32> = (1695..=1815).rev().step_by(15).collect();
+        let bins: Vec<u32> = (0..=20u32).map(|bin| (75_000 + bin * 625) / 100).collect();
+        let crash = [event(CondemnationSeverity::Rigid, 1815, 837, Some(29))];
+        let floors = |failures: &[(u32, u32)]| {
+            rigid_tdr_safety_cone_floors(&crash, "gpu-a", 29, &targets, &bins, failures)
+                .into_iter()
+                .filter(|(clock, _)| [1800, 1725, 1695].contains(clock))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(floors(&[]), [(1800, 831), (1725, 800), (1695, 787)], "one bin per clock bin");
+        assert_eq!(floors(&[(1815, 837)]), [(1800, 831), (1725, 800), (1695, 787)], "one clock measures no slope");
+        // Over the 7 bins the failures span, then one bin per bin again (1695: 768 → 762).
+        assert_eq!(floors(&[(1815, 837), (1710, 768)]), [(1800, 831), (1725, 781), (1695, 762)]);
+        // Failures where the edge flattens (3.6 mV per bin) hold the cone above one bin per bin.
+        assert_eq!(floors(&[(1815, 837), (1710, 812)]), [(1800, 837), (1725, 818), (1695, 806)]);
+        // The run of 2026-10-28 measured its failures above the crash: 1920@912 and 1905@893 fall
+        // 9.3 mV per bin to 1815@837, the flattest pair, over 7 bins. 1725 drops from 800 to 781.
+        let wide: Vec<u32> = (1695..=1920).rev().step_by(15).collect();
+        let at_1725 = |failures: &[(u32, u32)]| {
+            rigid_tdr_safety_cone_floors(&crash, "gpu-a", 29, &wide, &bins, failures)
+                .into_iter()
+                .find(|(clock, _)| *clock == 1725)
+        };
+        assert_eq!(at_1725(&[]), Some((1725, 800)));
+        assert_eq!(at_1725(&[(1920, 912), (1905, 893), (1815, 837)]), Some((1725, 781)));
+    }
+
+    #[test]
     fn rigid_tdr_cone_relaxes_one_physical_voltage_bin_per_lower_clock_bin() {
         let targets = [1935, 1920, 1905, 1890, 1875, 1860, 1845, 1830, 1815, 1800];
         let voltage_bins = [
@@ -538,7 +606,7 @@ mod tests {
         let events = [event(CondemnationSeverity::Rigid, 1920, 931, Some(29))];
 
         assert_eq!(
-            rigid_tdr_safety_cone_floors(&events, "gpu-a", 29, &targets, &voltage_bins),
+            rigid_tdr_safety_cone_floors(&events, "gpu-a", 29, &targets, &voltage_bins, &[]),
             vec![
                 (1920, 931),
                 (1905, 925),
@@ -567,6 +635,7 @@ mod tests {
                 29,
                 &targets,
                 &voltage_bins,
+                &[],
             ),
             vec![
                 (1920, 931),
@@ -605,6 +674,7 @@ mod tests {
             29,
             &targets,
             &voltage_bins,
+            &[],
         )
         .is_empty());
     }
@@ -624,6 +694,7 @@ mod tests {
                 29,
                 &targets,
                 &voltage_bins,
+                &[],
             ),
             vec![(1920, 931), (1875, 905), (1800, 870)]
         );

@@ -312,12 +312,48 @@ fn f2_tdr_safety_policy(
     run_id: Option<&str>,
     targets_descending: &[u32],
     voltage_bins_ascending: &[u32],
+    measured_failures: &[(u32, u32)],
 ) -> Result<F2TdrSafetyPolicy, String> {
     let crashes = f2_effective_candidate_crashes(events, gpu_key);
     if let Some(reason) = f2_current_crash_budget_error(&crashes, gpu_key, run_id) {
         return Err(reason);
     }
-    f2_tdr_cone(crashes, gpu_key, targets_descending, voltage_bins_ascending)
+    f2_tdr_cone(crashes, gpu_key, targets_descending, voltage_bins_ascending, measured_failures)
+}
+
+/// The failure pairs that set the TDR cone's slope (option B, user decision 2026-10-30): this
+/// GPU's Rigid ledger pairs, its crashes, and the integrity failures in its observations. A failure
+/// under which the same clock passed lower is no edge: one transient at a high voltage would
+/// otherwise steepen the slope and relieve the cone far below the crash (safety audit 2026-10-30).
+#[cfg(windows)]
+fn f2_cone_failure_points(
+    events: &[nidavellir_core::condemnation::CondemnationEvent],
+    observations: &[F2Observation],
+    gpu_key: &str,
+) -> Vec<(u32, u32)> {
+    use nidavellir_core::f2_observation::F2ObsOutcome;
+    let mut points = nidavellir_core::condemnation::condemned_pairs(events, gpu_key).rigid;
+    points.extend(
+        observations
+            .iter()
+            .filter(|o| {
+                o.gpu_key.as_deref() == Some(gpu_key)
+                    && matches!(
+                        o.outcome,
+                        F2ObsOutcome::SilentError
+                            | F2ObsOutcome::Unstable
+                            | F2ObsOutcome::DeviceLost
+                            | F2ObsOutcome::CrashOrRecovery
+                    )
+            })
+            .map(|o| (o.target_mhz, o.anchor_mv)),
+    );
+    points.retain(|&(clock, mv)| {
+        !observations.iter().any(|o| {
+            o.gpu_key.as_deref() == Some(gpu_key) && o.target_mhz == clock && o.anchor_mv < mv && o.outcome.is_validated()
+        })
+    });
+    points
 }
 
 /// The physical TDR cone alone. The crash budget blocks new exploration (Start/Resume); it never
@@ -329,6 +365,7 @@ fn f2_tdr_cone(
     gpu_key: &str,
     targets_descending: &[u32],
     voltage_bins_ascending: &[u32],
+    measured_failures: &[(u32, u32)],
 ) -> Result<F2TdrSafetyPolicy, String> {
     if let Some(unmapped) = crashes.iter().find(|event| {
         !targets_descending.contains(&event.target_mhz)
@@ -346,6 +383,7 @@ fn f2_tdr_cone(
         F2_CANDIDATE_CRASH_MIN_CONTRACT,
         targets_descending,
         voltage_bins_ascending,
+        measured_failures,
     );
     Ok(F2TdrSafetyPolicy { crashes, floors })
 }
@@ -384,7 +422,11 @@ fn current_f2_tdr_safety_policy(
         .collect::<Vec<_>>();
     voltage_bins.sort_unstable();
     voltage_bins.dedup();
-    f2_tdr_cone(crashes, gpu_key, &targets, &voltage_bins)
+    let observations = nidavellir_core::f2_observation::F2ObservationStore::new(store.base_dir())
+        .load_all_checked()
+        .map_err(|error| format!("cone TDR: observações ilegíveis: {error}"))?;
+    let failures = f2_cone_failure_points(&events, &observations, gpu_key);
+    f2_tdr_cone(crashes, gpu_key, &targets, &voltage_bins, &failures)
 }
 
 #[cfg(windows)]
@@ -9515,12 +9557,19 @@ fn measure_multiclock_undervolt_forge(
             return;
         }
     };
+    // An unreadable observation store leaves today's cone; the first calibration then aborts on it.
+    let cone_failures = f2_cone_failure_points(
+        &condemnation_events,
+        &F2ObservationStore::system().load_all_checked().unwrap_or_default(),
+        &gpu_key,
+    );
     let tdr_policy = match f2_tdr_safety_policy(
         &condemnation_events,
         &gpu_key,
         Some(&run_id),
         &targets,
         &voltage_bins_ascending,
+        &cone_failures,
     ) {
         Ok(policy) => policy,
         Err(reason) => {
@@ -16640,6 +16689,28 @@ mod tests {
         }
     }
 
+    /// Option B (user decision 2026-10-30): the TDR cone's slope comes from this GPU's integrity
+    /// failures at its edges, never from a clock drop, another GPU or a failure the same clock
+    /// passed under.
+    #[cfg(windows)]
+    #[test]
+    fn the_cone_slope_counts_this_gpu_s_integrity_failures_only() {
+        use nidavellir_core::f2_observation::F2ObsOutcome;
+        let failed = |outcome, gpu| F2Observation { outcome, ..power_obs(1920, 912, Some(180.0), true, Some(180), gpu) };
+        let observations = [
+            failed(F2ObsOutcome::SilentError, "gpu"),
+            failed(F2ObsOutcome::ClockDrop, "gpu"),
+            failed(F2ObsOutcome::DeviceLost, "other"),
+        ];
+        assert_eq!(f2_cone_failure_points(&[], &observations, "gpu"), [(1920, 912)]);
+        // A transient at 1830@950 under which 1830@900 passed is no edge.
+        let transient = [
+            F2Observation { outcome: F2ObsOutcome::SilentError, ..power_obs(1830, 950, Some(180.0), true, Some(180), "gpu") },
+            F2Observation { outcome: F2ObsOutcome::Validated, ..power_obs(1830, 900, Some(170.0), true, Some(170), "gpu") },
+        ];
+        assert_eq!(f2_cone_failure_points(&[], &transient, "gpu"), []);
+    }
+
     /// Field report 2026-10-21 (RTX 5070): 2992@1085 held p5 2910 below its 250 W cap at 74 °C.
     #[cfg(windows)]
     #[test]
@@ -16976,7 +17047,7 @@ mod tests {
         wrong_kind.kind = nidavellir_core::condemnation::KIND_FIELD_TDR.into();
         events.push(wrong_kind);
 
-        let policy = f2_tdr_safety_policy(&events, "gpu-a", None, &targets, &bins).unwrap();
+        let policy = f2_tdr_safety_policy(&events, "gpu-a", None, &targets, &bins, &[]).unwrap();
         assert_eq!(
             policy.crashes.len(),
             2,
@@ -16993,7 +17064,7 @@ mod tests {
 
         // 2026-10-01: earlier runs' edge TDRs never block a new run; their cones still apply.
         events.push(crash("run-clean-c", "gpu-a", 1890, 918, "event-3"));
-        let fresh = f2_tdr_safety_policy(&events, "gpu-a", None, &targets, &bins).unwrap();
+        let fresh = f2_tdr_safety_policy(&events, "gpu-a", None, &targets, &bins, &[]).unwrap();
         assert_eq!(fresh.crashes.len(), 3);
         // One run may spend twelve (two per lower level's edge, 2026-10-23); the thirteenth ends
         // its exploration.
@@ -17002,12 +17073,12 @@ mod tests {
             .collect::<Vec<_>>();
         let mut with_run = events.clone();
         with_run.extend(run_events);
-        assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-d"), &targets, &bins).is_ok());
+        assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-d"), &targets, &bins, &[]).is_ok());
         with_run.push(crash("run-d", "gpu-a", 1890, 918, "run-d-12"));
-        assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-d"), &targets, &bins)
+        assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-d"), &targets, &bins, &[])
             .unwrap_err()
             .contains("safety ceiling reached"));
-        assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-e"), &targets, &bins).is_ok());
+        assert!(f2_tdr_safety_policy(&with_run, "gpu-a", Some("run-e"), &targets, &bins, &[]).is_ok());
 
         // Explicit rehabilitation is resolved before the CandidateCrash filter and reopens budget.
         events.push(CondemnationEvent {
@@ -17023,7 +17094,7 @@ mod tests {
             rehabilitated: true,
         });
         assert_eq!(
-            f2_tdr_safety_policy(&events, "gpu-a", None, &targets, &bins)
+            f2_tdr_safety_policy(&events, "gpu-a", None, &targets, &bins, &[])
                 .unwrap()
                 .crashes
                 .len(),
@@ -17050,7 +17121,7 @@ mod tests {
             rehabilitated: false,
         }];
         let err =
-            f2_tdr_safety_policy(&events, "gpu-a", None, &[1920, 1905], &[925, 931, 937]).unwrap_err();
+            f2_tdr_safety_policy(&events, "gpu-a", None, &[1920, 1905], &[925, 931, 937], &[]).unwrap_err();
         assert!(
             err.contains("não pertence aos bins físicos atuais"),
             "{err}"

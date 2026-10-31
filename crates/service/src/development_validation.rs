@@ -428,13 +428,13 @@ mod tests {
         let targets = [1920, 1905, 1890];
         let bins = [925, 931, 937, 943, 950, 956];
         let before = nidavellir_core::condemnation::rigid_tdr_safety_cone_floors(
-            &baseline, "gpu-a", 29, &targets, &bins,
+            &baseline, "gpu-a", 29, &targets, &bins, &[],
         );
         assert!(!before.is_empty());
         assert!(a.budget(&baseline, "gpu-a").is_ok());
         assert_eq!(
             nidavellir_core::condemnation::rigid_tdr_safety_cone_floors(
-                &a.crashes, "gpu-a", 29, &targets, &bins
+                &a.crashes, "gpu-a", 29, &targets, &bins, &[]
             ),
             before
         );
