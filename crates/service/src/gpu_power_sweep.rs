@@ -103,6 +103,11 @@ fn f2_power_limited_sample(power_capped: bool, hw_thermal_slowdown: bool, power_
 fn f2_power_limited(power_capped: bool, hw_thermal_slowdown: bool, reading_at_limit: bool) -> bool {
     (power_capped || reading_at_limit) && !hw_thermal_slowdown
 }
+/// An RTX 50's driver does not hold a voltage lock at about 875 mV and below, and reportedly refuses
+/// 850 to 875 mV (NV-UV's guide and issue #12; not measured here). A refused lock aborts the Forge and
+/// discards its profiles, so the search stops above it. Raise or remove this once a run shows more.
+#[cfg(windows)]
+const F2_LIVE_CURVE_LOCK_FLOOR_MV: u32 = 875;
 #[cfg(windows)]
 const V8_GOLDEN_SAMPLE_MS: u64 = 2_000;
 #[cfg(windows)]
@@ -9608,6 +9613,10 @@ fn measure_multiclock_undervolt_forge(
         }
     };
     let tdr_safety_cone = tdr_policy.floors;
+    // After the cone: a recorded crash under the floor must still map onto the physical bins.
+    if nidavellir_core::f2_observation::f2_live_curve_follows_load() {
+        voltage_bins_ascending.retain(|mv| *mv > F2_LIVE_CURVE_LOCK_FLOOR_MV);
+    }
     if !tdr_policy.crashes.is_empty() {
         prog.log.push(format!(
             "Proteção TDR exact-v{F2_EXACT_APPLY_QUALIFICATION_CONTRACT_VERSION}: {}/{} CandidateCrash nesta run ({} no histórico); cone físico 1 clock-bin : 1 voltage-bin ativo em {} alvo(s).",

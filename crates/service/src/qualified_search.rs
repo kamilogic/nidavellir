@@ -1294,6 +1294,46 @@ mod tests {
         record(&mut stock_level, 0, Outcome::Inconclusive, &clocks, &volts, &low_stock(&volts), None, hint).unwrap();
         assert_eq!(stock_level.bands[0].target_clock_mhz, 2977, "never a pair at or under stock: one boost step");
     }
+    /// An RTX 5070 on its real curve (field report 2026-11-05) over the 875 mV lock floor. The edges are
+    /// assumed: 2977 MHz crashed a 12 s dwell at 915 mV on 0.8.11, and the matrix fails earlier.
+    #[test]
+    fn a_5070_forge_publishes_every_level_above_the_lock_floor_within_its_attempts() {
+        use Outcome::*;
+        let stock: Vec<(usize, u32, u32)> = [
+            (885, 2265), (890, 2287), (895, 2310), (900, 2332), (910, 2362), (915, 2385), (920, 2407), (925, 2430),
+            (935, 2452), (940, 2475), (945, 2497), (950, 2512), (960, 2535), (965, 2557), (970, 2572), (975, 2587),
+            (985, 2610), (990, 2625), (995, 2647), (1000, 2677), (1010, 2700), (1015, 2722), (1020, 2737),
+            (1025, 2745), (1035, 2760), (1040, 2775), (1045, 2782), (1050, 2797), (1060, 2812), (1065, 2820),
+            (1070, 2835), (1075, 2850), (1085, 2857), (1090, 2872), (1095, 2880),
+        ].iter().enumerate().map(|(index, &(mv, mhz))| (index, mv, mhz)).collect();
+        let volts: Vec<u32> = stock.iter().map(|p| p.1).collect();
+        let clocks: Vec<u32> = (0..30).map(|step| 2977 - step * 15).rev().collect();
+        for top_edge in [960, 930] {
+            let seed = |id| Seed { id, target_clock_mhz: 2977, voltage_mv: 1095, clock_ceiling_mhz: 2977 };
+            let mut state = new(&[seed("performance"), seed("balanced"), seed("efficiency")], STANDARD_ATTEMPTS, 10_000);
+            while let Some(index) = next_band(&state) {
+                let pair = admit(&mut state, index, 0, 100).unwrap();
+                let edge = top_edge - (2977 - pair.target_clock_mhz) / 5;
+                let outcome = if pair.voltage_mv >= 1090 {
+                    PowerBound
+                } else if pair.voltage_mv >= edge {
+                    Qualified
+                } else {
+                    IntegrityError
+                };
+                record(&mut state, index, outcome, &clocks, &volts, &stock, None, None).unwrap();
+            }
+            let levels: Vec<_> = state.bands.iter()
+                .map(|b| (b.id.as_str(), b.last_qualified_clock_mhz, b.last_qualified_voltage_mv, b.stop_reason.as_deref()))
+                .collect();
+            assert!(state.attempts_used <= STANDARD_ATTEMPTS, "{}: {levels:?}", state.attempts_used);
+            let stop = |id: &str| state.bands.iter().find(|b| b.id == id).unwrap().stop_reason.as_deref();
+            assert_eq!(stop("compensated"), Some("compensation_not_needed"), "{levels:?}");
+            assert_eq!(stop("balanced"), Some("published"), "{levels:?}");
+            assert_eq!(stop("efficiency"), Some("published"), "{levels:?}");
+        }
+    }
+
     #[test]
     fn every_pair_stays_below_the_stock_curve_of_a_gpu_at_its_voltage_limit() {
         use Outcome::*;
