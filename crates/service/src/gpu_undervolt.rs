@@ -4144,6 +4144,16 @@ pub(crate) struct F2ForgeInputs {
     pub limits: PositiveOffsetLimits,
 }
 
+/// The envelope of every Forge and Apply plan, so both write the same curve shape. An RTX 50 also
+/// lifts the point below the anchor; it is marked before either can run (`current_gpu_key`).
+#[cfg(windows)]
+fn f2_plan_limits(floor_mv: u32, clock_ceiling_mhz: u32, min_base: u32) -> PositiveOffsetLimits {
+    PositiveOffsetLimits {
+        lift_point_below: nidavellir_core::f2_observation::f2_live_curve_follows_load(),
+        ..PositiveOffsetLimits::hardware_frontier(floor_mv, clock_ceiling_mhz, min_base)
+    }
+}
+
 /// Read-only F2 forge inputs derived from the static VF base plus the caller's validated live stock
 /// clock ceiling. The offset envelope spans the physical curve, while the effective target can never
 /// exceed that stock ceiling. Returns `None` when no sane base points exist. No Safe Loop arm, apply,
@@ -4165,7 +4175,7 @@ pub(crate) fn f2_forge_inputs(clock_ceiling_mhz: u32) -> Option<F2ForgeInputs> {
     let min_base = sane.iter().map(|&(_, _, f)| f).min().unwrap();
     // The Forge must traverse the complete real VF domain. Its offset envelope is therefore derived
     // from the hardware curve itself, while the effective target remains capped at stock boost top.
-    let limits = PositiveOffsetLimits::hardware_frontier(floor_mv, clock_ceiling_mhz, min_base);
+    let limits = f2_plan_limits(floor_mv, clock_ceiling_mhz, min_base);
     Some(F2ForgeInputs {
         sane_base_curve: sane,
         boost_top_mhz: clock_ceiling_mhz,
@@ -4263,7 +4273,7 @@ fn apply_anchored_undervolt_with_mode(
     let min_base = sane.iter().map(|&(_, _, f)| f).min().unwrap();
     // Apply the exact already-validated Forge point under the same hardware-derived envelope used
     // during discovery. The target is still capped at stock boost top and the exact anchor is required.
-    let limits = PositiveOffsetLimits::hardware_frontier(floor_mv, boost_top, min_base);
+    let limits = f2_plan_limits(floor_mv, boost_top, min_base);
 
     let Some(anchor_idx) = select_exact_apply_anchor_bin(&sane, target_mhz, anchor_mv) else {
         return Err(format!(
@@ -4462,11 +4472,13 @@ fn plan_f2_power_calibration_candidate(
         reference_offset_mhz,
         limits,
     )
-    // Only the anchor is raised: a GPU that slips one voltage point lower runs that point's stock
-    // clock (field report 2026-10-21, RTX 5070).
     .inspect(|plan| {
+        let lifted = plan.entries.iter().find(|e| e.role == AnchoredBinRole::LiftedBelow).map_or(
+            String::new(),
+            |e| format!(", point below at {} mV raised +{} MHz to {} MHz", e.voltage_mv, e.offset_mhz, e.effective_mhz),
+        );
         info!(
-            "F2 plan {target_mhz} MHz @ {apply_mv} mV: stock {} MHz at the anchor, offset +{} MHz, {} bins capped above, {} left at stock below",
+            "F2 plan {target_mhz} MHz @ {apply_mv} mV: stock {} MHz at the anchor, offset +{} MHz, {} bins capped above, {} left at stock below{lifted}",
             plan.anchor.base_mhz, plan.anchor.offset_mhz, plan.capped_above_bins, plan.elastic_below_bins
         )
     })
@@ -6687,6 +6699,38 @@ mod tests {
         // Exactly one positive offset, and no bin sits above target.
         assert_eq!(plan.entries.iter().filter(|e| e.offset_mhz > 0).count(), 1);
         assert!(plan.entries.iter().all(|e| e.effective_mhz <= 1755));
+    }
+
+    /// RTX 5070, 2977@1070 (field report 2026-11-05): at stock, the point below sat 150 MHz under the
+    /// anchor and the GPU ran 37 MHz under its locked point.
+    #[test]
+    fn a_lifted_plan_raises_only_the_point_below_the_anchor() {
+        let curve = vec![(0, 1060, 2812), (1, 1065, 2820), (2, 1070, 2835), (3, 1075, 2850), (4, 1150, 2977)];
+        let stock = PositiveOffsetLimits::hardware_frontier(760, 2977, 547);
+        let plain = plan_bounded_anchored_positive_offset(&curve, 2, 2977, 0, &stock).unwrap();
+        assert_eq!(plain.entries.iter().filter(|e| e.offset_mhz > 0).count(), 1, "RTX 30/40 keep one raise");
+        assert_eq!(plain.elastic_below_bins, 2);
+
+        let limits = PositiveOffsetLimits { lift_point_below: true, ..stock };
+        let plan = plan_bounded_anchored_positive_offset(&curve, 2, 2977, 0, &limits).unwrap();
+        let raised: Vec<_> = plan.entries.iter().filter(|e| e.offset_mhz > 0).map(|e| (e.voltage_mv, e.offset_mhz, e.effective_mhz)).collect();
+        assert_eq!(raised, [(1065, 142, 2962), (1070, 142, 2977)]);
+        assert_eq!(plan.elastic_below_bins, 1);
+        assert!(plan.entries.iter().all(|e| e.effective_mhz <= 2977), "nothing above the target");
+
+        // A point already within one step of the target stays elastic.
+        let close = vec![(0, 1065, 2830), (1, 1070, 2835)];
+        let plan = plan_bounded_anchored_positive_offset(&close, 1, 2840, 0, &limits).unwrap();
+        assert_eq!(plan.entries.iter().filter(|e| e.role == AnchoredBinRole::LiftedBelow).count(), 0);
+        // The lowest point has nothing under it.
+        let lowest = vec![(0, 1070, 2835), (1, 1075, 2850)];
+        assert!(plan_bounded_anchored_positive_offset(&lowest, 0, 2860, 0, &limits).is_ok());
+        // On the curve's steep part a lift can outgrow the anchor's offset, and the cap still binds.
+        let steep = vec![(0, 875, 2205), (1, 885, 2265)];
+        let capped = PositiveOffsetLimits { abs_max_offset_mhz: 350, ..limits };
+        let refused = plan_bounded_anchored_positive_offset(&steep, 1, 2600, 0, &capped).unwrap_err();
+        assert!(refused.contains("lifted bin"), "{refused}");
+        assert_eq!(plan_bounded_anchored_positive_offset(&steep, 1, 2600, 0, &limits).unwrap().max_positive_offset_mhz, 380);
     }
 
     #[test]

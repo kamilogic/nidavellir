@@ -455,6 +455,19 @@ pub(crate) fn verify_anchored_positive_offset(
         if e.index == plan.anchor.index {
             continue;
         }
+        // A lifted point (RTX 50) is a planned raise too: the same check as the anchor.
+        if e.role == nidavellir_gpu_nvapi::AnchoredBinRole::LiftedBelow {
+            match verify_positive_offset(e.offset_mhz, e.effective_mhz, observed(e.index), None, tol_mhz) {
+                PositiveOffsetVerification::Unverifiable => return AnchoredOffsetVerification::Unverifiable,
+                PositiveOffsetVerification::RaiseIncomplete => {
+                    return AnchoredOffsetVerification::AnchorRaiseIncomplete
+                }
+                PositiveOffsetVerification::OverRaise => {
+                    return AnchoredOffsetVerification::UnexpectedPositiveOffset
+                }
+                PositiveOffsetVerification::RaiseVerified => continue,
+            }
+        }
         let Some(obs) = observed(e.index) else {
             return AnchoredOffsetVerification::Unverifiable;
         };
@@ -1993,6 +2006,39 @@ mod tests {
         assert_eq!(
             verify_anchored_positive_offset(&plan, &observed, TOL_MHZ),
             AnchoredOffsetVerification::AnchoredRaiseVerified
+        );
+    }
+
+    /// RTX 50: the point below the anchor is a planned raise. It must take, and it is the only one.
+    #[test]
+    fn anchored_verify_checks_a_lifted_point_like_the_anchor() {
+        use nidavellir_gpu_nvapi::{AnchoredBinRole, PositiveOffsetLimits};
+        let limits = PositiveOffsetLimits {
+            lift_point_below: true,
+            ..PositiveOffsetLimits::hardware_frontier(850, 1900, 1700)
+        };
+        let plan = nidavellir_gpu_nvapi::plan_bounded_anchored_positive_offset(&anchored_base(), 1, 1755, 0, &limits)
+            .unwrap();
+        let lifted = plan.entries.iter().find(|e| e.role == AnchoredBinRole::LiftedBelow).unwrap();
+        assert_eq!((lifted.voltage_mv, lifted.offset_mhz), (850, 40));
+        let with_lift = |offset: Option<i32>| -> AnchoredOffsetVerification {
+            let observed: Vec<_> = plan
+                .entries
+                .iter()
+                .map(|e| (e.index, if e.index == lifted.index { offset } else { Some(e.offset_mhz) }))
+                .collect();
+            verify_anchored_positive_offset(&plan, &observed, TOL_MHZ)
+        };
+        assert_eq!(with_lift(Some(40)), AnchoredOffsetVerification::AnchoredRaiseVerified);
+        assert_eq!(with_lift(Some(0)), AnchoredOffsetVerification::AnchorRaiseIncomplete, "the lift did not take");
+        assert_eq!(with_lift(Some(60)), AnchoredOffsetVerification::UnexpectedPositiveOffset);
+        assert_eq!(with_lift(None), AnchoredOffsetVerification::Unverifiable);
+        // Any other point below still may not carry a raise.
+        let mut observed = observed_as_planned(&anchored_plan());
+        observed[0].1 = Some(40);
+        assert_eq!(
+            verify_anchored_positive_offset(&anchored_plan(), &observed, TOL_MHZ),
+            AnchoredOffsetVerification::UnexpectedPositiveOffset
         );
     }
 
