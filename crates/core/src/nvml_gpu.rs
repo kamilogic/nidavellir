@@ -121,6 +121,23 @@ impl NvmlSampler {
         self.nvml.device_by_index(self.index).ok()?.name().ok()
     }
 
+    /// What NVML answers about clock-limit reasons. An RTX 5070 read none in every dwell, even at its
+    /// power limit (field report 2026-11-05), and the samples cannot tell a failing query from an
+    /// empty answer.
+    pub fn clock_limit_support(&self) -> String {
+        let Ok(device) = self.nvml.device_by_index(self.index) else {
+            return "device unavailable".into();
+        };
+        let names = |reasons: Result<nvml_wrapper::bitmasks::device::ThrottleReasons, nvml_wrapper::error::NvmlError>| {
+            reasons.map_or_else(|error| format!("error ({error})"), |reasons| clock_limit_names(reasons.bits()))
+        };
+        format!(
+            "supported {}; current {}",
+            names(device.supported_throttle_reasons()),
+            names(device.current_throttle_reasons())
+        )
+    }
+
     /// One snapshot. Any field NVML cannot supply is `None`; nothing is fabricated.
     pub fn sample(&self) -> NvmlSample {
         use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};

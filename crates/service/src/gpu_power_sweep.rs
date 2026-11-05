@@ -9054,6 +9054,9 @@ fn measure_multiclock_undervolt_forge(
         "F2 undervolt forge starting (bounded qualification-first discovery) — mode {}",
         mode.label()
     );
+    if let Ok((sampler, _)) = nidavellir_core::nvml_gpu::NvmlSampler::init(0) {
+        info!("NVML clock-limit reasons: {}", sampler.clock_limit_support());
+    }
     let previous = progress.lock().map(|g| g.clone()).unwrap_or_default();
     let resume_requested = intent == ForgeRunIntent::Resume;
     let previous_stock_mhz =
