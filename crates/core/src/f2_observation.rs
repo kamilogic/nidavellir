@@ -69,13 +69,17 @@ pub const F2_MAX_THERMAL_SHIFT_MHZ: u32 = 45;
 /// when that sits lower by more than the held bin, within a thermal shift. The ceiling always
 /// stays on the target.
 pub fn f2_held_reference_mhz(target: u32, live_anchor_mhz: Option<u32>) -> u32 {
-    let max_shift_mhz = if f2_live_curve_follows_load() { u32::MAX } else { F2_MAX_THERMAL_SHIFT_MHZ };
-    f2_held_reference_within(target, live_anchor_mhz, max_shift_mhz)
-}
-fn f2_held_reference_within(target: u32, live_anchor_mhz: Option<u32>, max_shift_mhz: u32) -> u32 {
+    if f2_live_curve_follows_load() {
+        return f2_live_curve_reference(target, live_anchor_mhz);
+    }
     live_anchor_mhz
-        .filter(|live| live + F2_HELD_BIN_BELOW_MHZ < target && live.saturating_add(max_shift_mhz) >= target)
+        .filter(|live| live + F2_HELD_BIN_BELOW_MHZ < target && live + F2_MAX_THERMAL_SHIFT_MHZ >= target)
         .unwrap_or(target)
+}
+/// On an RTX 50 the live point is the reference at any distance under the target. Stopping at the
+/// held bin would make a point 15 MHz under the target stricter than one 16 MHz under it.
+fn f2_live_curve_reference(target: u32, live_anchor_mhz: Option<u32>) -> u32 {
+    live_anchor_mhz.map_or(target, |live| live.min(target))
 }
 static LIVE_CURVE_FOLLOWS_LOAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 /// An RTX 50 moves its own V/F curve under load: an RTX 5070's anchor ran 15 to 60 MHz under the
@@ -1755,9 +1759,13 @@ mod tests {
         // RTX 50 (2026-10-28): 2917@1070 followed its live point down to 2835. There the floor
         // follows the live point at any distance; elsewhere 45 MHz still bounds it.
         assert!(!f2_live_curve_follows_load(), "only the service marks the GPU, never a test");
-        assert_eq!(f2_held_reference_within(2917, Some(2835), u32::MAX), 2835);
-        assert_eq!(f2_held_reference_within(2917, Some(2835), F2_MAX_THERMAL_SHIFT_MHZ), 2917);
-        assert_eq!(f2_held_reference_within(2917, Some(2930), u32::MAX), 2917, "never above the target");
+        assert_eq!(f2_live_curve_reference(2917, Some(2835)), 2835);
+        assert_eq!(f2_held_reference_mhz(2917, Some(2835)), 2917);
+        assert_eq!(f2_live_curve_reference(2917, Some(2930)), 2917, "never above the target");
+        assert_eq!(f2_live_curve_reference(2917, None), 2917, "without a reading the target is the floor");
+        // No step at the held bin: 15 MHz under the target follows the point like 16 MHz under it.
+        assert_eq!(f2_live_curve_reference(2977, Some(2962)), 2962);
+        assert_eq!(f2_live_curve_reference(2977, Some(2961)), 2961);
     }
 
     fn reproducible_provenance() -> F2EvidenceProvenance {
