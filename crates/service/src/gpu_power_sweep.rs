@@ -87,9 +87,21 @@ const F2_ENDURANCE_HOT_TARGET_MIN_SAMPLES: usize = 100;
 /// held when NVML attributes it to the SW power cap and hardware thermal slowdown is not engaged.
 /// Sampled power cannot decide this: NVML power is a 1 s average on Ampere, so 100 ms DX11 bursts
 /// clamped by the limiter read 100-190 W (run 1790466472114: cap bit on 100% of DX11 samples).
+/// An RTX 5070 never sets the cap bit, not even at 250 W (16 of 16 dwells, field report 2026-11-05),
+/// so there the reading has to decide. It does in the 100% duty phases that must hold, where the
+/// average sits at the limit: the 3060 Ti's read 200 W in the DX11 lane.
 #[cfg(windows)]
-fn f2_power_limited_sample(power_capped: bool, hw_thermal_slowdown: bool) -> bool {
-    power_capped && !hw_thermal_slowdown
+fn f2_power_limited_sample(power_capped: bool, hw_thermal_slowdown: bool, power_w: f32, limit_w: Option<f32>) -> bool {
+    f2_power_limited(
+        power_capped,
+        hw_thermal_slowdown,
+        nidavellir_core::f2_observation::f2_live_curve_follows_load()
+            && crate::gpu_undervolt::f2_drop_near_cap(Some(power_w), limit_w),
+    )
+}
+#[cfg(windows)]
+fn f2_power_limited(power_capped: bool, hw_thermal_slowdown: bool, reading_at_limit: bool) -> bool {
+    (power_capped || reading_at_limit) && !hw_thermal_slowdown
 }
 #[cfg(windows)]
 const V8_GOLDEN_SAMPLE_MS: u64 = 2_000;
@@ -3800,7 +3812,7 @@ fn qualification_coverage_from_run_with_context(
                 continue;
             }
             total = total.saturating_add(1);
-            if sample.0 >= target_floor || f2_power_limited_sample(sample.2, sample.5) {
+            if sample.0 >= target_floor || f2_power_limited_sample(sample.2, sample.5, sample.1, power_limit_w) {
                 resident = resident.saturating_add(1);
             }
         }
@@ -3907,7 +3919,7 @@ fn qualification_coverage_from_run_with_context(
                 if phase.len() < F2_SUSTAIN_MIN_SAMPLES as usize { return None; }
                 evaluated = true;
                 let held = phase.iter().filter(|s| nidavellir_core::f2_observation::f2_clock_held(s.0, target, live_anchor_mhz)
-                    || f2_power_limited_sample(s.2, s.5)).count();
+                    || f2_power_limited_sample(s.2, s.5, s.1, power_limit_w)).count();
                 (held as f64 / (phase.len() as f64) < 0.95).then_some("heavy_clock_not_sustained")
             });
         refusal.or((!evaluated).then_some("heavy_phase_telemetry_low"))
@@ -4548,7 +4560,8 @@ fn load_and_measure_for_with_phase_hook(
                 } else { None };
                 if let Ok(mut samples) = dx11_samples_thread.lock() {
                     let power_limited = f2_power_limited_sample(
-                        r.power_capped() == Some(true), r.hw_thermal_slowdown() == Some(true));
+                        r.power_capped() == Some(true), r.hw_thermal_slowdown() == Some(true),
+                        r.power_w.unwrap_or(0.0), qualification_power_limit_w);
                     samples.push(dx11_residency::Sample { start_us: dx11_start_us,
                         end_us, clock_mhz, voltage_mv: dx11_voltage,
                         temperature_c: r.temp_c, curve, power_limited });
@@ -12522,6 +12535,22 @@ mod tests {
     }
 
     #[cfg(windows)]
+    /// An RTX 5070 reads no cap bit even at 250 W (field report 2026-11-05), so there a reading at the
+    /// limit stands for it. RTX 30/40 keep the bit alone: their sampled power cannot decide.
+    #[test]
+    fn a_power_reading_counts_as_limited_only_where_the_cap_bit_is_missing() {
+        assert!(!nidavellir_core::f2_observation::f2_live_curve_follows_load(), "only the service marks the GPU");
+        assert!(!f2_power_limited_sample(false, false, 250.0, Some(250.0)), "RTX 30/40: the bit decides");
+        assert!(f2_power_limited_sample(true, false, 120.0, Some(250.0)));
+        assert!(!f2_power_limited_sample(true, true, 120.0, Some(250.0)), "a hardware slowdown is no power limit");
+
+        let at_limit = |power| crate::gpu_undervolt::f2_drop_near_cap(Some(power), Some(250.0));
+        assert!(f2_power_limited(false, false, at_limit(237.5)));
+        assert!(!f2_power_limited(false, false, at_limit(237.0)));
+        assert!(!f2_power_limited(false, true, at_limit(250.0)), "a hardware slowdown still disqualifies");
+        assert!(!crate::gpu_undervolt::f2_drop_near_cap(Some(250.0), None), "no limit, no reading");
+    }
+
     #[test]
     fn a_refused_sustain_names_the_phase_that_held_least_and_where_it_dropped() {
         // Cells: [clock MHz, °C, samples, SW power-cap samples]. Capped samples count as held, a

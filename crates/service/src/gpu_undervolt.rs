@@ -1598,7 +1598,7 @@ fn f2_finalize_power_cap_state(
 /// the voltage at the same clock, where the power reading becomes unambiguous.
 const F2_DROP_NEAR_CAP_RATIO: f32 = 0.95;
 
-fn f2_drop_near_cap(power_p99_w: Option<f32>, power_limit_w: Option<f32>) -> bool {
+pub(crate) fn f2_drop_near_cap(power_p99_w: Option<f32>, power_limit_w: Option<f32>) -> bool {
     power_p99_w.zip(power_limit_w).is_some_and(|(power, limit)| {
         power.is_finite() && limit.is_finite() && limit > 0.0 && power >= limit * F2_DROP_NEAR_CAP_RATIO
     })
