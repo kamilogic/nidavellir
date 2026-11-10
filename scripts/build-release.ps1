@@ -26,6 +26,13 @@ $srcExe = Join-Path $RepoRoot "target\release\nidavellir-service.exe"
 if (-not (Test-Path $srcExe)) {
     throw "Missing $srcExe - cargo build failed?"
 }
+# The installer ships no Visual C++ redistributable, so a Core that imports its DLLs never starts on a
+# fresh Windows (field report 2026-11-09). A RUSTFLAGS variable overrides .cargo/config.toml's static
+# runtime, so check the import names in the binary itself.
+$image = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($srcExe))
+if ($image -match '(?i)\b(vcruntime140(_1)?|msvcp140\w*)\.dll') {
+    throw "The Core imports $($Matches[0]) from the Visual C++ redistributable; build it with the static C runtime (.cargo/config.toml)"
+}
 
 $binDir = Join-Path $RepoRoot "apps\ui\src-tauri\binaries"
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null

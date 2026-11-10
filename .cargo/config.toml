@@ -1,0 +1,5 @@
+# Windows builds link the C runtime statically. VCRUNTIME140.dll comes with the Visual C++
+# redistributable, not with Windows, and the installer does not ship it: a Core that imports it never
+# starts on a fresh Windows (field report 2026-11-09). scripts/build-release.ps1 checks the Core.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
