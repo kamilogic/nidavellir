@@ -1055,6 +1055,23 @@ test("UX: a driver crash at stock says what comes next, and promises to continue
   await expect(note).toContainText("The run then continues by itself.");
 });
 
+test("UX: a run Windows paused by restarting says so, and promises to continue only when the Core will", async ({ page }) => {
+  await openForge(page);
+  await page.evaluate(() => Object.assign(window.__forgeTest.power, {
+    phase: "paused", run_id: "run-windows", windows_restart_paused_at: "2026-11-10T02:56:02+00:00",
+    resume_available: true, auto_resume: true, auto_continue_pending: false,
+  }));
+  const note = page.locator(".reboot-note");
+  await expect(note).toContainText("Windows restarted or shut down during the run; the run paused safely.", { timeout: 10_000 });
+  await expect(note).toContainText("Progress is saved.");
+  await expect(note).not.toContainText("continues by itself");
+  await expect(page.getByRole("heading", { name: "Forge paused" })).toBeVisible();
+  await page.evaluate(() => Object.assign(window.__forgeTest.power, { auto_continue_pending: true }));
+  await expect(note).toContainText("The run then continues by itself.");
+  await page.evaluate(() => Object.assign(window.__forgeTest.power, { auto_resume_at_ms: Date.now() + 90_000 }));
+  await expect(note).toContainText("Continuing automatically in");
+});
+
 test("Reports: the first Forge asks once whether to send error reports, and Start waits for the answer", async ({ page }, testInfo) => {
   await openForge(page);
   await page.evaluate(() => { window.__forgeTest.window.errorReports = null; });

@@ -16,6 +16,32 @@ use crate::SERVICE_NAME;
 static STOP_TX: OnceLock<std::sync::mpsc::Sender<Result<(), String>>> = OnceLock::new();
 static DRIVER_RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// The stop cleanup gives up after this and ends the process; recovery then fails closed.
+const SHUTDOWN_CLEANUP_LIMIT: Duration = Duration::from_secs(20);
+/// How long Windows waits for STOPPED after the preshutdown notice (10 s by default since build
+/// 15063). Longer than the cleanup limit, so a restart never cuts the cleanup.
+const PRESHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Preshutdown instead of Shutdown (the two exclude each other). At Shutdown Windows gives a service
+/// a few seconds: during a Forge that cut the cleanup before it disarmed the boot flag, so a Windows
+/// Update restart counted as a candidate crash (field report 2026-11-10).
+fn accepted_controls() -> ServiceControlAccept {
+    ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN
+}
+
+/// A failure keeps Windows' shorter default; a cleanup it cuts still fails closed.
+fn set_preshutdown_timeout() -> Result<(), String> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    let scm = |error: windows_service::Error| format!("SCM: {error}");
+    ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(scm)?
+        .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+        .map_err(scm)?
+        .set_preshutdown_timeout(PRESHUTDOWN_TIMEOUT)
+        .map_err(scm)
+}
+
 /// The driver-only reset exits non-zero on purpose, so SCM recovery must restart the service on
 /// every failure, non-crash failures included (`sc failureflag 1`).
 pub(crate) fn driver_reset_available() -> Result<(), String> {
@@ -68,7 +94,10 @@ pub fn run_service() -> windows_service::Result<()> {
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
-            ServiceControl::Stop | ServiceControl::Shutdown => {
+            ServiceControl::Stop | ServiceControl::Preshutdown => {
+                if control_event == ServiceControl::Preshutdown {
+                    crate::shutdown::note_windows_stopping();
+                }
                 crate::shutdown::begin();
                 let _ = shutdown_tx.send(Ok(()));
                 ServiceControlHandlerResult::NoError
@@ -92,6 +121,12 @@ pub fn run_service() -> windows_service::Result<()> {
 
     let started = std::time::Instant::now();
     info!("Nidavellir Core Service initializing");
+    // Tells a Windows restart from a restart of the service alone.
+    let boot = i64::try_from(crate::tdr_sentinel::current_boot_epoch_ms())
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map_or_else(|| "unknown".to_string(), |time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    info!("Windows started at {boot}");
 
     // Parachute first: the service boots before login, so it reads the
     // boot-flag and recovers from any prior crash before touching hardware.
@@ -140,6 +175,9 @@ pub fn run_service() -> windows_service::Result<()> {
         }
     };
     info!("startup: recovery and Sentinel took {} ms", started.elapsed().as_millis());
+    if let Err(error) = set_preshutdown_timeout() {
+        tracing::warn!("preshutdown timeout not set ({error}); a Windows restart may cut the stop cleanup");
+    }
     if !sentinel_ready {
         tracing::warn!("persisted GPU profile reapply disabled by the Sentinel startup guard");
     }
@@ -178,7 +216,7 @@ pub fn run_service() -> windows_service::Result<()> {
             status_handle.set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: ServiceState::Running,
-                controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                controls_accepted: accepted_controls(),
                 exit_code: ServiceExitCode::Win32(0),
                 checkpoint: 0,
                 wait_hint: Duration::default(),
@@ -201,14 +239,14 @@ pub fn run_service() -> windows_service::Result<()> {
         controls_accepted: ServiceControlAccept::empty(),
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 1,
-        wait_hint: Duration::from_secs(20),
+        wait_hint: SHUTDOWN_CLEANUP_LIMIT,
         process_id: None,
     });
     if let Err(error) = &stop_status {
         tracing::error!("cannot report StopPending; still performing shutdown cleanup: {error}");
     }
     let stopping = std::time::Instant::now();
-    let result = crate::shutdown::complete(state, Duration::from_secs(20));
+    let result = crate::shutdown::complete(state, SHUTDOWN_CLEANUP_LIMIT);
     if DRIVER_RESET_REQUESTED.load(Ordering::SeqCst) {
         // pnputil (≤ 60 s) plus the adapter readiness wait (≤ 30 s) outlast the first stop hint.
         let _ = status_handle.set_service_status(ServiceStatus {
@@ -244,4 +282,17 @@ pub fn run_service() -> windows_service::Result<()> {
     // The installer log shows how long Windows then takes to end the process.
     info!("stopped {} ms after the stop request; ending the process", stopping.elapsed().as_millis());
     crate::shutdown::exit_process(if failed { 1 } else { 0 });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_windows_restart_waits_for_the_whole_stop_cleanup() {
+        let accepted = accepted_controls();
+        assert!(accepted.contains(ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN));
+        assert!(!accepted.contains(ServiceControlAccept::SHUTDOWN), "Shutdown gives only seconds and excludes Preshutdown");
+        assert!(PRESHUTDOWN_TIMEOUT > SHUTDOWN_CLEANUP_LIMIT, "Windows must wait longer than the cleanup can take");
+    }
 }

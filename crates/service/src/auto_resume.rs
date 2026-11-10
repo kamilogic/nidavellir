@@ -13,6 +13,10 @@
 //! - otherwise it acknowledges only that run's own CandidateCrash and calls the same `resume` a
 //!   user click calls, so every guard applies, including the stock controls every run starts with.
 //!
+//! A run paused because Windows itself restarted (Preshutdown) continues the same way, with no
+//! incident to acknowledge, when Windows is back within 30 minutes (user decision 2026-11-10). A
+//! later boot was a shutdown: that run waits for the user.
+//!
 //! One attempt per incident, kept across Core restarts: a refusal is logged and the run waits for
 //! the user.
 
@@ -95,8 +99,20 @@ fn eligible_keys(state: &AppState) -> Option<[String; 2]> {
     }
     let pending = pending_incident(state).ok()?;
     let run = progress.run_id.clone().unwrap_or_default();
-    auto_resume_eligible(&progress, pending.as_ref())
-        .then(|| [pending.map_or_else(|| run.clone(), |incident| incident.id), run])
+    auto_resume_eligible(&progress, pending.as_ref()).then(|| {
+        let first = attempt_key(&run, pending, progress.windows_restart_paused_at.as_deref());
+        [first, run]
+    })
+}
+
+/// The incident, else one key per Windows restart: the run's own key is spent by any earlier
+/// continuation of the run, which must not block a restart hours later.
+fn attempt_key(run: &str, pending: Option<ForgeIncident>, windows_restart_paused_at: Option<&str>) -> String {
+    match (pending, windows_restart_paused_at) {
+        (Some(incident), _) => incident.id,
+        (None, Some(at)) => format!("{run} windows restart {at}"),
+        (None, None) => run.to_owned(),
+    }
 }
 
 /// True while this run will still continue on its own (countdown, next poll or restart warning).
@@ -144,8 +160,13 @@ fn countdown(state: &Mutex<AppState>, cancels: u64) -> bool {
     let deadline = now_ms() + AUTO_RESUME_DELAY_MS;
     {
         let Ok(guard) = state.lock() else { return false };
+        let cause = if guard.power_sweep.progress().windows_restart_paused_at.is_some() {
+            "Windows restarted during the run"
+        } else {
+            "Driver crash at a test edge"
+        };
         guard.power_sweep.note_auto_resume(Some(deadline), LogTone::Attention, format!(
-            "Driver crash at a test edge · the same run continues in {} s. Turn off auto-continue to cancel.",
+            "{cause} · the same run continues in {} s. Turn off auto-continue to cancel.",
             AUTO_RESUME_DELAY_MS / 1000
         ));
     }
@@ -189,6 +210,10 @@ fn act(state: &Mutex<AppState>, keys: &[String; 2]) -> Option<String> {
         return refuse("the run changed during the wait".into());
     }
     if let Some(latch) = crate::tdr_sentinel::reboot_required_event() {
+        // A pause for a Windows restart owns no crash: a driver crash in this boot needs the user.
+        if progress.windows_restart_paused_at.is_some() {
+            return refuse(format!("this Windows start already had a driver crash ({latch})"));
+        }
         // A crash at factory settings gets a full Windows restart; the driver-only reset is for
         // test edges (user decision 2026-10-14).
         let reset = if progress.stock_crash_paused {
@@ -232,7 +257,13 @@ fn act(state: &Mutex<AppState>, keys: &[String; 2]) -> Option<String> {
     guard.power_sweep.refresh_resume_state(&guard.safe_store);
     guard.power_sweep.note_auto_resume(None, LogTone::Step, format!(
         "Continuing the run automatically{}.",
-        if pending.is_some() { "; auto-continue acknowledged this run's driver crash" } else { "" }
+        if pending.is_some() {
+            "; auto-continue acknowledged this run's driver crash"
+        } else if progress.windows_restart_paused_at.is_some() {
+            " after the Windows restart"
+        } else {
+            ""
+        }
     ));
     if let Err(error) = guard.power_sweep.resume(guard.safe_store.clone()) {
         return refuse(error);
@@ -560,6 +591,19 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert!(saved_attempts(&path).is_empty(), "a damaged file never blocks every future run");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_windows_restart_gets_its_own_attempt_apart_from_the_run() {
+        use nidavellir_core::safe_loop::ForgeIncidentKind;
+        let first = attempt_key("run-1", None, Some("2026-11-10T02:56:02+00:00"));
+        let later = attempt_key("run-1", None, Some("2026-11-10T05:10:00+00:00"));
+        assert_ne!(first, "run-1", "an earlier continuation of the run must not block it");
+        assert_ne!(first, later, "one attempt per restart");
+        assert_eq!(attempt_key("run-1", None, None), "run-1");
+        let incident = ForgeIncident::new(ForgeIncidentKind::CandidateCrash, Some("run-1".into()), None, None, None, "tdr");
+        let id = incident.id.clone();
+        assert_eq!(attempt_key("run-1", Some(incident), Some("2026-11-10T02:56:02+00:00")), id, "an incident keeps its own key");
     }
 
     #[test]

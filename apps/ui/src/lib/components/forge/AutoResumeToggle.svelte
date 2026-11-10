@@ -1,8 +1,9 @@
 <script>
   import { serviceCall } from "../../service.js";
 
-  // Automatic continuation after a TDR at a step edge: on unless the user turns it off. The service
-  // persists the choice. `detail` adds the full explanation (the pre-Forge sheet).
+  // Automatic continuation after a TDR at a step edge, or after Windows restarts during a run: on
+  // unless the user turns it off. The service persists the choice. `detail` adds the full
+  // explanation (the pre-Forge sheet).
   let { powerSweep = null, disabled = false, detail = false } = $props();
 
   let busy = $state(false);
@@ -53,18 +54,18 @@
 </script>
 
 <div class="auto-resume">
-  <label class="option-row" title="If the GPU driver crashes at a test edge, Nidavellir restarts only the driver, or restarts Windows after a 2-minute warning, then the same run continues.">
+  <label class="option-row" title="If the GPU driver crashes at a test edge, Nidavellir restarts only the driver, or restarts Windows after a 2-minute warning, then the same run continues. If Windows restarts during a run, the run continues after the restart.">
     <span class="option-text">
-      <span class="option-eyebrow">After a driver crash</span>
+      <span class="option-eyebrow">After a driver crash or Windows restart</span>
       <span class="option-value">Continue automatically<em>Recommended</em></span>
       {#if detail}
-        <span class="option-detail">Nidavellir waits 2 minutes (you can cancel), then continues the same run. If the driver needs a fresh Windows start, it warns you for 2 minutes and restarts Windows by itself. The failed point is saved and never tested again. When this is off, the run stops and waits for you.</span>
+        <span class="option-detail">Nidavellir waits 2 minutes (you can cancel), then continues the same run. If the driver needs a fresh Windows start, it warns you for 2 minutes and restarts Windows by itself. The failed point is saved and never tested again. If Windows itself restarts during a run, for an update for example, the run continues the same way when Windows is back within 30 minutes. When this is off, the run stops and waits for you.</span>
       {/if}
     </span>
     <input
       type="checkbox"
       role="switch"
-      aria-label="Continue automatically after a driver crash"
+      aria-label="Continue automatically after a driver crash or Windows restart"
       checked={enabled}
       disabled={busy || disabled}
       onchange={(event) => setEnabled(event.currentTarget.checked)}

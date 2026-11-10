@@ -245,7 +245,35 @@ pub(crate) fn auto_resume_eligible(
     progress.auto_resume
         && progress.auto_resume_consent
         && !progress.running
-        && run_continues_after_crash(progress, pending)
+        && (run_continues_after_crash(progress, pending)
+            || windows_restart_continues(progress, pending, crate::tdr_sentinel::current_boot_epoch_ms()))
+}
+
+/// Windows back this soon after the pause was a restart (an update works for minutes), not a
+/// shutdown the user started.
+#[cfg(windows)]
+const WINDOWS_RESTART_CONTINUE_MS: u64 = 30 * 60 * 1000;
+
+/// Windows restarted during the run and the run paused cleanly at stock, with nothing pending: it
+/// continues by itself after the restart (user, 2026-11-10). A boot long after the pause was a
+/// shutdown, and none since the pause leaves nothing to continue after: both wait for the user.
+#[cfg(windows)]
+fn windows_restart_continues(
+    progress: &PowerSweepProgress,
+    pending: Option<&nidavellir_core::safe_loop::ForgeIncident>,
+    boot_epoch_ms: u64,
+) -> bool {
+    let paused_ms = progress
+        .windows_restart_paused_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .and_then(|at| u64::try_from(at.timestamp_millis()).ok());
+    pending.is_none()
+        && progress.phase == "paused"
+        // The boot estimate jitters by seconds.
+        && paused_ms.is_some_and(|paused| {
+            boot_epoch_ms + 30_000 >= paused && boot_epoch_ms <= paused + WINDOWS_RESTART_CONTINUE_MS
+        })
 }
 
 /// The crash itself lets the run continue: this run's own staircase-edge TDR with its search still
@@ -9350,6 +9378,9 @@ fn measure_multiclock_undervolt_forge(
                 prog.resume_block_reason = (!prog.resume_available).then(|| {
                     "the build, GPU and driver identity could not be recorded".into()
                 });
+                // Windows itself stopping is not the user's Stop: auto-continue may resume it.
+                prog.windows_restart_paused_at = crate::shutdown::forge_paused_by_windows()
+                    .then(nidavellir_core::f2_observation::now_rfc3339);
                 prog.note = Some(
                     "Forge paused during the stock measurement. The GPU is at stock and the checkpoint is saved."
                         .into(),
@@ -9358,7 +9389,8 @@ fn measure_multiclock_undervolt_forge(
                     "STOP manual concluído durante preheat; checkpoint retomável gravado após reset stock."
                         .into(),
                 );
-                live_event(&mut prog, LogTone::Attention, "Stock baseline", "Stopped by you during the stock measurement · the run can resume", None);
+                let by = if prog.windows_restart_paused_at.is_some() { "Paused because Windows is restarting" } else { "Stopped by you" };
+                live_event(&mut prog, LogTone::Attention, "Stock baseline", format!("{by} during the stock measurement · the run can resume"), None);
                 task_tracker.finish(&mut prog);
                 save_forge_state(&gpu_key, &prog);
             } else if driver_crashed_during_stock(latch_before_stock.as_deref()) {
@@ -10734,11 +10766,21 @@ fn measure_multiclock_undervolt_forge(
         } else {
             Some("the build, GPU and driver identity could not be recorded".into())
         };
-        prog.note = Some(
+        // Windows itself stopping is not the user's Stop: auto-continue may resume it.
+        prog.windows_restart_paused_at = crate::shutdown::forge_paused_by_windows()
+            .then(nidavellir_core::f2_observation::now_rfc3339);
+        let windows = prog.windows_restart_paused_at.is_some();
+        prog.note = Some(if windows {
+            "Forge paused safely because Windows is shutting down or restarting. The GPU is at stock and everything learned is saved. After a restart the run continues by itself when auto-continue is on; otherwise use Resume."
+        } else {
             "Forge paused safely. The GPU is at stock and everything learned is saved. Use Resume to continue."
-                .into(),
-        );
-        live_event(&mut prog, LogTone::Attention, "Finish", "Stopped by you · the run is paused and can resume", None);
+        }.into());
+        let line = if windows {
+            "Windows is restarting · the run is paused and continues after the restart"
+        } else {
+            "Stopped by you · the run is paused and can resume"
+        };
+        live_event(&mut prog, LogTone::Attention, "Finish", line, None);
         prog.log.push(
             "STOP manual concluído: checkpoint pausado gravado após reset confirmado para stock."
                 .into(),
@@ -13103,6 +13145,33 @@ mod tests {
         progress.phase = "interrupted".into();
         progress.auto_resume = false;
         assert!(!auto_resume_eligible(&progress, Some(&crash("run-a"))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_run_paused_by_a_windows_restart_continues_only_after_a_prompt_restart() {
+        use nidavellir_core::safe_loop::{ForgeIncident, ForgeIncidentKind};
+        // 2026-11-10T02:56:02Z, when the field Core got the Windows Update restart.
+        let paused_ms = 1_794_279_362_000;
+        let progress = PowerSweepProgress {
+            auto_resume: true,
+            auto_resume_consent: true,
+            phase: "paused".into(),
+            run_id: Some("run-w".into()),
+            windows_restart_paused_at: Some("2026-11-10T02:56:02+00:00".into()),
+            ..Default::default()
+        };
+        let back = |after_ms: u64| windows_restart_continues(&progress, None, paused_ms + after_ms);
+        assert!(back(32_000), "the field restart: Windows was back after 32 s");
+        assert!(back(29 * 60_000), "an update that works for minutes");
+        assert!(!back(31 * 60_000), "a shutdown and a later boot wait for the user");
+        assert!(!windows_restart_continues(&progress, None, paused_ms - 3_600_000), "no boot since the pause");
+        let crash = ForgeIncident::new(ForgeIncidentKind::CandidateCrash, Some("run-w".into()), None, None, None, "tdr");
+        assert!(!windows_restart_continues(&progress, Some(&crash), paused_ms + 32_000), "an incident waits");
+        let stopped = PowerSweepProgress { windows_restart_paused_at: None, ..progress.clone() };
+        assert!(!windows_restart_continues(&stopped, None, paused_ms + 32_000), "the user's Stop never continues by itself");
+        let running = PowerSweepProgress { phase: "power".into(), ..progress.clone() };
+        assert!(!windows_restart_continues(&running, None, paused_ms + 32_000));
     }
 
     /// 0.8.14 (2026-10-25): a TDR at 1890@881 became a blue screen and Windows restarted itself.

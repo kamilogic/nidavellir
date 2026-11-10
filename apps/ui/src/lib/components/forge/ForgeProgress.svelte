@@ -140,6 +140,8 @@
   );
   // A driver crash during the stock reference pauses the run to repeat those checks after a restart.
   const stockCrashPause = $derived(Boolean(isPaused && powerSweep?.stock_crash_paused));
+  // Windows itself stopped during the run (an update, for one): the run paused safely at stock.
+  const windowsRestartPause = $derived(Boolean(isPaused && powerSweep?.windows_restart_paused_at));
   const title = $derived(
     isInterrupted
       ? (rebootRequired ? "Restart Windows to continue" : "Forge interrupted")
@@ -163,13 +165,15 @@
     return parts.join(" · ");
   });
   const interruptionNote = $derived.by(() => {
-    if (!isInterrupted && !stockCrashPause) return null;
+    if (!isInterrupted && !stockCrashPause && !windowsRestartPause) return null;
     const pair = currentPairLabel === "—" ? "" : ` at ${currentPairLabel}`;
     const cause = stockCrashPause
       ? "The GPU driver crashed during the stock checks, before any tuning."
-      : latchedLastOutcome === "TdrOrCrash"
-        ? `A driver crash stopped the test${pair}.`
-        : `The run stopped before finishing${pair}.`;
+      : windowsRestartPause
+        ? "Windows restarted or shut down during the run; the run paused safely."
+        : latchedLastOutcome === "TdrOrCrash"
+          ? `A driver crash stopped the test${pair}.`
+          : `The run stopped before finishing${pair}.`;
     if (autoResumeSeconds != null) return `${cause} Continuing automatically in ${autoResumeSeconds}s.`;
     if (autoRestartSeconds != null) return `${cause} Windows restarts in ${autoRestartSeconds}s; the run then continues by itself.`;
     // Promised only when the Core confirms it will continue this run.
@@ -177,7 +181,7 @@
     const next = stockCrashPause ? "restart Windows to repeat the stock checks" : "restart Windows to continue";
     return rebootRequired
       ? `${cause} Progress is saved; ${next}.${after}`
-      : `${cause} Progress is saved.`;
+      : `${cause} Progress is saved.${windowsRestartPause ? after : ""}`;
   });
   const runState = $derived(
     rebootRequired

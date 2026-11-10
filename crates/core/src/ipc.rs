@@ -635,6 +635,11 @@ pub struct PowerSweepProgress {
     /// resume it after a Windows restart. Cleared when any run starts.
     #[serde(default)]
     pub stock_crash_paused: bool,
+    /// The run is paused because Windows itself shut down or restarted during it (Preshutdown,
+    /// 2026-11-10): the time of that notice. Auto-continue resumes it once when Windows comes back
+    /// soon enough to be a restart. Cleared when any run starts.
+    #[serde(default)]
+    pub windows_restart_paused_at: Option<String>,
     /// The run was started by a build where auto-resume is on by default (2026-10-12), so only such
     /// a run may continue by itself. A run saved by an older build, when the option was opt-in,
     /// decodes as `false` and waits for the user's Resume.

@@ -7,6 +7,20 @@ use std::time::Duration;
 use nidavellir_core::safe_loop::SafeLoopStore;
 
 static REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Windows itself is shutting down or restarting (Preshutdown), not the user, the program or the
+/// installer.
+static WINDOWS_STOPPING: AtomicBool = AtomicBool::new(false);
+/// That stop is what pauses the Forge: the user had not already stopped it. Such a run may continue
+/// by itself after the restart (user, 2026-11-10).
+static WINDOWS_PAUSE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn note_windows_stopping() {
+    WINDOWS_STOPPING.store(true, Ordering::SeqCst);
+}
+/// Read by the Forge worker when it pauses.
+pub(crate) fn forge_paused_by_windows() -> bool {
+    WINDOWS_PAUSE.load(Ordering::SeqCst)
+}
 
 /// Close admission immediately, including requests already queued on AppState.
 pub(crate) fn begin() -> bool {
@@ -46,6 +60,11 @@ pub(crate) fn complete(
             .clear_clean_shutdown()
             .map_err(|e| format!("Cannot clear stale shutdown marker: {e}"))?;
         let active = crate::ipc_server::gpu_operation_running(&state);
+        // A Stop of the user's already under way stays theirs. Decided before the worker is told
+        // to stop, so it reads the answer when it pauses.
+        if WINDOWS_STOPPING.load(Ordering::SeqCst) && state.power_sweep.progress().phase != "stopping" {
+            WINDOWS_PAUSE.store(true, Ordering::SeqCst);
+        }
         crate::ipc_server::request_mutating_worker_stop(&mut state, true);
         crate::ipc_server::wait_for_mutating_workers_to_quiesce(&state)?;
         crate::tdr_sentinel::quiesce_for_shutdown()?;
