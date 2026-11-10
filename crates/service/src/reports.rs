@@ -546,8 +546,10 @@ fn system32(program: &str) -> PathBuf {
 
 /// The latest GPU driver and crash events from Windows with their data, since an nvlddmkm 153 has
 /// no message text: driver resets (nvlddmkm, Display), blue screens (BugCheck), unexpected restarts
-/// (Kernel-Power 41), the kernel reports Windows wrote for them (LiveKernelEvent 141/117) and
-/// crashes of Nidavellir itself (Application Error 1000), which leave no line in core.log.
+/// (Kernel-Power 41), the kernel reports Windows wrote for them (LiveKernelEvent 141/117), crashes
+/// of Nidavellir itself (Application Error 1000), which leave no line in core.log, and the restarts
+/// themselves: who asked for one (User32 1074) and each stop and start of the Event Log (6006/6005,
+/// or 6008 after an unclean one).
 fn driver_events() -> String {
     // Separate queries, so a run of unexpected restarts never crowds the driver resets out.
     let query = |log: &str, filter: &str, count: u32| {
@@ -575,6 +577,13 @@ fn driver_events() -> String {
             .filter(|line| line.to_ascii_lowercase().contains("nidavellir"))
             .take(3),
     );
+    // A Windows Update restart during a Forge looked like a crash, and no report showed it
+    // (2026-11-10). Three events per restart: the last three restarts.
+    lines.extend(query(
+        "System",
+        "*[System[EventID=1074 or (Provider[@Name='EventLog'] and (EventID=6005 or EventID=6006 or EventID=6008))]]",
+        9,
+    ));
     lines.join("\n")
 }
 
@@ -583,6 +592,8 @@ static EVENT_PROVIDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<Provide
 static EVENT_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<EventID[^>]*>(\d+)</EventID>").expect("static pattern"));
 static EVENT_TIME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"SystemTime=['"]([^'"]*)"#).expect("static pattern"));
 static EVENT_DATA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<Data(?: Name=['][^']*[']| Name=[^>]*)?>(.*?)</Data>").expect("static pattern"));
+static EVENT_PARAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?s)<Data Name=['"]param(\d+)['"]>(.*?)</Data>"#).expect("static pattern"));
+static EVENT_USER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<Security UserID=['"]([^'"]*)"#).expect("static pattern"));
 
 /// `time provider id: data | data` per event of a wevtutil XML answer, newest first.
 fn event_lines(xml: &str) -> Vec<String> {
@@ -591,14 +602,44 @@ fn event_lines(xml: &str) -> Vec<String> {
         .map(|event| {
             let event = event.as_str();
             let field = |pattern: &Regex| pattern.captures(event).map(|found| found[1].to_owned()).unwrap_or_default();
-            let data: Vec<String> = EVENT_DATA
-                .captures_iter(event)
-                .map(|found| unescape_xml(found[1].trim()))
-                .filter(|value| !value.is_empty())
-                .collect();
+            let data: Vec<String> = if field(&EVENT_ID) == "1074" {
+                restart_request(event)
+            } else {
+                EVENT_DATA
+                    .captures_iter(event)
+                    .map(|found| unescape_xml(found[1].trim()))
+                    .filter(|value| !value.is_empty())
+                    .collect()
+            };
             let line = format!("{} {} {}: {}", field(&EVENT_TIME), field(&EVENT_PROVIDER), field(&EVENT_ID), data.join(" | "));
             line.chars().take(500).collect()
         })
+        .collect()
+}
+
+/// A restart request (User32 1074) without its computer (param2), comment (param6) or account
+/// (param7): the program that asked, the reason code and text, restart or power off, and whether
+/// the SYSTEM account asked (Windows Update does).
+fn restart_request(event: &str) -> Vec<String> {
+    let param = |number: &str| {
+        EVENT_PARAM
+            .captures_iter(event)
+            .find(|found| &found[1] == number)
+            .map(|found| unescape_xml(found[2].trim()))
+            .unwrap_or_default()
+    };
+    // "C:\WINDOWS\uus\AMD64\MoUsoCoreWorker.exe (COMPUTER)": the file name, without the computer.
+    let path = param("1");
+    let file = path.rsplit('\\').next().unwrap_or_default();
+    let program = file.split(" (").next().unwrap_or_default();
+    let by = match EVENT_USER.captures(event) {
+        Some(found) if &found[1] == "S-1-5-18" => "system",
+        Some(_) => "user",
+        None => "",
+    };
+    [program.to_owned(), param("4"), param("3"), param("5"), by.to_owned()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
         .collect()
 }
 
@@ -745,6 +786,43 @@ mod tests {
             "2026-10-19T10:19:40.0000000Z Windows Error Reporting 1001: 0 | LiveKernelEvent | 141 | a & b",
         ]);
         assert!(lines.iter().all(|line| !line.contains("DESKTOP")), "the computer name stays out");
+    }
+
+    #[test]
+    fn a_restart_request_keeps_who_and_why_but_not_the_computer_account_or_comment() {
+        // Shaped like the 2026-11-10 field events: Windows Update, then a user's restart, then the
+        // Event Log stopping.
+        let xml = concat!(
+            "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>",
+            "<Provider Name='User32' Guid='{b0aa8734-56f7-41cc-b2f4-de228e98b946}' EventSourceName='User32'/>",
+            "<EventID Qualifiers='32768'>1074</EventID><TimeCreated SystemTime='2026-11-10T02:55:03.1234567Z'/>",
+            "<Computer>DESKTOP-ABC12</Computer><Security UserID='S-1-5-18'/></System><EventData>",
+            "<Data Name='param1'>C:\\WINDOWS\\uus\\AMD64\\MoUsoCoreWorker.exe (DESKTOP-ABC12)</Data>",
+            "<Data Name='param2'>DESKTOP-ABC12</Data>",
+            "<Data Name='param3'>Sistema operacional: service pack (planejado)</Data>",
+            "<Data Name='param4'>0x80020010</Data><Data Name='param5'>reiniciar</Data>",
+            "<Data Name='param6'></Data><Data Name='param7'>AUTORIDADE NT\\SISTEMA</Data></EventData></Event>",
+            "<Event xmlns='x'><System><Provider Name='User32'/><EventID>1074</EventID>",
+            "<TimeCreated SystemTime='2026-11-10T00:31:14.0000000Z'/>",
+            "<Security UserID='S-1-5-21-1004336348-1177238915-682003330-1001'/></System><EventData>",
+            "<Data Name='param1'>C:\\Program Files (x86)\\Tool\\tool.exe (DESKTOP-ABC12)</Data>",
+            "<Data Name='param2'>DESKTOP-ABC12</Data><Data Name='param3'>Outro (não planejada)</Data>",
+            "<Data Name='param4'>0x0</Data><Data Name='param5'>reiniciar</Data>",
+            "<Data Name='param6'>off to bed, John</Data><Data Name='param7'>DESKTOP-ABC12\\John Doe</Data>",
+            "</EventData></Event>",
+            "<Event xmlns='x'><System><Provider Name='EventLog'/><EventID Qualifiers='32768'>6006</EventID>",
+            "<TimeCreated SystemTime='2026-11-10T02:56:02.0000000Z'/></System><EventData><Binary>E9070B00</Binary>",
+            "</EventData></Event>",
+        );
+        let lines = event_lines(xml);
+        assert_eq!(lines, [
+            "2026-11-10T02:55:03.1234567Z User32 1074: MoUsoCoreWorker.exe | 0x80020010 | Sistema operacional: service pack (planejado) | reiniciar | system",
+            "2026-11-10T00:31:14.0000000Z User32 1074: tool.exe | 0x0 | Outro (não planejada) | reiniciar | user",
+            "2026-11-10T02:56:02.0000000Z EventLog 6006: ",
+        ]);
+        for leak in ["DESKTOP", "John", "Doe", "bed", "S-1-5", "SISTEMA"] {
+            assert!(lines.iter().all(|line| !line.contains(leak)), "{leak} leaked: {lines:?}");
+        }
     }
 
     #[test]
